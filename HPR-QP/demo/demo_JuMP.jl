@@ -20,7 +20,9 @@ function HPRQP_solve()
     params.time_limit = 3600
     params.stoptol = 1e-8
     params.device_number = 0 
-    result = HPRQP.run_file("model.mps", params)
+    params.warm_up = true
+
+    result = HPRQP.run_single("model.mps", params)
 
     # if maximize, then the objective value is the negative of the result
     if MOI.get(model, MOI.ObjectiveSense()) == MOI.MAX_SENSE

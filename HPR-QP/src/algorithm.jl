@@ -23,29 +23,39 @@ function compute_residuals_gpu(ws::HPRQP_workspace_gpu,
     qp::QP_info_gpu,
     sc::Scaling_info_gpu,
     res::HPRQP_residuals,
+    params::HPRQP_parameters,
     iter::Int,
 )
     ### Objective values
-    CUSPARSE.mv!('N', 1, ws.Q, ws.x_bar, 0, ws.Qx, 'O', CUSPARSE.CUSPARSE_SPMV_CSR_ALG2)
+    # Use Qmap! for operator-based Q, or CUSPARSE for sparse matrix Q
+    if isa(qp.Q, AbstractQOperator)
+        Qmap!(ws.x_bar, ws.Qx, ws.temp1, qp.Q)
+    else
+        CUSPARSE.mv!('N', 1, ws.Q, ws.x_bar, 0, ws.Qx, 'O', CUSPARSE.CUSPARSE_SPMV_CSR_ALG2)
+    end
     res.primal_obj_bar = sc.b_scale * sc.c_scale *
                          (CUDA.dot(ws.c, ws.x_bar) + 0.5 * CUDA.dot(ws.x_bar, ws.Qx)) + qp.obj_constant
 
-    if qp.noC
-        res.dual_obj_bar =
-            sc.b_scale * sc.c_scale *
-            (-0.5 * CUDA.dot(ws.x_bar, ws.Qx) + CUDA.dot(ws.y_bar, ws.s)) + qp.obj_constant
-    else
-        res.dual_obj_bar =
-            sc.b_scale * sc.c_scale *
-            (-0.5 * CUDA.dot(ws.x_bar, ws.Qx)
-             + CUDA.dot(ws.y_bar, ws.s)
-             + CUDA.dot(ws.z_bar, ws.x_bar)) + qp.obj_constant
+    # Dual objective: always include z'x term (for bounds/L1), conditionally add y'(Ax-b) term
+    res.dual_obj_bar = sc.b_scale * sc.c_scale *
+                       (-0.5 * CUDA.dot(ws.x_bar, ws.Qx) + CUDA.dot(ws.z_bar, ws.x_bar)) + qp.obj_constant
+    if ws.m > 0
+        res.dual_obj_bar += sc.b_scale * sc.c_scale * CUDA.dot(ws.y_bar, ws.s)
+    end
+
+    # Add L1 norm term for LASSO problems
+    if params.problem_type == "LASSO" && length(ws.lambda) > 0
+        ws.tempv .= ws.lambda .* ws.x_bar
+        l1_norm = CUDA.norm(ws.tempv, 1)
+        res.primal_obj_bar += sc.b_scale * sc.c_scale * l1_norm
+        res.dual_obj_bar += sc.b_scale * sc.c_scale * l1_norm
     end
 
     res.rel_gap_bar = abs(res.primal_obj_bar - res.dual_obj_bar) / (1.0 + max(abs(res.primal_obj_bar), abs(res.dual_obj_bar)))
 
     ### Dual residuals
-    if qp.noC
+    # For LASSO, we need to use compute_Rd_gpu! even when noC=true to include z term (subdifferential of L1)
+    if qp.noC && params.problem_type != "LASSO"
         compute_Rd_noC_gpu!(ws, sc)
     else
         compute_Rd_gpu!(ws, sc)
@@ -56,9 +66,11 @@ function compute_residuals_gpu(ws::HPRQP_workspace_gpu,
     if ws.m > 0
         compute_Rp_gpu!(ws, sc)
         res.err_Rp_org_bar = CUDA.norm(ws.Rp, Inf) / (1.0 + max(sc.norm_b_org, CUDA.norm(ws.Ax, Inf)))
+    else
+        res.err_Rp_org_bar = 0.0
     end
 
-    if iter == 0
+    if (params.problem_type == "QAP" && iter == 0) || (params.problem_type == "QP" && iter == 0)
         @cuda threads = 256 blocks = ceil(Int, ws.n / 256) compute_err_lu_kernel!(ws.dx, ws.x_bar, ws.l, ws.u, sc.col_norm, sc.b_scale, ws.n)
         res.err_Rp_org_bar = max(res.err_Rp_org_bar, CUDA.norm(ws.dx, Inf))
     end
@@ -66,11 +78,51 @@ function compute_residuals_gpu(ws::HPRQP_workspace_gpu,
 
 end
 
+# This function updates sigma for operator-based Q (QAP/LASSO)
+function update_sigma_operator(params::HPRQP_parameters,
+    restart_info::HPRQP_restart,
+    ws::HPRQP_workspace_gpu,
+    qp::QP_info_gpu,
+)
+    if ~params.sigma_fixed && (restart_info.restart_flag >= 1)
+        a = 0.0
+        b = 0.0
+        c = 0.0
+        d = 0.0
+        axpby_gpu!(1.0, ws.x_bar, -1.0, ws.last_x, ws.dx, ws.n)
+        if ws.m > 0
+            axpby_gpu!(1.0, ws.y_bar, -1.0, ws.last_y, ws.dy, ws.m)
+            axpby_gpu!(1.0, ws.ATy_bar, -1.0, ws.last_ATy, ws.ATdy, ws.n)
+            Qmap!(ws.ATdy, ws.QATdy, ws.temp1, qp.Q)
+            a += ws.lambda_max_A * CUDA.dot(ws.dy, ws.dy) - 2 * CUDA.dot(ws.dQw, ws.ATdy)
+        end
+        axpby_gpu!(1.0, ws.w_bar, -1.0, ws.last_w, ws.dw, ws.n)
+        Qmap!(ws.dw, ws.dQw, ws.temp1, qp.Q)
+
+        b += CUDA.dot(ws.dx, ws.dx)
+        a += ws.lambda_max_Q * CUDA.dot(ws.dw, ws.dQw)
+        if ws.m > 0
+            c += CUDA.dot(ws.ATdy, ws.QATdy)
+            d += ws.lambda_max_Q
+        end
+        a = max(a, 1e-12)
+        b = max(b, 1e-12)
+        if ws.m > 0
+            sigma_new = golden(a, b, c, d; lo=1e-12, hi=1e12, tol=1e-13)
+        else
+            sigma_new = sqrt(b / a)
+        end
+        fact = exp(-restart_info.current_gap / restart_info.weighted_norm)
+        ws.sigma = exp(fact * log(sigma_new) + (1 - fact) * log(ws.sigma))
+    end
+end
+
 
 # This function updates the penalty parameter (sigma) based on the current state of the algorithm.
 function update_sigma(params::HPRQP_parameters,
     restart_info::HPRQP_restart,
     ws::HPRQP_workspace_gpu,
+    qp::QP_info_gpu,
     Q_is_diag::Bool,
     noC::Bool,
 )
@@ -101,10 +153,20 @@ function update_sigma(params::HPRQP_parameters,
             if ws.m > 0
                 axpby_gpu!(1.0, ws.y_bar, -1.0, ws.last_y, ws.dy, ws.m)
                 axpby_gpu!(1.0, ws.ATy_bar, -1.0, ws.last_ATy, ws.ATdy, ws.n)
-                CUDA.CUSPARSE.mv!('N', 1, ws.Q, ws.ATdy, 0, ws.QATdy, 'O', CUDA.CUSPARSE.CUSPARSE_SPMV_CSR_ALG2)
+                # Handle operator-based Q vs sparse matrix Q
+                if isa(qp.Q, AbstractQOperator)
+                    Qmap!(ws.ATdy, ws.QATdy, ws.temp1, qp.Q)
+                else
+                    CUDA.CUSPARSE.mv!('N', 1, ws.Q, ws.ATdy, 0, ws.QATdy, 'O', CUDA.CUSPARSE.CUSPARSE_SPMV_CSR_ALG2)
+                end
             end
             axpby_gpu!(1.0, ws.w_bar, -1.0, ws.last_w, ws.dw, ws.n)
-            CUDA.CUSPARSE.mv!('N', 1, ws.Q, ws.dw, 0, ws.dQw, 'O', CUDA.CUSPARSE.CUSPARSE_SPMV_CSR_ALG2)
+            # Handle operator-based Q vs sparse matrix Q
+            if isa(qp.Q, AbstractQOperator)
+                Qmap!(ws.dw, ws.dQw, ws.temp1, qp.Q)
+            else
+                CUDA.CUSPARSE.mv!('N', 1, ws.Q, ws.dw, 0, ws.dQw, 'O', CUDA.CUSPARSE.CUSPARSE_SPMV_CSR_ALG2)
+            end
             a = ws.lambda_max_A * CUDA.dot(ws.dy, ws.dy) - 2 * CUDA.dot(ws.dQw, ws.ATdy)
             b = CUDA.dot(ws.dx, ws.dx)
             if Q_is_diag
@@ -144,8 +206,15 @@ end
 function check_restart(restart_info::HPRQP_restart,
     iter::Int,
     check_iter::Int,
+    restart::Int=-1,
 )
     restart_info.restart_flag = 0
+    if restart > 0
+        if rem(iter, restart) == 0 && iter > 0
+            restart_info.restart_flag = 1
+        end
+        return
+    end
     if restart_info.first_restart
         if iter == check_iter
             restart_info.first_restart = false
@@ -181,7 +250,7 @@ function check_restart(restart_info::HPRQP_restart,
 end
 
 # This function performs the restart for the HPR-QP algorithm on GPU.
-function do_restart(restart_info::HPRQP_restart, ws::HPRQP_workspace_gpu, noC::Bool)
+function do_restart(restart_info::HPRQP_restart, ws::HPRQP_workspace_gpu, qp::QP_info_gpu, noC::Bool)
     if restart_info.restart_flag > 0
         ws.x .= ws.x_bar
         ws.y .= ws.y_bar
@@ -194,7 +263,12 @@ function do_restart(restart_info::HPRQP_restart, ws::HPRQP_workspace_gpu, noC::B
             ws.last_ATy .= ws.ATy_bar
             ws.ATy .= ws.ATy_bar
         else
-            CUDA.CUSPARSE.mv!('N', 1, ws.Q, ws.w_bar, 0, ws.Qw_bar, 'O', CUDA.CUSPARSE.CUSPARSE_SPMV_CSR_ALG2)
+            # Handle operator-based Q vs sparse matrix Q
+            if isa(qp.Q, AbstractQOperator)
+                Qmap!(ws.w_bar, ws.Qw_bar, ws.temp1, qp.Q)
+            else
+                CUDA.CUSPARSE.mv!('N', 1, ws.Q, ws.w_bar, 0, ws.Qw_bar, 'O', CUDA.CUSPARSE.CUSPARSE_SPMV_CSR_ALG2)
+            end
             ws.Qw .= ws.Qw_bar
             ws.last_Qw .= ws.Qw_bar
         end
@@ -328,11 +402,24 @@ function allocate_workspace_gpu(qp::QP_info_gpu,
     ws.fact2 = CUDA.zeros(Float64, n)
     ws.fact = CUDA.zeros(Float64, n)
     ws.fact_M = CUDA.zeros(Float64, n)
+
+    # Allocate temp1 for Q operator computations
+    if isa(qp.Q, LASSO_Q_operator_gpu)
+        ws.temp1 = CUDA.zeros(Float64, qp.Q.A.dims[1])
+    elseif isa(qp.Q, QAP_Q_operator_gpu)
+        ws.temp1 = CUDA.zeros(Float64, n)
+    else
+        ws.temp1 = CUDA.zeros(Float64, n)  # Default for sparse matrix Q
+    end
+
+    # Copy lambda for LASSO problems
+    ws.lambda = qp.lambda
+
     return ws
 end
 
 # This function initializes the restart information for the HPR-QP algorithm.
-function initialize_restart(params::HPRQP_parameters)
+function initialize_restart()
     restart_info = HPRQP_restart()
     restart_info.first_restart = true
     restart_info.save_gap = Inf
@@ -351,6 +438,54 @@ end
 
 function print_step(iter::Int)
     return max(10^floor(log10(iter)) / 10, 10)
+end
+
+# This function updates the variables for operator-based Q (QAP/LASSO)
+function main_update_operator!(ws::HPRQP_workspace_gpu,
+    qp::QP_info_gpu,
+    params::HPRQP_parameters,
+    restart_info::HPRQP_restart,
+)
+    Halpern_fact1 = 1.0 / (restart_info.inner + 2.0)
+    Halpern_fact2 = 1.0 - Halpern_fact1
+
+    if params.problem_type == "LASSO"
+        # LASSO update with soft-thresholding
+        Qmap!(ws.w, ws.Qw, ws.temp1, qp.Q)
+        fact2 = 1.0 / (1.0 + ws.sigma * ws.lambda_max_Q)
+        fact1 = 1.0 - fact2
+        @cuda threads = 256 blocks = ceil(Int, ws.n / 256) update_zxw_LASSO_kernel!(ws.lambda, ws.dw, ws.dx, ws.w_bar, ws.w, ws.z_bar, ws.x_bar, ws.x_hat, ws.last_x, ws.x, ws.Qw, ws.ATy, ws.c, ws.tempv, ws.sigma, fact1, fact2, Halpern_fact1, Halpern_fact2, ws.n)
+    elseif params.problem_type == "QAP"
+        # QAP update with box constraints
+        update_zxw1_QAP_gpu!(ws, qp, Halpern_fact1, Halpern_fact2)
+        update_y_QAP_gpu!(ws, qp, Halpern_fact1, Halpern_fact2)
+        update_w2_QAP_gpu!(ws, Halpern_fact1, Halpern_fact2)
+    end
+end
+
+# This function computes the M norm for operator-based Q
+function compute_M_norm_operator_gpu!(ws::HPRQP_workspace_gpu, qp::QP_info_gpu)
+    M_1 = 0.0
+    M_2 = 1 / ws.sigma * CUDA.dot(ws.dx, ws.dx)
+    Qmap!(ws.dw, ws.dQw, ws.temp1, qp.Q)
+    M_1 += ws.sigma * ws.lambda_max_Q * CUDA.dot(ws.dw, ws.dQw)
+    M_2 -= 2 * CUDA.dot(ws.dQw, ws.dx)
+    M_3 = 0.0
+
+    if ws.m > 0
+        M_1 += ws.sigma * ws.lambda_max_A * CUDA.dot(ws.dy, ws.dy)
+        CUDA.CUSPARSE.mv!('N', 1, ws.AT, ws.dy, 0, ws.ATdy, 'O', CUDA.CUSPARSE.CUSPARSE_SPMV_CSR_ALG2)
+        Qmap!(ws.ATdy, ws.QATdy, ws.temp1, qp.Q)
+        M_1 -= 2 * ws.sigma * CUDA.dot(ws.dQw, ws.ATdy)
+        M_2 += 2 * CUDA.dot(ws.ATdy, ws.dx)
+        M_3 += (ws.sigma * ws.sigma) / (1 + ws.sigma * ws.lambda_max_Q) * CUDA.dot(ws.ATdy, ws.QATdy)
+    end
+    M_2 += max(M_1, 0)
+    M_norm = max(M_2, 0) + max(M_3, 0)
+    if min(M_1, M_2, M_3) < -1e-8
+        println("M_1 = $M_1,M_2 = $M_2,M_3 = $M_3, negative M norm due to numerical instability, consider increasing eig_factor")
+    end
+    return sqrt(M_norm)
 end
 
 # This function updates the variables in the HPR-QP algorithm, when Q is diagonal, there's no proximal term on w;
@@ -385,47 +520,33 @@ function main_update!(ws::HPRQP_workspace_gpu,
             end
         end
     else
-        if spmv_mode == "customized"
-            if qp.Q_is_diag
-                if length(qp.Q.nzVal) > 0
-                    cust_update_zxw1_diagQ_gpu!(ws, Halpern_fact1, Halpern_fact2)
-                    cust_update_y_gpu!(ws, Halpern_fact1, Halpern_fact2)
-                    cust_update_w2_diagQ_gpu!(ws, Halpern_fact1, Halpern_fact2)
-                else
-                    cust_update_zx_gpu!(ws, Halpern_fact1, Halpern_fact2)
-                    cust_update_y_noQ_gpu!(ws, Halpern_fact1, Halpern_fact2)
-                end
-            else
-                cust_update_zxw1_gpu!(ws, Halpern_fact1, Halpern_fact2)
-                cust_update_y_gpu!(ws, Halpern_fact1, Halpern_fact2)
-                cust_update_w2_gpu!(ws, Halpern_fact1, Halpern_fact2)
-            end
+        if length(qp.Q.nzVal) > 0
+            # Standard case with Q matrix - use unified kernels
+            unified_update_zxw1_gpu!(ws, Halpern_fact1, Halpern_fact2; 
+                                     spmv_mode=spmv_mode, is_diag_Q=qp.Q_is_diag)
+            unified_update_y_gpu!(ws, Halpern_fact1, Halpern_fact2; spmv_mode=spmv_mode)
+            unified_update_w2_gpu!(ws, Halpern_fact1, Halpern_fact2; 
+                                   spmv_mode=spmv_mode, is_diag_Q=qp.Q_is_diag)
         else
-            if qp.Q_is_diag
-                if length(qp.Q.nzVal) > 0
-                    update_zxw1_diagQ_gpu!(ws, Halpern_fact1, Halpern_fact2)
-                    update_y_gpu!(ws, Halpern_fact1, Halpern_fact2)
-                    update_w2_diagQ_gpu!(ws, Halpern_fact1, Halpern_fact2)
-                else
-                    update_zx_gpu!(ws, Halpern_fact1, Halpern_fact2)
-                    update_y_noQ_gpu!(ws, Halpern_fact1, Halpern_fact2)
-                end
-            else
-                update_zxw1_gpu!(ws, Halpern_fact1, Halpern_fact2)
-                update_y_gpu!(ws, Halpern_fact1, Halpern_fact2)
-                update_w2_gpu!(ws, Halpern_fact1, Halpern_fact2)
-            end
+            # Empty Q case (linear program) - use unified kernels
+            unified_update_zx_gpu!(ws, Halpern_fact1, Halpern_fact2; spmv_mode=spmv_mode)
+            unified_update_y_noQ_gpu!(ws, Halpern_fact1, Halpern_fact2; spmv_mode=spmv_mode)
         end
     end
 end
 
 # This function computes the M norm for the HPR-QP algorithm on GPU.
-function compute_M_norm_gpu!(ws::HPRQP_workspace_gpu, Q_is_diag::Bool, noC::Bool)
+function compute_M_norm_gpu!(ws::HPRQP_workspace_gpu, qp::QP_info_gpu, Q_is_diag::Bool, noC::Bool)
     if noC
         M_1 = ws.sigma * ws.lambda_max_A * CUDA.dot(ws.dy, ws.dy)
         M_1 += 1 / ws.sigma * CUDA.dot(ws.dx, ws.dx)
         CUDA.CUSPARSE.mv!('N', 1, ws.AT, ws.dy, 0, ws.ATdy, 'O', CUDA.CUSPARSE.CUSPARSE_SPMV_CSR_ALG2)
-        CUDA.CUSPARSE.mv!('N', 1, ws.Q, ws.dw, 0, ws.dQw, 'O', CUDA.CUSPARSE.CUSPARSE_SPMV_CSR_ALG2)
+        # Handle operator-based Q vs sparse matrix Q
+        if isa(qp.Q, AbstractQOperator)
+            Qmap!(ws.dw, ws.dQw, ws.temp1, qp.Q)
+        else
+            CUDA.CUSPARSE.mv!('N', 1, ws.Q, ws.dw, 0, ws.dQw, 'O', CUDA.CUSPARSE.CUSPARSE_SPMV_CSR_ALG2)
+        end
         M_1 += 2 * CUDA.dot(ws.ATdy, ws.dx)
         M_2 = 0
         if !Q_is_diag
@@ -439,8 +560,14 @@ function compute_M_norm_gpu!(ws::HPRQP_workspace_gpu, Q_is_diag::Bool, noC::Bool
     else
         M_1 = ws.sigma * ws.lambda_max_A * CUDA.dot(ws.dy, ws.dy)
         CUDA.CUSPARSE.mv!('N', 1, ws.AT, ws.dy, 0, ws.ATdy, 'O', CUDA.CUSPARSE.CUSPARSE_SPMV_CSR_ALG2)
-        CUDA.CUSPARSE.mv!('N', 1, ws.Q, ws.ATdy, 0, ws.QATdy, 'O', CUDA.CUSPARSE.CUSPARSE_SPMV_CSR_ALG2)
-        CUDA.CUSPARSE.mv!('N', 1, ws.Q, ws.dw, 0, ws.dQw, 'O', CUDA.CUSPARSE.CUSPARSE_SPMV_CSR_ALG2)
+        # Handle operator-based Q vs sparse matrix Q
+        if isa(qp.Q, AbstractQOperator)
+            Qmap!(ws.ATdy, ws.QATdy, ws.temp1, qp.Q)
+            Qmap!(ws.dw, ws.dQw, ws.temp1, qp.Q)
+        else
+            CUDA.CUSPARSE.mv!('N', 1, ws.Q, ws.ATdy, 0, ws.QATdy, 'O', CUDA.CUSPARSE.CUSPARSE_SPMV_CSR_ALG2)
+            CUDA.CUSPARSE.mv!('N', 1, ws.Q, ws.dw, 0, ws.dQw, 'O', CUDA.CUSPARSE.CUSPARSE_SPMV_CSR_ALG2)
+        end
         M_1 -= 2 * ws.sigma * CUDA.dot(ws.dQw, ws.ATdy)
         M_2 = 1 / ws.sigma * CUDA.dot(ws.dx, ws.dx)
         M_2 += 2 * CUDA.dot(ws.ATdy, ws.dx)
@@ -466,6 +593,78 @@ end
 function solve(qp::QP_info_gpu, scaling_info::Scaling_info_gpu, params::HPRQP_parameters)
     m, n = size(qp.A)
 
+    # Print QP Information
+    println("="^80)
+    println("QP PROBLEM INFORMATION")
+    println("="^80)
+    
+    # Determine QP type
+    qp_type = if isa(qp.Q, QAP_Q_operator_gpu)
+        "QAP (Quadratic Assignment Problem)"
+    elseif isa(qp.Q, LASSO_Q_operator_gpu)
+        "LASSO (Least Absolute Shrinkage and Selection Operator)"
+    elseif isa(qp.Q, CuSparseMatrixCSR)
+        if length(qp.Q.nzVal) > 0
+            qp.Q_is_diag ? "QP with Diagonal Q" : "QP with Sparse Q"
+        else
+            "LP (Linear Program - Empty Q)"
+        end
+    else
+        "Unknown QP Type"
+    end
+    println("Problem Type: $qp_type")
+    
+    # Q matrix information
+    if isa(qp.Q, CuSparseMatrixCSR)
+        q_size = size(qp.Q, 1)
+        q_nnz = length(qp.Q.nzVal)
+        println("Q Matrix: $(q_size)×$(q_size), nnz = $q_nnz")
+        if q_nnz > 0
+            println("Q is Diagonal: $(qp.Q_is_diag)")
+        end
+    elseif isa(qp.Q, QAP_Q_operator_gpu)
+        println("Q Operator: QAP operator (implicit matrix)")
+    elseif isa(qp.Q, LASSO_Q_operator_gpu)
+        println("Q Operator: LASSO operator (implicit matrix)")
+    end
+    
+    # Constraint matrix information
+    if m > 0
+        a_nnz = length(qp.A.nzVal)
+        println("A Matrix: $(m)×$(n), nnz = $a_nnz")
+        # println("Constraint Type: $(qp.noC ? "No C matrix (direct A)" : "With C matrix")")
+    else
+        println("A Matrix: No constraints (unconstrained)")
+    end
+    
+    println()
+    println("="^80)
+    println("SOLVER PARAMETERS")
+    println("="^80)
+    println("Max Iterations: $(params.max_iter)")
+    println("Time Limit: $(params.time_limit)s")
+    println("Stop Tolerance: $(params.stoptol)")
+    println("Eigenvalue Factor: $(params.eig_factor)")
+    println("Sigma Fixed: $(params.sigma_fixed)")
+    if !params.sigma_fixed
+        println("  Sigma Update: adaptive (based on restart)")
+        println("  Check Iteration: every $(params.check_iter) iterations")
+        if params.restart > 0
+            println("  Restart Frequency: every $(params.restart) iterations")
+        else
+            println("  Restart Strategy: adaptive")
+        end
+    end
+    println("SpMV Mode: $(params.spmv_mode)")
+    if isa(qp.Q, CuSparseMatrixCSR) && length(qp.Q.nzVal) > 0
+        println("  (Controls kernel fusion for Q*w and A*x operations)")
+    end
+    println("Print Frequency: $(params.print_frequency == -1 ? "adaptive" : "every $(params.print_frequency) iterations")")
+    println("Device Number: $(params.device_number)")
+    println("Warm Up: $(params.warm_up)")
+    println("="^80)
+    println()
+
     CUDA.synchronize()
     t_start_alg = time()
     ### power iteration to estimate lambda_max ###
@@ -475,14 +674,24 @@ function solve(qp::QP_info_gpu, scaling_info::Scaling_info_gpu, params::HPRQP_pa
     else
         lambda_max_A = 0.0
     end
-    if length(qp.Q.nzVal) > 0
-        if !qp.Q_is_diag
-            lambda_max_Q = power_iteration_Q_gpu(qp.Q) * params.eig_factor
+
+    # Handle different Q types for eigenvalue estimation
+    if isa(qp.Q, QAP_Q_operator_gpu)
+        lambda_max_Q = power_iteration_Q_QAP_gpu(qp.Q) * params.eig_factor
+    elseif isa(qp.Q, LASSO_Q_operator_gpu)
+        lambda_max_Q = power_iteration_Q_LASSO_gpu(qp.Q) * params.eig_factor
+    elseif isa(qp.Q, CuSparseMatrixCSR)
+        if length(qp.Q.nzVal) > 0
+            if !qp.Q_is_diag
+                lambda_max_Q = power_iteration_Q_gpu(qp.Q) * params.eig_factor
+            else
+                lambda_max_Q = maximum(qp.Q.nzVal)
+            end
         else
-            lambda_max_Q = maximum(qp.Q.nzVal)
+            lambda_max_Q = 0.0
         end
     else
-        lambda_max_Q = 0.0
+        error("Unsupported Q type: ", typeof(qp.Q))
     end
     CUDA.synchronize()
     power_time = time() - t_start_alg
@@ -492,8 +701,7 @@ function solve(qp::QP_info_gpu, scaling_info::Scaling_info_gpu, params::HPRQP_pa
 
     ### Initialization ###
     residuals = HPRQP_residuals()
-
-    restart_info = initialize_restart(params)
+    restart_info = initialize_restart()
 
     ws = allocate_workspace_gpu(qp, params, lambda_max_A, lambda_max_Q, scaling_info)
 
@@ -504,8 +712,9 @@ function solve(qp::QP_info_gpu, scaling_info::Scaling_info_gpu, params::HPRQP_pa
     first_4 = true
     first_6 = true
 
+    # Determine spmv_mode (only relevant for sparse matrix Q)
     spmv_mode = params.spmv_mode
-    if params.spmv_mode == "auto"
+    if isa(qp.Q, CuSparseMatrixCSR) && params.spmv_mode == "auto"
         if ws.m > 0
             max_nnz_A_row = maximum(vec(sum(t -> (abs(t) > 0), qp.A, dims=2)))
             max_nnz_A_col = maximum(vec(sum(t -> (abs(t) > 0), qp.A, dims=1)))
@@ -523,10 +732,12 @@ function solve(qp::QP_info_gpu, scaling_info::Scaling_info_gpu, params::HPRQP_pa
         if m > 1e5 && n > 1e5
             spmv_mode = "CUSPARSE"
         end
+    elseif isa(qp.Q, AbstractQOperator)
+        spmv_mode = "operator"  # Use operator mode for Q operators
     end
     println("SPMV mode = ", spmv_mode)
 
-    if qp.Q_is_diag
+    if isa(qp.Q, CuSparseMatrixCSR) && qp.Q_is_diag
         update_Q_factors_gpu!(
             ws.fact2, ws.fact, ws.fact1, ws.fact_M,
             ws.diag_Q, ws.sigma
@@ -550,7 +761,7 @@ function solve(qp::QP_info_gpu, scaling_info::Scaling_info_gpu, params::HPRQP_pa
 
         if rem(iter, check_iter) == 0 || print_yes
             residuals.is_updated = true
-            compute_residuals_gpu(ws, qp, scaling_info, residuals, iter)
+            compute_residuals_gpu(ws, qp, scaling_info, residuals, params, iter)
         else
             residuals.is_updated = false
         end
@@ -559,13 +770,17 @@ function solve(qp::QP_info_gpu, scaling_info::Scaling_info_gpu, params::HPRQP_pa
         status = check_break(residuals, iter, t_start_alg, params)
 
         ### check restart ###
-        check_restart(restart_info, iter, check_iter)
+        check_restart(restart_info, iter, check_iter, params.restart)
 
-        ### update sigma ###
-        update_sigma(params, restart_info, ws, qp.Q_is_diag, qp.noC)
+        ### update sigma - use operator version for QAP/LASSO ###
+        if isa(qp.Q, AbstractQOperator)
+            update_sigma_operator(params, restart_info, ws, qp)
+        else
+            update_sigma(params, restart_info, ws, qp, qp.Q_is_diag, qp.noC)
+        end
 
         ### restart if needed ###
-        do_restart(restart_info, ws, qp.noC)
+        do_restart(restart_info, ws, qp, qp.noC)
 
         ### print the log ##
         if print_yes || (status != "CONTINUE")
@@ -604,7 +819,7 @@ function solve(qp::QP_info_gpu, scaling_info::Scaling_info_gpu, params::HPRQP_pa
                 println("The time limit is reached, the accuracy is ", residuals.KKTx_and_gap_org_bar)
             end
             results = collect_results_gpu!(ws, residuals, scaling_info, iter, t_start_alg, power_time)
-            results.output_type = status
+            results.status = status
             results.time_4 = time_4 == 0.0 ? results.time : time_4
             results.iter_4 = iter_4 == 0 ? iter : iter_4
             results.time_6 = time_6 == 0.0 ? results.time : time_6
@@ -612,14 +827,27 @@ function solve(qp::QP_info_gpu, scaling_info::Scaling_info_gpu, params::HPRQP_pa
             return results
         end
 
-        ## main update
-        main_update!(ws, qp, spmv_mode, restart_info)
+        ## main update - use operator-specific update for QAP/LASSO, standard update otherwise
+        if spmv_mode == "operator"
+            main_update_operator!(ws, qp, params, restart_info)
+        else
+            main_update!(ws, qp, spmv_mode, restart_info)
+        end
 
+        # Compute M norm for restart decision
         if restart_info.restart_flag > 0
-            restart_info.last_gap = compute_M_norm_gpu!(ws, qp.Q_is_diag, qp.noC)
+            if isa(qp.Q, AbstractQOperator)
+                restart_info.last_gap = compute_M_norm_operator_gpu!(ws, qp)
+            else
+                restart_info.last_gap = compute_M_norm_gpu!(ws, qp, qp.Q_is_diag, qp.noC)
+            end
         end
         if rem(iter + 1, check_iter) == 0
-            restart_info.current_gap = compute_M_norm_gpu!(ws, qp.Q_is_diag, qp.noC)
+            if isa(qp.Q, AbstractQOperator)
+                restart_info.current_gap = compute_M_norm_operator_gpu!(ws, qp)
+            else
+                restart_info.current_gap = compute_M_norm_gpu!(ws, qp, qp.Q_is_diag, qp.noC)
+            end
         end
         restart_info.inner += 1
     end

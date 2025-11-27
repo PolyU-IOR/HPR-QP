@@ -379,6 +379,7 @@ function run_file(FILE_NAME::String, params::HPRQP_parameters)
         CuVector(standard_qp.diag_Q),
         standard_qp.Q_is_diag,
         standard_qp.noC,
+        CuVector{Float64}([]),  # lambda (empty for standard QP)
     )
 
     scaling_info_gpu = Scaling_info_gpu(
@@ -493,7 +494,7 @@ function run_dataset(data_path::String, result_path::String, params::HPRQP_param
                 push!(timelist, min(results.time, params.time_limit))
                 push!(reslist, results.residuals)
                 push!(objlist, results.primal_obj)
-                push!(statuslist, results.output_type)
+                push!(statuslist, results.status)
                 push!(iter4list, results.iter_4)
                 push!(time3list, min(results.time_4, params.time_limit))
                 push!(iter6list, results.iter_6)
@@ -537,6 +538,37 @@ function run_dataset(data_path::String, result_path::String, params::HPRQP_param
     close(io)
 end
 
+# the function to test the HPR-QP algorithm on a single file
+function run_single(file_name::String, params::HPRQP_parameters)
+
+    println("data path: ", file_name)
+
+    if occursin(".mps", file_name)
+        if params.warm_up
+            println("warm up starts: ---------------------------------------------------------------------------------------------------------- ")
+            t_start_all = time()
+            max_iter = params.max_iter
+            params.max_iter = 200
+            redirect_stdout(devnull) do
+                results = run_file(file_name, params)
+            end
+            params.max_iter = max_iter
+            all_time = time() - t_start_all
+            println("warm up time: ", all_time)
+            println("warm up ends ----------------------------------------------------------------------------------------------------------")
+        end
+
+        println("main run starts: ----------------------------------------------------------------------------------------------------------")
+        results = run_file(file_name, params)
+        println("main run ends----------------------------------------------------------------------------------------------------------")
+    else
+        error("The file is not in the correct format, please provide a .mps file")
+    end
+
+    return results
+end
+
+
 # it's used in demo_QAbc.jl
 function run_qp(Q::SparseMatrixCSC,
     c::Vector{Float64},
@@ -546,7 +578,44 @@ function run_qp(Q::SparseMatrixCSC,
     lvar::Vector{Float64},
     uvar::Vector{Float64},
     c0::Float64,
-    params)
+    params::HPRQP_parameters)
+
+    if params.warm_up
+        println("warm up starts: ---------------------------------------------------------------------------------------------------------- ")
+        t_start_all = time()
+        max_iter = params.max_iter
+        params.max_iter = 200
+        redirect_stdout(devnull) do
+            results = run_QAbc(Q, c, A, lcon, ucon, lvar, uvar, c0, params)
+        end
+        params.max_iter = max_iter
+        all_time = time() - t_start_all
+        println("warm up time: ", all_time)
+        println("warm up ends ----------------------------------------------------------------------------------------------------------")
+    end
+    println("main run starts: ----------------------------------------------------------------------------------------------------------")
+    results = run_QAbc(Q, c, A, lcon, ucon, lvar, uvar, c0, params)
+    println("main run ends----------------------------------------------------------------------------------------------------------")
+    return results
+end
+
+function run_QAbc(Q::SparseMatrixCSC,
+    c::Vector{Float64},
+    A::SparseMatrixCSC,
+    lcon::Vector{Float64},
+    ucon::Vector{Float64},
+    lvar::Vector{Float64},
+    uvar::Vector{Float64},
+    c0::Float64,
+    params::HPRQP_parameters)
+    
+    Q = copy(Q)
+    c = copy(c)
+    A = copy(A)
+    lcon = copy(lcon)
+    ucon = copy(ucon)   
+    lvar = copy(lvar)
+    uvar = copy(uvar)
     CUDA.device!(params.device_number)
     t_start = time()
     setup_start = time()
@@ -586,6 +655,7 @@ function run_qp(Q::SparseMatrixCSC,
         CuVector(standard_qp.diag_Q),
         standard_qp.Q_is_diag,
         standard_qp.noC,
+        CuVector{Float64}([]),  # lambda (empty for standard QP)
     )
 
     scaling_info_gpu = Scaling_info_gpu(
@@ -605,6 +675,270 @@ function run_qp(Q::SparseMatrixCSC,
     println("copy to GPU ends, time = ", t_end_gpu - t_start_gpu, " seconds")
     setup_time = time() - setup_start
 
+    results = solve(standard_qp_gpu, scaling_info_gpu, params)
+    println(@sprintf("Total time: %.2fs", setup_time + results.time),
+        @sprintf("  setup time = %.2fs", setup_time),
+        @sprintf("  solve time = %.2fs", results.time))
+
+    return results
+end
+
+# ==================== QAP and LASSO Support Functions ====================
+
+# This function reads a QAP problem from a .mat file and prepares it for solving.
+function read_QAP_mat(FILE_NAME::String)
+    QAPdata = matread(FILE_NAME)
+    A = QAPdata["A"]
+    B = QAPdata["B"]
+    S = QAPdata["S"]
+    T = QAPdata["T"]
+    n = size(A, 1)
+    
+    println("QAP problem information: nRow = ", 2*n, ", nCol = ", n^2)
+    A_gpu = CuMatrix(A)
+    B_gpu = CuMatrix(B)
+    S_gpu = CuMatrix(S)
+    T_gpu = CuMatrix(T)
+
+    Q = QAP_Q_operator_gpu(A_gpu, B_gpu, S_gpu, T_gpu, n)
+    c = CUDA.zeros(Float64, n^2)
+    ee = ones(Float64, n)
+    Id = spdiagm(ones(Float64, n))
+    A_constraint = sparse(vcat(kron(ee', Id), kron(Id, ee')))
+
+    A_gpu_sparse = CuSparseMatrixCSR(A_constraint)
+    AT_gpu = CuSparseMatrixCSR(A_constraint')
+    b = CuVector(ones(Float64, 2 * n))
+    l = CUDA.zeros(Float64, n^2)
+    u = Inf * CUDA.ones(Float64, n^2)
+    
+    # Convert to standard QP_info format
+    standard_qp = QP_info_gpu(Q, c, A_gpu_sparse, AT_gpu, b, copy(b), l, u, 0.0, 
+                              CUDA.zeros(Float64, 0), false, false, CuVector{Float64}([]))
+
+    return standard_qp
+end
+
+# This function formulates a LASSO problem from a sparse matrix A, vector b, and regularization parameter lambda.
+function formulate_LASSO_from_A_b_lambda(A::SparseMatrixCSC, b::Vector{Float64}, lambda::Float64)
+    ## LASSO: min 0.5 ||Ax-b||^2 + λ ||x||_1
+    n_org = size(A, 2)
+    ATb = A' * b
+    lambda_vec = lambda * ones(n_org)
+    println("LASSO problem information: nRow = ", 0, ", nCol = ", n_org)
+    c = -ATb
+    c0 = 0.5 * norm(b)^2
+    Q = LASSO_Q_operator_gpu(CuSparseMatrixCSR(A), CuSparseMatrixCSR(A'))
+    A_constraint = CuSparseMatrixCSR(sparse([], [], Float64[], 0, n_org))
+    AT = CuSparseMatrixCSR(sparse([], [], Float64[], n_org, 0))
+    c_gpu = CuVector{Float64}(c)
+    lp_AL = CuVector{Float64}(zeros(0))
+    lp_AU = CuVector{Float64}(zeros(0))
+    l = CuVector{Float64}(-Inf * ones(n_org))
+    u = CuVector{Float64}(Inf * ones(n_org))
+    lambda_gpu = CuVector{Float64}(lambda_vec)
+
+    standard_qp = QP_info_gpu(Q, c_gpu, A_constraint, AT, lp_AL, lp_AU, l, u, c0,
+                              CUDA.zeros(Float64, 0), false, true, lambda_gpu)
+
+    return standard_qp
+end
+
+# This function reads a LASSO problem from a .mat file and prepares it for solving.
+function formulate_LASSO_from_mat(file::String)
+    ## LASSO: min 0.5 ||Ax-b||^2 + λ ||x||_1
+    LASSO = matread(file)
+    A = sparse(LASSO["A"])
+    b = reshape(LASSO["b"], size(A, 1))
+    n_org = size(A, 2)
+    ATb = A' * b
+    lambda_vec = 1e-3 * norm(ATb, Inf) * ones(n_org)
+    c = -ATb
+    c0 = 0.5 * norm(b)^2
+    Q = LASSO_Q_operator_gpu(CuSparseMatrixCSR(A), CuSparseMatrixCSR(A'))
+    A_constraint = CuSparseMatrixCSR(sparse([], [], Float64[], 0, n_org))
+    AT = CuSparseMatrixCSR(sparse([], [], Float64[], n_org, 0))
+    c_gpu = CuVector{Float64}(c)
+    lp_AL = CuVector{Float64}(zeros(0))
+    lp_AU = CuVector{Float64}(zeros(0))
+    l = CuVector{Float64}(-Inf * ones(n_org))
+    u = CuVector{Float64}(Inf * ones(n_org))
+    lambda_gpu = CuVector{Float64}(lambda_vec)
+
+    standard_qp = QP_info_gpu(Q, c_gpu, A_constraint, AT, lp_AL, lp_AU, l, u, c0,
+                              CUDA.zeros(Float64, 0), false, true, lambda_gpu)
+
+    return standard_qp
+end
+
+# Scaling function for operator-based QP problems (QAP/LASSO)
+function scaling!(qp::QP_info_gpu, params::HPRQP_parameters)
+    m, n = size(qp.A)
+    row_norm = ones(m)
+    col_norm = ones(n)
+
+    AL_nInf = Array(qp.AL)
+    AU_nInf = Array(qp.AU)
+    AL_nInf[AL_nInf.==-Inf] .= 0.0
+    AU_nInf[AU_nInf.==Inf] .= 0.0
+    c_arr = Array(qp.c)
+    l_arr = Array(qp.l)
+    
+    scaling_info = Scaling_info_gpu(CuVector(copy(l_arr)), CuVector(copy(l_arr)), 
+                                     CuVector(row_norm), CuVector(col_norm), 
+                                     1.0, 1.0, 1.0, 1.0, 
+                                     norm(max.(abs.(AL_nInf), abs.(AU_nInf)), Inf), 
+                                     norm(c_arr, Inf))
+    
+    if params.use_bc_scaling
+        b_norm = norm(min.(AL_nInf, AU_nInf))
+        c_norm = norm(c_arr)
+        b_scale = max(1.0, b_norm, c_norm)
+        c_scale = b_scale
+
+        qp.AL ./= b_scale
+        qp.AU ./= b_scale
+        qp.c ./= c_scale
+        if length(qp.lambda) > 0
+            qp.lambda ./= c_scale
+        end
+        qp.l ./= b_scale
+        qp.u ./= b_scale
+        scaling_info.b_scale = b_scale
+        scaling_info.c_scale = c_scale
+    else
+        scaling_info.b_scale = 1.0
+        scaling_info.c_scale = 1.0
+    end
+
+    AL_nInf = Array(qp.AL)
+    AU_nInf = Array(qp.AU)
+    AL_nInf[AL_nInf.==-Inf] .= 0.0
+    AU_nInf[AU_nInf.==Inf] .= 0.0
+    c_arr = Array(qp.c)
+    scaling_info.norm_b = norm(max.(abs.(AL_nInf), abs.(AU_nInf)))
+    scaling_info.norm_c = norm(c_arr)
+    scaling_info.row_norm = CuVector(row_norm)
+    scaling_info.col_norm = CuVector(col_norm)
+    
+    return scaling_info
+end
+
+# Power iteration to estimate the largest eigenvalue of Q for QAP problem
+function power_iteration_Q_QAP_gpu(Q::QAP_Q_operator_gpu, max_iterations::Int=5000, tolerance::Float64=1e-4)
+    seed = 1
+    n = Q.n^2
+    z = CuVector(randn(Random.MersenneTwister(seed), n)) .+ 1e-8
+    q = CUDA.zeros(Float64, n)
+    lambda_max = 1.0
+    temp1 = CUDA.zeros(Float64, n)
+    error = 1.0
+    for i in 1:max_iterations
+        q .= z
+        if CUDA.norm(q) < 1e-15
+            println("Power iteration failed to converge.")
+            return 1.0
+        end
+        q ./= CUDA.norm(q)
+        Qmap!(q, z, temp1, Q)
+        lambda_max = CUDA.dot(q, z)
+        q .= z .- lambda_max .* q
+        error = CUDA.norm(q) / (CUDA.norm(z) + lambda_max)
+        if error < tolerance
+            return lambda_max
+        end
+    end
+    println("Power iteration did not converge within the specified tolerance.")
+    println("The maximum iteration is ", max_iterations, " and the error is ", error)
+    return lambda_max
+end
+
+# Power iteration to estimate the largest eigenvalue of Q for LASSO problem
+function power_iteration_Q_LASSO_gpu(Q::LASSO_Q_operator_gpu, max_iterations::Int=5000, tolerance::Float64=1e-4)
+    seed = 1
+    m, n = size(Q.A)
+    z = CuVector(randn(Random.MersenneTwister(seed), n)) .+ 1e-8
+    q = CUDA.zeros(Float64, n)
+    lambda_max = 1.0
+    temp1 = CUDA.zeros(Float64, m)
+    error = 1.0
+    for i in 1:max_iterations
+        q .= z
+        if CUDA.norm(q) < 1e-15
+            println("Power iteration failed to converge.")
+            return 1.0
+        end
+        q ./= CUDA.norm(q)
+        Qmap!(q, z, temp1, Q)
+        lambda_max = CUDA.dot(q, z)
+        q .= z .- lambda_max .* q
+        error = CUDA.norm(q) / (CUDA.norm(z) + lambda_max)
+        if error < tolerance
+            return lambda_max
+        end
+    end
+    println("Power iteration did not converge within the specified tolerance.")
+    println("The maximum iteration is ", max_iterations, " and the error is ", error)
+    return lambda_max
+end
+
+# Run the HPR-QP algorithm on a QAP/LASSO .mat file
+function run_file_operator(FILE_NAME::String, params::HPRQP_parameters)
+    CUDA.device!(params.device_number)
+    t_start = time()
+    println("READING FILE ... ", FILE_NAME)
+    if endswith(FILE_NAME, ".mat") && params.problem_type == "QAP"
+        standard_qp_gpu = read_QAP_mat(FILE_NAME)
+    elseif endswith(FILE_NAME, ".mat") && params.problem_type == "LASSO"
+        standard_qp_gpu = formulate_LASSO_from_mat(FILE_NAME)
+    else
+        println("For operator-based problems, we only support QAP and LASSO instances in .mat format")
+        error("the file format is: ", FILE_NAME[end-2:end], ", but the problem type is: ", params.problem_type)
+    end
+    read_time = time() - t_start
+    println(@sprintf("READING FILE time: %.2f seconds", read_time))
+
+    setup_start = time()
+    if params.use_bc_scaling
+        t_start = time()
+        println("SCALING ... ")
+        scaling_info_gpu = scaling!(standard_qp_gpu, params)
+        println(@sprintf("SCALING time: %.2f seconds", time() - t_start))
+    else
+        println("SCALING: OFF")
+        scaling_info_gpu = scaling!(standard_qp_gpu, params)
+    end
+    setup_time = time() - setup_start
+
+    results = solve(standard_qp_gpu, scaling_info_gpu, params)
+    println(@sprintf("Total time: %.2fs", read_time + setup_time + results.time),
+        @sprintf("  read time = %.2fs", read_time),
+        @sprintf("  setup time = %.2fs", setup_time),
+        @sprintf("  solve time = %.2fs", results.time))
+
+    return results
+end
+
+# Solve LASSO problem directly from A, b matrices
+function solve_LASSO_from_A_b(A::SparseMatrixCSC, b::Vector{Float64}, params::HPRQP_parameters)
+    CUDA.device!(params.device_number)
+    t_start = time()
+    setup_start = time()
+    println("FORMULATING ... ")
+    standard_qp_gpu = formulate_LASSO_from_A_b_lambda(A, b, params.lambda)
+    println(@sprintf("FORMULATING time: %.2f seconds", time() - t_start))
+
+    if params.use_bc_scaling
+        t_start = time()
+        println("SCALING ... ")
+        scaling_info_gpu = scaling!(standard_qp_gpu, params)
+        println(@sprintf("SCALING time: %.2f seconds", time() - t_start))
+    else
+        println("SCALING: OFF")
+        scaling_info_gpu = scaling!(standard_qp_gpu, params)
+    end
+
+    setup_time = time() - setup_start
     results = solve(standard_qp_gpu, scaling_info_gpu, params)
     println(@sprintf("Total time: %.2fs", setup_time + results.time),
         @sprintf("  setup time = %.2fs", setup_time),

@@ -32,6 +32,7 @@ params.max_iter = typemax(Int32)
 params.time_limit = 3600
 params.stoptol = 1e-8
 params.device_number = 0 
+params.warm_up = true
 
 result = HPRQP.run_qp(Q, c, A, AL, AU, l, u, obj_constant, params)
 

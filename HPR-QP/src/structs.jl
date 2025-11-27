@@ -1,3 +1,26 @@
+# Abstract type for Q operators (allows defining Q implicitly as a linear operator)
+abstract type AbstractQOperator end
+
+# This struct stores the problem data for QAP (Quadratic Assignment Problem).
+# Q(X) = 2*(AXB - SX - XT) where X is n×n reshaped from vector x of length n²
+mutable struct QAP_Q_operator_gpu <: AbstractQOperator
+    A::CuMatrix{Float64}
+    B::CuMatrix{Float64}
+    S::CuMatrix{Float64}
+    T::CuMatrix{Float64}
+    n::Int
+end
+
+# This struct stores the problem data for LASSO.
+# Q(x) = A'*(A*x) where A is the data matrix
+mutable struct LASSO_Q_operator_gpu <: AbstractQOperator
+    A::CuSparseMatrixCSR{Float64,Int32}
+    AT::CuSparseMatrixCSR{Float64,Int32}
+end
+
+# Union type for Q that can be either a sparse matrix or an operator
+const QType = Union{CuSparseMatrixCSR{Float64,Int32}, AbstractQOperator}
+
 # This struct stores the problem data.
 mutable struct QP_info_cpu
     """
@@ -52,8 +75,9 @@ mutable struct QP_info_cpu
 end
 
 # This struct stores the problem data for GPU computations.
+# Q can be either a sparse matrix or a Q operator (for QAP/LASSO problems)
 mutable struct QP_info_gpu
-    Q::CuSparseMatrixCSR{Float64,Int32}
+    Q::QType  # Union{CuSparseMatrixCSR{Float64,Int32}, AbstractQOperator}
     c::CuVector{Float64}
     A::CuSparseMatrixCSR{Float64,Int32}
     AT::CuSparseMatrixCSR{Float64,Int32}
@@ -65,6 +89,7 @@ mutable struct QP_info_gpu
     diag_Q::CuVector{Float64}
     Q_is_diag::Bool
     noC::Bool
+    lambda::CuVector{Float64}  # Regularization parameter for LASSO problems
 end
 
 # This struct stores the scaling information.
@@ -128,7 +153,12 @@ mutable struct HPRQP_parameters
             If true, applies L2-norm based scaling.
         use_Pock_Chambolle_scaling::Bool
             If true, applies Pock-Chambolle scaling to the problem data.
+        problem_type::String
+            Type of problem being solved (e.g., "QP", "LASSO", "QAP").
+        lambda::Float64
+            Regularization parameter for LASSO problems.
     """
+    restart::Int
     stoptol::Float64
     sigma::Float64
     max_iter::Int
@@ -145,7 +175,10 @@ mutable struct HPRQP_parameters
     use_bc_scaling::Bool
     use_l2_scaling::Bool
     use_Pock_Chambolle_scaling::Bool
-    HPRQP_parameters() = new(1e-6, -1, typemax(Int32), false, 3600.0, 1.05, 100, false, "auto", -1, 0, true, false, false, true)
+    # problem type and regularization
+    problem_type::String
+    lambda::Float64
+    HPRQP_parameters() = new(-1, 1e-6, -1, typemax(Int32), false, 3600.0, 1.05, 100, false, "auto", -1, 0, true, false, false, true, "QP", 0.0)
 end
 
 # This struct stores the residuals and other metrics during the HPR-QP algorithm.
@@ -174,7 +207,7 @@ mutable struct HPRQP_results
     primal_obj::Float64      # Final value of the primal objective function.
     residuals::Float64       # Final value of the residuals.
     gap::Float64             # Final duality gap.
-    output_type::String      # Status or type of output (e.g., "OPTIMAL", "MAX_ITER", "TIME_LIMIT").
+    status::String      # Status or type of output (e.g., "OPTIMAL", "MAX_ITER", "TIME_LIMIT").
     x::Vector{Float64}       # Solution vector for the primal variables.
     y::Vector{Float64}       # Solution vector for the dual variables (equality/inequality constraints).
     z::Vector{Float64}       # Solution vector for the dual variables (bounds).
@@ -197,7 +230,7 @@ mutable struct HPRQP_workspace_gpu
     y_bar::CuVector{Float64}
     dy::CuVector{Float64}
     z_bar::CuVector{Float64}
-    Q::CuSparseMatrixCSR{Float64,Int32}
+    Q::QType  # Can be sparse matrix or Q operator
     A::CuSparseMatrixCSR{Float64,Int32}
     AT::CuSparseMatrixCSR{Float64,Int32}
     AL::CuVector{Float64}
@@ -234,6 +267,8 @@ mutable struct HPRQP_workspace_gpu
     fact2::CuVector{Float64}
     fact::CuVector{Float64}
     fact_M::CuVector{Float64}
+    temp1::CuVector{Float64}  # Temporary vector for Q operator computations
+    lambda::CuVector{Float64}  # Regularization parameter for LASSO
     HPRQP_workspace_gpu() = new()
 end
 
