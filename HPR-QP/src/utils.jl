@@ -67,9 +67,9 @@ function qp_formulation_noC(Q::SparseMatrixCSC,
     idxB = setdiff(idxB, idxE)
 
     # check dimension of Q, c, A, l, u, AL, AU
-    println("problem information: nRow = ", size(A, 1), ", nCol = ", size(A, 2), ", nnz Q = ", nnz(Q), ", nnz A = ", nnz(A))
-    println("                     number of equalities = ", length(idxE))
-    println("                     number of inequalities = ", length(idxG) + length(idxL) + length(idxB))
+    # println("problem information: nRow = ", size(A, 1), ", nCol = ", size(A, 2), ", nnz Q = ", nnz(Q), ", nnz A = ", nnz(A))
+    # println("                     number of equalities = ", length(idxE))
+    # println("                     number of inequalities = ", length(idxG) + length(idxL) + length(idxB))
     @assert size(Q, 1) == size(Q, 2)
     @assert size(Q, 1) == length(c)
     @assert size(A, 2) == length(c)
@@ -78,7 +78,7 @@ function qp_formulation_noC(Q::SparseMatrixCSC,
     @assert length(AL) == length(AU)
     @assert length(AL) == size(A, 1)
 
-    standard_qp = QP_info_cpu(Q, c, A, A', AL, AU, l, u, c0, [], false, true)
+    standard_qp = QP_info_cpu(Q, c, A, A', AL, AU, l, u, c0, [], false, true, 0.0)
 
     # Return the modified qp
     return standard_qp
@@ -115,9 +115,9 @@ function qp_formulation(Q::SparseMatrixCSC,
     idxB = setdiff(idxB, idxE)
 
     # check dimension of Q, c, A, l, u, AL, AU
-    println("problem information: nRow = ", size(A, 1), ", nCol = ", size(A, 2), ", nnz Q = ", nnz(Q), ", nnz A = ", nnz(A))
-    println("                     number of equalities = ", length(idxE))
-    println("                     number of inequalities = ", length(idxG) + length(idxL) + length(idxB))
+    # println("problem information: nRow = ", size(A, 1), ", nCol = ", size(A, 2), ", nnz Q = ", nnz(Q), ", nnz A = ", nnz(A))
+    # println("                     number of equalities = ", length(idxE))
+    # println("                     number of inequalities = ", length(idxG) + length(idxL) + length(idxB))
     @assert size(Q, 1) == size(Q, 2)
     @assert size(Q, 1) == length(c)
     @assert size(A, 2) == length(c)
@@ -127,7 +127,7 @@ function qp_formulation(Q::SparseMatrixCSC,
     @assert length(AL) == size(A, 1)
 
 
-    standard_qp = QP_info_cpu(Q, c, A, A', AL, AU, l, u, c0, [], false, false)
+    standard_qp = QP_info_cpu(Q, c, A, A', AL, AU, l, u, c0, [], false, false, 0.0)
 
     # Return the modified qp
     return standard_qp
@@ -275,8 +275,734 @@ function scaling!(qp::QP_info_cpu, params::HPRQP_parameters)
     return scaling_info
 end
 
+# GPU-based scaling function for the QP problem
+function scaling_gpu!(qp::QP_info_gpu, params::HPRQP_parameters)
+    m = size(qp.A, 1)
+    n = size(qp.A, 2)
+
+    # Check if Q is a sparse matrix (not an operator)
+    # If Q is an operator (QAP/LASSO), we skip ALL scaling
+    Q_is_sparse = isa(qp.Q, CuSparseMatrixCSR{Float64,Int32})
+
+    if !Q_is_sparse
+        println("Q is an operator - skipping ALL scaling")
+        # Return minimal scaling info with no scaling applied
+        row_norm = CUDA.ones(Float64, m)
+        col_norm = CUDA.ones(Float64, n)
+
+        AL_nInf = copy(qp.AL)
+        AU_nInf = copy(qp.AU)
+        AL_nInf[qp.AL.==-Inf] .= 0.0
+        AU_nInf[qp.AU.==Inf] .= 0.0
+        norm_b_org = CUDA.norm(max.(abs.(AL_nInf), abs.(AU_nInf)), Inf)
+        norm_c_org = CUDA.norm(qp.c, Inf)
+
+        scaling_info = Scaling_info_gpu(
+            copy(qp.l), copy(qp.u),
+            row_norm, col_norm,
+            1.0, 1.0, 1.0, 1.0,
+            norm_b_org, norm_c_org
+        )
+
+        scaling_info.norm_b = CUDA.norm(max.(abs.(AL_nInf), abs.(AU_nInf)))
+        scaling_info.norm_c = CUDA.norm(qp.c)
+
+        return scaling_info
+    end
+
+    # For sparse Q, proceed with normal scaling
+    # Initialize scaling vectors on GPU
+    row_norm = CUDA.ones(Float64, m)
+    col_norm = CUDA.ones(Float64, n)
+
+    # Compute original norms for scaling info
+    AL_nInf = copy(qp.AL)
+    AU_nInf = copy(qp.AU)
+    AL_nInf[qp.AL.==-Inf] .= 0.0
+    AU_nInf[qp.AU.==Inf] .= 0.0
+    norm_b_org = CUDA.norm(max.(abs.(AL_nInf), abs.(AU_nInf)), Inf)
+    norm_c_org = CUDA.norm(qp.c, Inf)
+
+    # Initialize scaling info
+    scaling_info = Scaling_info_gpu(
+        copy(qp.l), copy(qp.u),
+        row_norm, col_norm,
+        1.0, 1.0, 1.0, 1.0,
+        norm_b_org, norm_c_org
+    )
+
+    # Get CSR matrix components for A and AT
+    A_rowPtr = qp.A.rowPtr
+    A_colVal = qp.A.colVal
+    A_nzVal = qp.A.nzVal
+    AT_rowPtr = qp.AT.rowPtr
+    AT_colVal = qp.AT.colVal
+    AT_nzVal = qp.AT.nzVal
+
+    # Temporary vectors for scaling
+    temp_row_norm = CUDA.ones(Float64, m)
+    temp_col_norm = CUDA.ones(Float64, n)
+
+    Q_rowPtr = Q_is_sparse ? qp.Q.rowPtr : nothing
+    Q_colVal = Q_is_sparse ? qp.Q.colVal : nothing
+    Q_nzVal = Q_is_sparse ? qp.Q.nzVal : nothing
+
+    # Ruiz scaling - only if Q is a sparse matrix
+    if params.use_Ruiz_scaling && Q_is_sparse
+        for _ in 1:10
+            if Q_is_sparse
+                # Compute column-wise max of |Q| and |A| combined
+                @cuda threads = 256 blocks = ceil(Int, n / 256) compute_row_max_abs_with_Q_kernel!(
+                    AT_rowPtr, AT_nzVal, Q_rowPtr, Q_nzVal, temp_col_norm, n
+                )
+            else
+                # Just compute column-wise max of |A| via AT
+                @cuda threads = 256 blocks = ceil(Int, n / 256) compute_col_max_abs_kernel!(
+                    AT_rowPtr, AT_nzVal, temp_col_norm, n
+                )
+            end
+            CUDA.synchronize()
+
+            # Compute row-wise max of |A|
+            @cuda threads = 256 blocks = ceil(Int, m / 256) compute_row_max_abs_kernel!(
+                A_rowPtr, A_nzVal, temp_row_norm, m
+            )
+            CUDA.synchronize()
+
+            # Update cumulative norms
+            row_norm .*= temp_row_norm
+            col_norm .*= temp_col_norm
+
+            # Scale Q if it's a sparse matrix
+            if Q_is_sparse
+                # Scale Q: Q = DC * Q * DC (both rows and cols by temp_col_norm)
+                @cuda threads = 256 blocks = ceil(Int, n / 256) scale_rows_csr_kernel!(
+                    Q_rowPtr, Q_nzVal, temp_col_norm, n
+                )
+                CUDA.synchronize()
+
+                @cuda threads = 256 blocks = ceil(Int, n / 256) scale_csr_cols_kernel!(
+                    Q_rowPtr, Q_colVal, Q_nzVal, temp_col_norm, n
+                )
+                CUDA.synchronize()
+            end
+
+            # Scale A: A = DR * A * DC (rows by temp_row_norm, cols by temp_col_norm)
+            @cuda threads = 256 blocks = ceil(Int, m / 256) scale_rows_csr_kernel!(
+                A_rowPtr, A_nzVal, temp_row_norm, m
+            )
+            CUDA.synchronize()
+
+            @cuda threads = 256 blocks = ceil(Int, m / 256) scale_csr_cols_kernel!(
+                A_rowPtr, A_colVal, A_nzVal, temp_col_norm, m
+            )
+            CUDA.synchronize()
+
+            # Scale AT: AT = DC * AT * DR (rows by temp_col_norm, cols by temp_row_norm)
+            @cuda threads = 256 blocks = ceil(Int, n / 256) scale_rows_csr_kernel!(
+                AT_rowPtr, AT_nzVal, temp_col_norm, n
+            )
+            CUDA.synchronize()
+
+            @cuda threads = 256 blocks = ceil(Int, n / 256) scale_csr_cols_kernel!(
+                AT_rowPtr, AT_colVal, AT_nzVal, temp_row_norm, n
+            )
+            CUDA.synchronize()
+
+            # Scale objective and constraint bounds
+            @cuda threads = 256 blocks = ceil(Int, n / 256) scale_vector_div_kernel!(
+                qp.c, temp_col_norm, n
+            )
+            CUDA.synchronize()
+
+            # Scale constraint bounds
+            @cuda threads = 256 blocks = ceil(Int, m / 256) scale_vector_div_kernel!(
+                qp.AL, temp_row_norm, m
+            )
+            @cuda threads = 256 blocks = ceil(Int, m / 256) scale_vector_div_kernel!(
+                qp.AU, temp_row_norm, m
+            )
+            CUDA.synchronize()
+
+            # Scale variable bounds
+            @cuda threads = 256 blocks = ceil(Int, n / 256) scale_vector_mul_kernel!(
+                qp.l, temp_col_norm, n
+            )
+            @cuda threads = 256 blocks = ceil(Int, n / 256) scale_vector_mul_kernel!(
+                qp.u, temp_col_norm, n
+            )
+            CUDA.synchronize()
+        end
+    end
+
+    # Pock-Chambolle scaling - only if Q is a sparse matrix
+    if params.use_Pock_Chambolle_scaling && Q_is_sparse
+        if Q_is_sparse
+            # Compute column-wise sum of |Q| and |A| combined
+            @cuda threads = 256 blocks = ceil(Int, n / 256) compute_col_sum_abs_with_Q_kernel!(
+                AT_rowPtr, AT_nzVal, Q_rowPtr, Q_nzVal, temp_col_norm, n
+            )
+        else
+            # Just compute column-wise sum of |A| via AT
+            @cuda threads = 256 blocks = ceil(Int, n / 256) compute_col_sum_abs_kernel!(
+                AT_rowPtr, AT_nzVal, temp_col_norm, n
+            )
+        end
+        CUDA.synchronize()
+
+        # Compute row-wise sum of |A|
+        @cuda threads = 256 blocks = ceil(Int, m / 256) compute_row_sum_abs_kernel!(
+            A_rowPtr, A_nzVal, temp_row_norm, m
+        )
+        CUDA.synchronize()
+
+        # Update cumulative norms
+        row_norm .*= temp_row_norm
+        col_norm .*= temp_col_norm
+
+        # Scale Q if it's a sparse matrix
+        if Q_is_sparse
+            # Scale Q: Q = DC * Q * DC
+            @cuda threads = 256 blocks = ceil(Int, n / 256) scale_rows_csr_kernel!(
+                Q_rowPtr, Q_nzVal, temp_col_norm, n
+            )
+            CUDA.synchronize()
+
+            @cuda threads = 256 blocks = ceil(Int, n / 256) scale_csr_cols_kernel!(
+                Q_rowPtr, Q_colVal, Q_nzVal, temp_col_norm, n
+            )
+            CUDA.synchronize()
+        end
+
+        # Scale A: A = DR * A * DC
+        @cuda threads = 256 blocks = ceil(Int, m / 256) scale_rows_csr_kernel!(
+            A_rowPtr, A_nzVal, temp_row_norm, m
+        )
+        CUDA.synchronize()
+
+        @cuda threads = 256 blocks = ceil(Int, m / 256) scale_csr_cols_kernel!(
+            A_rowPtr, A_colVal, A_nzVal, temp_col_norm, m
+        )
+        CUDA.synchronize()
+
+        # Scale AT: AT = DC * AT * DR
+        @cuda threads = 256 blocks = ceil(Int, n / 256) scale_rows_csr_kernel!(
+            AT_rowPtr, AT_nzVal, temp_col_norm, n
+        )
+        CUDA.synchronize()
+
+        @cuda threads = 256 blocks = ceil(Int, n / 256) scale_csr_cols_kernel!(
+            AT_rowPtr, AT_colVal, AT_nzVal, temp_row_norm, n
+        )
+        CUDA.synchronize()
+
+        # Scale objective and bounds
+        @cuda threads = 256 blocks = ceil(Int, n / 256) scale_vector_div_kernel!(
+            qp.c, temp_col_norm, n
+        )
+        @cuda threads = 256 blocks = ceil(Int, m / 256) scale_vector_div_kernel!(
+            qp.AL, temp_row_norm, m
+        )
+        @cuda threads = 256 blocks = ceil(Int, m / 256) scale_vector_div_kernel!(
+            qp.AU, temp_row_norm, m
+        )
+        @cuda threads = 256 blocks = ceil(Int, n / 256) scale_vector_mul_kernel!(
+            qp.l, temp_col_norm, n
+        )
+        @cuda threads = 256 blocks = ceil(Int, n / 256) scale_vector_mul_kernel!(
+            qp.u, temp_col_norm, n
+        )
+        CUDA.synchronize()
+    end
+
+    # b and c scaling, dont use it for now
+    if params.use_bc_scaling && false
+        AL_nInf = copy(qp.AL)
+        AU_nInf = copy(qp.AU)
+        AL_nInf[qp.AL.==-Inf] .= 0.0
+        AU_nInf[qp.AU.==Inf] .= 0.0
+        b_scale = 1 + CUDA.norm(max.(abs.(AL_nInf), abs.(AU_nInf)))
+        c_scale = 1 + CUDA.norm(qp.c)
+
+        println("b_scale: ", b_scale)
+        println("c_scale: ", c_scale)
+
+        # Scale Q: Q *= b_scale / c_scale
+        if Q_is_sparse
+            scale_factor = b_scale / c_scale
+            @cuda threads = 256 blocks = ceil(Int, n / 256) scale_vector_scalar_mul_kernel!(
+                Q_nzVal, scale_factor, length(Q_nzVal)
+            )
+            CUDA.synchronize()
+        end
+
+        @cuda threads = 256 blocks = ceil(Int, m / 256) scale_vector_scalar_div_kernel!(
+            qp.AL, b_scale, m
+        )
+        @cuda threads = 256 blocks = ceil(Int, m / 256) scale_vector_scalar_div_kernel!(
+            qp.AU, b_scale, m
+        )
+        @cuda threads = 256 blocks = ceil(Int, n / 256) scale_vector_scalar_div_kernel!(
+            qp.c, c_scale, n
+        )
+        @cuda threads = 256 blocks = ceil(Int, n / 256) scale_vector_scalar_div_kernel!(
+            qp.l, b_scale, n
+        )
+        @cuda threads = 256 blocks = ceil(Int, n / 256) scale_vector_scalar_div_kernel!(
+            qp.u, b_scale, n
+        )
+        CUDA.synchronize()
+
+        scaling_info.b_scale = b_scale
+        scaling_info.c_scale = c_scale
+    else
+        scaling_info.b_scale = 1.0
+        scaling_info.c_scale = 1.0
+    end
+
+    # Update diagonal of Q if Q is sparse
+    if Q_is_sparse
+        # Extract diagonal from GPU Q matrix
+        diag_Q = CUDA.zeros(Float64, n)
+        # This is a simple approach - extract diagonal elements
+        Q_cpu = SparseMatrixCSC(qp.Q)
+        diag_Q_cpu = diag(Q_cpu)
+        qp.diag_Q = CuVector(diag_Q_cpu)
+
+        # Check if Q is diagonal
+        temp_norm_Q = sum(abs, Q_cpu, dims=1)[1, :]
+        Q_is_diag = (sum(temp_norm_Q .== abs.(diag_Q_cpu)) == length(temp_norm_Q))
+        qp.Q_is_diag = Q_is_diag
+
+        # Symmetrize Q to eliminate numerical errors
+        Q_cpu = (Q_cpu + transpose(Q_cpu)) / 2
+        qp.Q = CuSparseMatrixCSR(Q_cpu)
+    end
+
+    # Compute final norms
+    AL_nInf = copy(qp.AL)
+    AU_nInf = copy(qp.AU)
+    AL_nInf[qp.AL.==-Inf] .= 0.0
+    AU_nInf[qp.AU.==Inf] .= 0.0
+    scaling_info.norm_b = CUDA.norm(max.(abs.(AL_nInf), abs.(AU_nInf)))
+    scaling_info.norm_c = CUDA.norm(qp.c)
+
+    # Store the cumulative scaling norms
+    scaling_info.row_norm = row_norm
+    scaling_info.col_norm = col_norm
+
+    return scaling_info
+end
+
 function mean(x::Vector{Float64})
     return sum(x) / length(x)
+end
+
+# ==================== Build Functions (Public API) ====================
+
+"""
+    build_from_mps(filename::String; verbose::Bool=true)
+
+Build a QP model from an MPS file.
+
+This function reads a QP problem from an MPS file and returns a CPU-based model
+that can be solved with `optimize()` or `solve()`.
+
+# Arguments
+- `filename::String`: Path to the MPS file
+- `verbose::Bool`: Whether to print progress information (default: true)
+
+# Returns
+- `QP_info_cpu`: QP model ready to be solved
+
+# Example
+```julia
+using HPRQP
+
+model = build_from_mps("problem.mps")
+params = HPRQP_parameters()
+result = optimize(model, params)
+```
+
+See also: [`build_from_QAbc`](@ref), [`build_from_mat`](@ref), [`optimize`](@ref)
+"""
+function build_from_mps(filename::String; verbose::Bool=true)
+    t_start = time()
+    if verbose
+        println("READING FILE ... ", filename)
+    end
+    Q, c, A, lcon, ucon, lvar, uvar, c0 = read_mps(filename)
+    read_time = time() - t_start
+    if verbose
+        println(@sprintf("READING FILE time: %.2f seconds", read_time))
+    end
+
+    t_start = time()
+    if verbose
+        println("FORMULATING QP ...")
+    end
+    number_empty_lu = sum((lvar .== -Inf) .& (uvar .== Inf))
+    if (number_empty_lu > 0.8 * length(lvar)) && false
+        ## dont use this branch for now
+        standard_qp = qp_formulation_noC(Q, c, A, lcon, ucon, lvar, uvar, c0)
+        if verbose
+            println("QP formulation without C")
+        end
+    else
+        standard_qp = qp_formulation(Q, c, A, lcon, ucon, lvar, uvar, c0)
+        if verbose
+            println("QP formulation with C")
+        end
+    end
+    if verbose
+        println(@sprintf("FORMULATING QP time: %.2f seconds", time() - t_start))
+    end
+
+    return standard_qp
+end
+
+"""
+    build_from_QAbc(Q, c, A, AL, AU, l, u, obj_constant=0.0)
+
+Build a QP model from matrix form.
+
+This function creates a QP problem from the standard form:
+    min  0.5 <x,Qx> + <c,x> + obj_constant
+    s.t. AL <= Ax <= AU
+         l <= x <= u
+
+# Arguments
+- `Q::SparseMatrixCSC`: Quadratic objective matrix (n × n)
+- `c::Vector{Float64}`: Linear objective coefficients (length n)
+- `A::SparseMatrixCSC`: Constraint matrix (m × n)
+- `AL::Vector{Float64}`: Lower bounds for constraints Ax (length m)
+- `AU::Vector{Float64}`: Upper bounds for constraints Ax (length m)
+- `l::Vector{Float64}`: Lower bounds for variables x (length n)
+- `u::Vector{Float64}`: Upper bounds for variables x (length n)
+- `obj_constant::Float64`: Constant term in objective function (default: 0.0)
+
+# Returns
+- `QP_info_cpu`: QP model ready to be solved
+
+# Example
+```julia
+using SparseArrays, HPRQP
+
+Q = sparse([2.0 0.0; 0.0 2.0])
+c = [-3.0, -5.0]
+A = sparse([-1.0 -2.0; -3.0 -1.0])
+AL = [-10.0, -12.0]
+AU = [Inf, Inf]
+l = [0.0, 0.0]
+u = [Inf, Inf]
+
+model = build_from_QAbc(Q, c, A, AL, AU, l, u)
+params = HPRQP_parameters()
+result = optimize(model, params)
+```
+
+See also: [`build_from_mps`](@ref), [`build_from_mat`](@ref), [`optimize`](@ref)
+"""
+function build_from_QAbc(Q::SparseMatrixCSC,
+    c::Vector{Float64},
+    A::SparseMatrixCSC,
+    AL::Vector{Float64},
+    AU::Vector{Float64},
+    l::Vector{Float64},
+    u::Vector{Float64},
+    obj_constant::Float64=0.0;
+    verbose::Bool=true)
+
+    # Create copies to avoid modifying the input
+    Q = copy(Q)
+    c = copy(c)
+    A = copy(A)
+    lcon = copy(AL)
+    ucon = copy(AU)
+    lvar = copy(l)
+    uvar = copy(u)
+
+    t_start = time()
+    if verbose
+        println("FORMULATING QP ...")
+    end
+    number_empty_lu = sum((lvar .== -Inf) .& (uvar .== Inf))
+    if (number_empty_lu > 0.8 * length(lvar)) && false
+        ## dont use this branch for now
+        standard_qp = qp_formulation_noC(Q, c, A, lcon, ucon, lvar, uvar, obj_constant)
+        if verbose
+            println("QP formulation without C")
+        end
+    else
+        standard_qp = qp_formulation(Q, c, A, lcon, ucon, lvar, uvar, obj_constant)
+        if verbose
+            println("QP formulation with C")
+        end
+    end
+    if verbose
+        println(@sprintf("FORMULATING QP time: %.2f seconds", time() - t_start))
+    end
+
+    return standard_qp
+end
+
+"""
+    build_from_mat(filename::String; problem_type::String="QAP", lambda::Float64=1.0, verbose::Bool=true)
+
+Build a QP model from a MAT file (for QAP or LASSO problems).
+
+This function reads a QAP (Quadratic Assignment Problem) or LASSO problem from a .mat file.
+Note: This function stores metadata that will be used to create operator-based models during solve().
+
+# Arguments
+- `filename::String`: Path to the MAT file
+- `problem_type::String`: Type of problem - "QAP" or "LASSO" (default: "QAP")
+- `lambda::Float64`: Regularization parameter for LASSO (default: 1.0)
+- `verbose::Bool`: Whether to print progress information (default: true)
+
+# Returns
+- `Tuple`: (metadata_dict, problem_type) containing problem data
+
+# Example
+```julia
+using HPRQP
+
+model_info, prob_type = build_from_mat("qap_problem.mat", problem_type="QAP")
+params = HPRQP_parameters()
+params.problem_type = prob_type
+result = optimize((model_info, prob_type), params)
+```
+
+See also: [`build_from_mps`](@ref), [`build_from_QAbc`](@ref), [`optimize`](@ref)
+"""
+function build_from_mat(filename::String; problem_type::String="QAP", verbose::Bool=true)
+    t_start = time()
+    if verbose
+        println("READING FILE ... ", filename)
+    end
+
+    if problem_type == "QAP"
+        # Read QAP data from .mat file
+        QAPdata = matread(filename)
+        A = Matrix{Float64}(QAPdata["A"])
+        B = Matrix{Float64}(QAPdata["B"])
+        S = Matrix{Float64}(QAPdata["S"])
+        T = Matrix{Float64}(QAPdata["T"])
+        
+        read_time = time() - t_start
+        if verbose
+            println(@sprintf("READING FILE time: %.2f seconds", read_time))
+        end
+        
+        # Use the new build_from_ABST function
+        return build_from_ABST(A, B, S, T; verbose=verbose)
+
+    elseif problem_type == "LASSO"
+        # Read LASSO data from .mat file
+        data = matread(filename)
+        A_lasso = sparse(data["A"])
+        b = vec(data["b"])
+        
+        read_time = time() - t_start
+        if verbose
+            println(@sprintf("READING FILE time: %.2f seconds", read_time))
+        end
+
+        # Set lambda based on ||A'b||_inf (common heuristic)
+        lambda = 0.001 * norm(A_lasso' * b, Inf)
+        if verbose
+            println("Auto-selected lambda = ", lambda)
+        end
+        
+        # Use the new build_from_Ab_lambda function
+        return build_from_Ab_lambda(A_lasso, b, lambda; verbose=verbose)
+
+    else
+        error("Unknown problem_type: $problem_type. Supported types are 'QAP' and 'LASSO'.")
+    end
+end
+
+"""
+    build_from_ABST(A, B, S, T; verbose::Bool=true)
+
+Build a QP model for Quadratic Assignment Problem (QAP) from matrices A, B, S, T.
+
+This function creates a QAP problem in the standard form used by HPR-QP:
+    min  <vec(X), Q*vec(X)>
+    s.t. X*e = e, X'*e = e  (doubly stochastic constraints)
+         X >= 0
+
+Where Q(X) = 2*(A*X*B - S*X - X*T) is represented as a matrix-free operator using
+the CUSTOM_Q_OPERATOR API.
+
+# Arguments
+- `A::Matrix{Float64}`: Distance matrix for facility locations (n × n)
+- `B::Matrix{Float64}`: Flow matrix between facilities (n × n)
+- `S::Matrix{Float64}`: Linear term for rows (n × n)
+- `T::Matrix{Float64}`: Linear term for columns (n × n)
+- `verbose::Bool`: Whether to print progress information (default: true)
+
+# Returns
+- `QP_info_cpu`: QP model ready to be solved with operator-based Q
+
+# Example
+```julia
+using HPRQP
+
+# Define QAP data matrices
+n = 10
+A = rand(n, n)
+B = rand(n, n)
+S = zeros(n, n)
+T = zeros(n, n)
+
+model = build_from_ABST(A, B, S, T)
+params = HPRQP_parameters()
+result = optimize(model, params)
+```
+
+See also: [`build_from_Ab_lambda`](@ref), [`build_from_mat`](@ref), [`build_from_QAbc`](@ref), [`optimize`](@ref)
+"""
+function build_from_ABST(A::Matrix{Float64}, B::Matrix{Float64}, 
+                         S::Matrix{Float64}, T::Matrix{Float64}; 
+                         verbose::Bool=true)
+    t_start = time()
+    
+    # Validate dimensions
+    n = size(A, 1)
+    @assert size(A) == (n, n) "A must be square"
+    @assert size(B) == (n, n) "B must be square and same size as A"
+    @assert size(S) == (n, n) "S must be square and same size as A"
+    @assert size(T) == (n, n) "T must be square and same size as A"
+    
+    if verbose
+        println("FORMULATING QAP PROBLEM ...")
+        println("QAP problem information: nRow = ", 2 * n, ", nCol = ", n^2)
+    end
+
+    # Create constraint matrix: each row is assigned exactly once, each column exactly once
+    # Constraints: X*e = e, X'*e = e (doubly stochastic)
+    ee = ones(Float64, n)
+    Id = spdiagm(ones(Float64, n))
+    A_constraint = sparse(vcat(kron(ee', Id), kron(Id, ee')))
+
+    # Create the CPU operator struct (will be transferred to GPU via to_gpu interface)
+    Q_cpu = QAP_Q_operator_cpu(A, B, S, T, n)
+
+    # Create QP_info_cpu with Q operator stored directly in Q field
+    # Use to_gpu(qp.Q) to transfer to GPU
+    qp = QP_info_cpu(
+        Q_cpu,  # Q operator (CPU version, use to_gpu to transfer)
+        zeros(Float64, n^2),  # c vector (all zeros for QAP, linear term is in S and T)
+        SparseMatrixCSC{Float64,Int32}(A_constraint),  # Constraint matrix
+        SparseMatrixCSC{Float64,Int32}(A_constraint'),  # AT (transpose of constraint matrix)
+        ones(Float64, 2 * n),  # AL = b (equality constraints)
+        ones(Float64, 2 * n),  # AU = b (equality constraints)
+        zeros(Float64, n^2),  # l (lower bounds = 0)
+        fill(Inf, n^2),  # u (upper bounds = Inf)
+        0.0,  # obj_constant
+        Float64[],  # diag_Q (empty for operator)
+        false,  # Q_is_diag
+        false,  # noC
+        0.0,  # lambda (not used for QAP)
+    )
+
+    if verbose
+        println(@sprintf("FORMULATING QAP time: %.2f seconds", time() - t_start))
+        println("Note: Operator-based Q will be created on GPU during solve()")
+    end
+
+    return qp
+end
+
+"""
+    build_from_Ab_lambda(A, b, lambda; verbose::Bool=true)
+
+Build a QP model for LASSO regression from data matrix A, target vector b, and regularization λ.
+
+This function creates a LASSO problem in the standard form:
+    min  0.5 ||A*x - b||₂² + λ ||x||₁
+
+Which is reformulated as a QP with operator-based Q:
+    min  0.5 <x, Q*x> + <c, x> + constant
+    s.t. (no constraints on x, handled via proximal operator for L1)
+
+Where Q = A'*A is represented as a matrix-free operator using the CUSTOM_Q_OPERATOR API.
+
+# Arguments
+- `A::SparseMatrixCSC{Float64}`: Data matrix (m × n)
+- `b::Vector{Float64}`: Target vector (length m)
+- `lambda::Float64`: Regularization parameter (must be positive)
+- `verbose::Bool`: Whether to print progress information (default: true)
+
+# Returns
+- `QP_info_cpu`: QP model ready to be solved with operator-based Q
+
+# Example
+```julia
+using HPRQP, SparseArrays
+
+# Define LASSO data
+m, n = 100, 50
+A = sprandn(m, n, 0.1)
+b = randn(m)
+lambda = 0.01 * norm(A' * b, Inf)
+
+model = build_from_Ab_lambda(A, b, lambda)
+params = HPRQP_parameters()
+result = optimize(model, params)
+```
+
+See also: [`build_from_ABST`](@ref), [`build_from_mat`](@ref), [`build_from_QAbc`](@ref), [`optimize`](@ref)
+"""
+function build_from_Ab_lambda(A::SparseMatrixCSC{Float64}, b::Vector{Float64}, 
+                               lambda::Float64; verbose::Bool=true)
+    t_start = time()
+    
+    # Validate inputs
+    m, n = size(A)
+    @assert length(b) == m "Length of b must match number of rows in A"
+    @assert lambda > 0 "Lambda must be positive"
+    
+    if verbose
+        println("FORMULATING LASSO PROBLEM ...")
+        println("LASSO problem information: m = ", m, ", n = ", n)
+        println("Regularization lambda = ", lambda)
+    end
+
+    # Compute linear term c = -A'*b
+    c = -A' * b
+    
+    # Objective constant: 0.5 * ||b||²
+    obj_constant = 0.5 * norm(b)^2
+
+    # Create the CPU operator struct (will be transferred to GPU via to_gpu interface)
+    Q_cpu = LASSO_Q_operator_cpu(A)
+
+    # Create QP_info_cpu with Q operator stored directly in Q field
+    # Use to_gpu(qp.Q) to transfer to GPU
+    qp = QP_info_cpu(
+        Q_cpu,  # Q operator (CPU version, use to_gpu to transfer)
+        c,  # c vector = -A'*b
+        SparseMatrixCSC{Float64,Int32}(spzeros(0, n)),  # No constraints (empty matrix)
+        SparseMatrixCSC{Float64,Int32}(spzeros(n, 0)),  # AT (transpose of empty constraint matrix)
+        Float64[],  # AL (empty)
+        Float64[],  # AU (empty)
+        -Inf * ones(Float64, n),  # l (lower bounds = -Inf, no box constraints)
+        Inf * ones(Float64, n),  # u (upper bounds = Inf, no box constraints)
+        obj_constant,  # obj_constant = 0.5 * ||b||²
+        Float64[],  # diag_Q (empty for operator)
+        false,  # Q_is_diag
+        false,  # noC (we handle bounds via proximal operator)
+        lambda,  # lambda for LASSO regularization
+    )
+
+    if verbose
+        println(@sprintf("FORMULATING LASSO time: %.2f seconds", time() - t_start))
+        println("Note: Operator-based Q will be created on GPU during solve()")
+    end
+
+    return qp
 end
 
 # Power iteration method to find the largest eigenvalue of a matrix AAT using GPU
@@ -328,86 +1054,6 @@ function power_iteration_Q_gpu(Q::CuSparseMatrixCSR, max_iterations=5000, tolera
     println("Power iteration did not converge within the specified tolerance.")
     println("The maximum iteration is ", max_iterations, " and the error is ", error)
     return lambda_max
-end
-
-# Run the HPR-QP solver on a given file with specified parameters
-function run_file(FILE_NAME::String, params::HPRQP_parameters)
-    CUDA.device!(params.device_number)
-    t_start = time()
-    println("READING FILE ... ", FILE_NAME)
-    Q, c, A, lcon, ucon, lvar, uvar, c0 = read_mps(FILE_NAME)
-    read_time = time() - t_start
-    println(@sprintf("READING FILE time: %.2f seconds", read_time))
-
-    t_start = time()
-    setup_start = time()
-    println("FORMULATING QP ...")
-    number_empty_lu = sum((lvar .== -Inf) .& (uvar .== Inf))
-    if (number_empty_lu > 0.8 * length(lvar))
-        println("put C into K")
-        standard_qp = qp_formulation_noC(Q, c, A, lcon, ucon, lvar, uvar, c0)
-    else
-        standard_qp = qp_formulation(Q, c, A, lcon, ucon, lvar, uvar, c0)
-    end
-    t_end = time()
-    println(@sprintf("FORMULATING QP time: %.2f seconds", t_end - t_start))
-
-    t_start = time()
-    println("SCALING QP ... ")
-    scaling_info = scaling!(standard_qp, params)
-    t_end = time()
-    println(@sprintf("SCALING time: %.2f seconds", t_end - t_start))
-    if standard_qp.Q_is_diag
-        println("Q is diagonal: true")
-    else
-        println("Q is diagonal: false")
-    end
-
-    t_start_gpu = time()
-    CUDA.synchronize()
-    println("COPY TO GPU ...")
-    standard_qp_gpu = QP_info_gpu(
-        CuSparseMatrixCSR(standard_qp.Q),
-        CuVector(standard_qp.c),
-        CuSparseMatrixCSR(standard_qp.A),
-        CuSparseMatrixCSR(standard_qp.A'),
-        CuVector(standard_qp.AL),
-        CuVector(standard_qp.AU),
-        CuVector(standard_qp.l),
-        CuVector(standard_qp.u),
-        standard_qp.obj_constant,
-        CuVector(standard_qp.diag_Q),
-        standard_qp.Q_is_diag,
-        standard_qp.noC,
-        CuVector{Float64}([]),  # lambda (empty for standard QP)
-    )
-
-    scaling_info_gpu = Scaling_info_gpu(
-        CuVector(scaling_info.l_org),
-        CuVector(scaling_info.u_org),
-        CuVector(scaling_info.row_norm),
-        CuVector(scaling_info.col_norm),
-        scaling_info.b_scale,
-        scaling_info.c_scale,
-        scaling_info.norm_b,
-        scaling_info.norm_c,
-        scaling_info.norm_b_org,
-        scaling_info.norm_c_org)
-
-    CUDA.synchronize()
-    t_end_gpu = time()
-    println(@sprintf("COPY TO GPU time: %.2f seconds", t_end_gpu - t_start_gpu))
-    setup_time = time() - setup_start
-
-    results = solve(standard_qp_gpu, scaling_info_gpu, params)
-
-    println(@sprintf("Total time: %.2fs", read_time + setup_time + results.time),
-        @sprintf("  read time = %.2fs", read_time),
-        @sprintf("  setup time = %.2fs", setup_time),
-        @sprintf("  solve time = %.2fs", results.time))
-
-    return results
-
 end
 
 # Run the dataset of QP problems from a specified directory and save the results to a CSV file
@@ -466,7 +1112,8 @@ function run_dataset(data_path::String, result_path::String, params::HPRQP_param
                 warm_up_done = true
                 println("warm up starts: ---------------------------------------------------------------------------------------------------------- ")
                 t_start_all = time()
-                results = run_file(FILE_NAME, params)
+                model = build_from_mps(FILE_NAME, verbose=false)
+                results = optimize(model, params)
                 params.max_iter = max_iter
                 all_time = time() - t_start_all
                 println("warm up time: ", all_time)
@@ -478,7 +1125,8 @@ function run_dataset(data_path::String, result_path::String, params::HPRQP_param
                 println(@sprintf("solving the problem %d", i), @sprintf(": %s", file))
                 println("main run starts: ----------------------------------------------------------------------------------------------------------")
                 t_start_all = time()
-                results = run_file(FILE_NAME, params)
+                model = build_from_mps(FILE_NAME, verbose=true)
+                results = optimize(model, params)
                 all_time = time() - t_start_all
                 println("main run ends----------------------------------------------------------------------------------------------------------")
 
@@ -538,151 +1186,6 @@ function run_dataset(data_path::String, result_path::String, params::HPRQP_param
     close(io)
 end
 
-# the function to test the HPR-QP algorithm on a single file
-function run_single(file_name::String, params::HPRQP_parameters)
-
-    println("data path: ", file_name)
-
-    if occursin(".mps", file_name)
-        if params.warm_up
-            println("warm up starts: ---------------------------------------------------------------------------------------------------------- ")
-            t_start_all = time()
-            max_iter = params.max_iter
-            params.max_iter = 200
-            redirect_stdout(devnull) do
-                results = run_file(file_name, params)
-            end
-            params.max_iter = max_iter
-            all_time = time() - t_start_all
-            println("warm up time: ", all_time)
-            println("warm up ends ----------------------------------------------------------------------------------------------------------")
-        end
-
-        println("main run starts: ----------------------------------------------------------------------------------------------------------")
-        results = run_file(file_name, params)
-        println("main run ends----------------------------------------------------------------------------------------------------------")
-    else
-        error("The file is not in the correct format, please provide a .mps file")
-    end
-
-    return results
-end
-
-
-# it's used in demo_QAbc.jl
-function run_qp(Q::SparseMatrixCSC,
-    c::Vector{Float64},
-    A::SparseMatrixCSC,
-    lcon::Vector{Float64},
-    ucon::Vector{Float64},
-    lvar::Vector{Float64},
-    uvar::Vector{Float64},
-    c0::Float64,
-    params::HPRQP_parameters)
-
-    if params.warm_up
-        println("warm up starts: ---------------------------------------------------------------------------------------------------------- ")
-        t_start_all = time()
-        max_iter = params.max_iter
-        params.max_iter = 200
-        redirect_stdout(devnull) do
-            results = run_QAbc(Q, c, A, lcon, ucon, lvar, uvar, c0, params)
-        end
-        params.max_iter = max_iter
-        all_time = time() - t_start_all
-        println("warm up time: ", all_time)
-        println("warm up ends ----------------------------------------------------------------------------------------------------------")
-    end
-    println("main run starts: ----------------------------------------------------------------------------------------------------------")
-    results = run_QAbc(Q, c, A, lcon, ucon, lvar, uvar, c0, params)
-    println("main run ends----------------------------------------------------------------------------------------------------------")
-    return results
-end
-
-function run_QAbc(Q::SparseMatrixCSC,
-    c::Vector{Float64},
-    A::SparseMatrixCSC,
-    lcon::Vector{Float64},
-    ucon::Vector{Float64},
-    lvar::Vector{Float64},
-    uvar::Vector{Float64},
-    c0::Float64,
-    params::HPRQP_parameters)
-    
-    Q = copy(Q)
-    c = copy(c)
-    A = copy(A)
-    lcon = copy(lcon)
-    ucon = copy(ucon)   
-    lvar = copy(lvar)
-    uvar = copy(uvar)
-    CUDA.device!(params.device_number)
-    t_start = time()
-    setup_start = time()
-    println("Formulating QP...")
-    number_empty_lu = sum((lvar .== -Inf) .& (uvar .== Inf))
-    if (number_empty_lu > 0.8 * length(lvar))
-        standard_qp = qp_formulation_noC(Q, c, A, lcon, ucon, lvar, uvar, c0)
-        println("QP formulation without C")
-    else
-        standard_qp = qp_formulation(Q, c, A, lcon, ucon, lvar, uvar, c0)
-        println("QP formulation with C")
-    end
-    t_end = time()
-    println("QP formulation time = ", t_end - t_start, " seconds")
-
-    t_start = time()
-    scaling_info = scaling!(standard_qp, params)
-    t_end = time()
-    println("scaling time = ", t_end - t_start, " seconds")
-    if standard_qp.Q_is_diag
-        println("Q is diagonal")
-    end
-
-    t_start_gpu = time()
-    CUDA.synchronize()
-    println("copy to GPU starts...")
-    standard_qp_gpu = QP_info_gpu(
-        CuSparseMatrixCSR(standard_qp.Q),
-        CuVector(standard_qp.c),
-        CuSparseMatrixCSR(standard_qp.A),
-        CuSparseMatrixCSR(standard_qp.A'),
-        CuVector(standard_qp.AL),
-        CuVector(standard_qp.AU),
-        CuVector(standard_qp.l),
-        CuVector(standard_qp.u),
-        standard_qp.obj_constant,
-        CuVector(standard_qp.diag_Q),
-        standard_qp.Q_is_diag,
-        standard_qp.noC,
-        CuVector{Float64}([]),  # lambda (empty for standard QP)
-    )
-
-    scaling_info_gpu = Scaling_info_gpu(
-        CuVector(scaling_info.l_org),
-        CuVector(scaling_info.u_org),
-        CuVector(scaling_info.row_norm),
-        CuVector(scaling_info.col_norm),
-        scaling_info.b_scale,
-        scaling_info.c_scale,
-        scaling_info.norm_b,
-        scaling_info.norm_c,
-        scaling_info.norm_b_org,
-        scaling_info.norm_c_org)
-
-    CUDA.synchronize()
-    t_end_gpu = time()
-    println("copy to GPU ends, time = ", t_end_gpu - t_start_gpu, " seconds")
-    setup_time = time() - setup_start
-
-    results = solve(standard_qp_gpu, scaling_info_gpu, params)
-    println(@sprintf("Total time: %.2fs", setup_time + results.time),
-        @sprintf("  setup time = %.2fs", setup_time),
-        @sprintf("  solve time = %.2fs", results.time))
-
-    return results
-end
-
 # ==================== QAP and LASSO Support Functions ====================
 
 # This function reads a QAP problem from a .mat file and prepares it for solving.
@@ -693,14 +1196,14 @@ function read_QAP_mat(FILE_NAME::String)
     S = QAPdata["S"]
     T = QAPdata["T"]
     n = size(A, 1)
-    
-    println("QAP problem information: nRow = ", 2*n, ", nCol = ", n^2)
-    A_gpu = CuMatrix(A)
-    B_gpu = CuMatrix(B)
-    S_gpu = CuMatrix(S)
-    T_gpu = CuMatrix(T)
 
-    Q = QAP_Q_operator_gpu(A_gpu, B_gpu, S_gpu, T_gpu, n)
+    println("QAP problem information: nRow = ", 2 * n, ", nCol = ", n^2)
+    
+    # Create CPU operator first
+    Q_cpu = QAP_Q_operator_cpu(A, B, S, T, n)
+    # Transfer to GPU using interface
+    Q = to_gpu(Q_cpu, n^2)
+    
     c = CUDA.zeros(Float64, n^2)
     ee = ones(Float64, n)
     Id = spdiagm(ones(Float64, n))
@@ -711,10 +1214,10 @@ function read_QAP_mat(FILE_NAME::String)
     b = CuVector(ones(Float64, 2 * n))
     l = CUDA.zeros(Float64, n^2)
     u = Inf * CUDA.ones(Float64, n^2)
-    
+
     # Convert to standard QP_info format
-    standard_qp = QP_info_gpu(Q, c, A_gpu_sparse, AT_gpu, b, copy(b), l, u, 0.0, 
-                              CUDA.zeros(Float64, 0), false, false, CuVector{Float64}([]))
+    standard_qp = QP_info_gpu(Q, c, A_gpu_sparse, AT_gpu, b, copy(b), l, u, 0.0,
+        CUDA.zeros(Float64, 0), false, false, CuVector{Float64}([]))
 
     return standard_qp
 end
@@ -728,7 +1231,12 @@ function formulate_LASSO_from_A_b_lambda(A::SparseMatrixCSC, b::Vector{Float64},
     println("LASSO problem information: nRow = ", 0, ", nCol = ", n_org)
     c = -ATb
     c0 = 0.5 * norm(b)^2
-    Q = LASSO_Q_operator_gpu(CuSparseMatrixCSR(A), CuSparseMatrixCSR(A'))
+    
+    # Create CPU operator first
+    Q_cpu = LASSO_Q_operator_cpu(A)
+    # Transfer to GPU using interface
+    Q = to_gpu(Q_cpu, n_org)
+    
     A_constraint = CuSparseMatrixCSR(sparse([], [], Float64[], 0, n_org))
     AT = CuSparseMatrixCSR(sparse([], [], Float64[], n_org, 0))
     c_gpu = CuVector{Float64}(c)
@@ -739,7 +1247,7 @@ function formulate_LASSO_from_A_b_lambda(A::SparseMatrixCSC, b::Vector{Float64},
     lambda_gpu = CuVector{Float64}(lambda_vec)
 
     standard_qp = QP_info_gpu(Q, c_gpu, A_constraint, AT, lp_AL, lp_AU, l, u, c0,
-                              CUDA.zeros(Float64, 0), false, true, lambda_gpu)
+        CUDA.zeros(Float64, 0), false, true, lambda_gpu)
 
     return standard_qp
 end
@@ -755,7 +1263,12 @@ function formulate_LASSO_from_mat(file::String)
     lambda_vec = 1e-3 * norm(ATb, Inf) * ones(n_org)
     c = -ATb
     c0 = 0.5 * norm(b)^2
-    Q = LASSO_Q_operator_gpu(CuSparseMatrixCSR(A), CuSparseMatrixCSR(A'))
+    
+    # Create CPU operator first
+    Q_cpu = LASSO_Q_operator_cpu(A)
+    # Transfer to GPU using interface
+    Q = to_gpu(Q_cpu, n_org)
+    
     A_constraint = CuSparseMatrixCSR(sparse([], [], Float64[], 0, n_org))
     AT = CuSparseMatrixCSR(sparse([], [], Float64[], n_org, 0))
     c_gpu = CuVector{Float64}(c)
@@ -766,7 +1279,7 @@ function formulate_LASSO_from_mat(file::String)
     lambda_gpu = CuVector{Float64}(lambda_vec)
 
     standard_qp = QP_info_gpu(Q, c_gpu, A_constraint, AT, lp_AL, lp_AU, l, u, c0,
-                              CUDA.zeros(Float64, 0), false, true, lambda_gpu)
+        CUDA.zeros(Float64, 0), false, true, lambda_gpu)
 
     return standard_qp
 end
@@ -783,13 +1296,13 @@ function scaling!(qp::QP_info_gpu, params::HPRQP_parameters)
     AU_nInf[AU_nInf.==Inf] .= 0.0
     c_arr = Array(qp.c)
     l_arr = Array(qp.l)
-    
-    scaling_info = Scaling_info_gpu(CuVector(copy(l_arr)), CuVector(copy(l_arr)), 
-                                     CuVector(row_norm), CuVector(col_norm), 
-                                     1.0, 1.0, 1.0, 1.0, 
-                                     norm(max.(abs.(AL_nInf), abs.(AU_nInf)), Inf), 
-                                     norm(c_arr, Inf))
-    
+
+    scaling_info = Scaling_info_gpu(CuVector(copy(l_arr)), CuVector(copy(l_arr)),
+        CuVector(row_norm), CuVector(col_norm),
+        1.0, 1.0, 1.0, 1.0,
+        norm(max.(abs.(AL_nInf), abs.(AU_nInf)), Inf),
+        norm(c_arr, Inf))
+
     if params.use_bc_scaling
         b_norm = norm(min.(AL_nInf, AU_nInf))
         c_norm = norm(c_arr)
@@ -820,19 +1333,25 @@ function scaling!(qp::QP_info_gpu, params::HPRQP_parameters)
     scaling_info.norm_c = norm(c_arr)
     scaling_info.row_norm = CuVector(row_norm)
     scaling_info.col_norm = CuVector(col_norm)
-    
+
     return scaling_info
 end
 
-# Power iteration to estimate the largest eigenvalue of Q for QAP problem
-function power_iteration_Q_QAP_gpu(Q::QAP_Q_operator_gpu, max_iterations::Int=5000, tolerance::Float64=1e-4)
+# ============================================================================
+# Power Iteration for Q Operators
+# ============================================================================
+
+# Unified power iteration for ALL operators (QAP, LASSO, custom, etc.)
+# Uses get_problem_size and Qmap! - no operator-specific code needed
+function power_iteration_Q(Q::AbstractQOperator; max_iterations::Int=5000, tolerance::Float64=1e-4)
     seed = 1
-    n = Q.n^2
+    n = get_problem_size(Q)
+    
     z = CuVector(randn(Random.MersenneTwister(seed), n)) .+ 1e-8
     q = CUDA.zeros(Float64, n)
     lambda_max = 1.0
-    temp1 = CUDA.zeros(Float64, n)
     error = 1.0
+    
     for i in 1:max_iterations
         q .= z
         if CUDA.norm(q) < 1e-15
@@ -840,7 +1359,7 @@ function power_iteration_Q_QAP_gpu(Q::QAP_Q_operator_gpu, max_iterations::Int=50
             return 1.0
         end
         q ./= CUDA.norm(q)
-        Qmap!(q, z, temp1, Q)
+        Qmap!(q, z, Q)  # Uses operator's Qmap! and temp storage
         lambda_max = CUDA.dot(q, z)
         q .= z .- lambda_max .* q
         error = CUDA.norm(q) / (CUDA.norm(z) + lambda_max)
@@ -853,96 +1372,6 @@ function power_iteration_Q_QAP_gpu(Q::QAP_Q_operator_gpu, max_iterations::Int=50
     return lambda_max
 end
 
-# Power iteration to estimate the largest eigenvalue of Q for LASSO problem
-function power_iteration_Q_LASSO_gpu(Q::LASSO_Q_operator_gpu, max_iterations::Int=5000, tolerance::Float64=1e-4)
-    seed = 1
-    m, n = size(Q.A)
-    z = CuVector(randn(Random.MersenneTwister(seed), n)) .+ 1e-8
-    q = CUDA.zeros(Float64, n)
-    lambda_max = 1.0
-    temp1 = CUDA.zeros(Float64, m)
-    error = 1.0
-    for i in 1:max_iterations
-        q .= z
-        if CUDA.norm(q) < 1e-15
-            println("Power iteration failed to converge.")
-            return 1.0
-        end
-        q ./= CUDA.norm(q)
-        Qmap!(q, z, temp1, Q)
-        lambda_max = CUDA.dot(q, z)
-        q .= z .- lambda_max .* q
-        error = CUDA.norm(q) / (CUDA.norm(z) + lambda_max)
-        if error < tolerance
-            return lambda_max
-        end
-    end
-    println("Power iteration did not converge within the specified tolerance.")
-    println("The maximum iteration is ", max_iterations, " and the error is ", error)
-    return lambda_max
-end
-
-# Run the HPR-QP algorithm on a QAP/LASSO .mat file
-function run_file_operator(FILE_NAME::String, params::HPRQP_parameters)
-    CUDA.device!(params.device_number)
-    t_start = time()
-    println("READING FILE ... ", FILE_NAME)
-    if endswith(FILE_NAME, ".mat") && params.problem_type == "QAP"
-        standard_qp_gpu = read_QAP_mat(FILE_NAME)
-    elseif endswith(FILE_NAME, ".mat") && params.problem_type == "LASSO"
-        standard_qp_gpu = formulate_LASSO_from_mat(FILE_NAME)
-    else
-        println("For operator-based problems, we only support QAP and LASSO instances in .mat format")
-        error("the file format is: ", FILE_NAME[end-2:end], ", but the problem type is: ", params.problem_type)
-    end
-    read_time = time() - t_start
-    println(@sprintf("READING FILE time: %.2f seconds", read_time))
-
-    setup_start = time()
-    if params.use_bc_scaling
-        t_start = time()
-        println("SCALING ... ")
-        scaling_info_gpu = scaling!(standard_qp_gpu, params)
-        println(@sprintf("SCALING time: %.2f seconds", time() - t_start))
-    else
-        println("SCALING: OFF")
-        scaling_info_gpu = scaling!(standard_qp_gpu, params)
-    end
-    setup_time = time() - setup_start
-
-    results = solve(standard_qp_gpu, scaling_info_gpu, params)
-    println(@sprintf("Total time: %.2fs", read_time + setup_time + results.time),
-        @sprintf("  read time = %.2fs", read_time),
-        @sprintf("  setup time = %.2fs", setup_time),
-        @sprintf("  solve time = %.2fs", results.time))
-
-    return results
-end
-
-# Solve LASSO problem directly from A, b matrices
-function solve_LASSO_from_A_b(A::SparseMatrixCSC, b::Vector{Float64}, params::HPRQP_parameters)
-    CUDA.device!(params.device_number)
-    t_start = time()
-    setup_start = time()
-    println("FORMULATING ... ")
-    standard_qp_gpu = formulate_LASSO_from_A_b_lambda(A, b, params.lambda)
-    println(@sprintf("FORMULATING time: %.2f seconds", time() - t_start))
-
-    if params.use_bc_scaling
-        t_start = time()
-        println("SCALING ... ")
-        scaling_info_gpu = scaling!(standard_qp_gpu, params)
-        println(@sprintf("SCALING time: %.2f seconds", time() - t_start))
-    else
-        println("SCALING: OFF")
-        scaling_info_gpu = scaling!(standard_qp_gpu, params)
-    end
-
-    setup_time = time() - setup_start
-    results = solve(standard_qp_gpu, scaling_info_gpu, params)
-    println(@sprintf("Total time: %.2fs", setup_time + results.time),
-        @sprintf("  setup time = %.2fs", setup_time),
-        @sprintf("  solve time = %.2fs", results.time))
-
-    return results
-end
+# Legacy function names for backward compatibility (redirect to unified version)
+power_iteration_Q_QAP_gpu(Q::QAP_Q_operator_gpu, args...; kwargs...) = power_iteration_Q(Q; kwargs...)
+power_iteration_Q_LASSO_gpu(Q::LASSO_Q_operator_gpu, args...; kwargs...) = power_iteration_Q(Q; kwargs...)

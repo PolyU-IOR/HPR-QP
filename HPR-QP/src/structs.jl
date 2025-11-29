@@ -1,31 +1,26 @@
-# Abstract type for Q operators (allows defining Q implicitly as a linear operator)
-abstract type AbstractQOperator end
+# ============================================================================
+# Q Operator Types and Interfaces
+# ============================================================================
+# Q operators are defined in separate files under Q_operators/
+# Each operator type has its own file for better organization
 
-# This struct stores the problem data for QAP (Quadratic Assignment Problem).
-# Q(X) = 2*(AXB - SX - XT) where X is n×n reshaped from vector x of length n²
-mutable struct QAP_Q_operator_gpu <: AbstractQOperator
-    A::CuMatrix{Float64}
-    B::CuMatrix{Float64}
-    S::CuMatrix{Float64}
-    T::CuMatrix{Float64}
-    n::Int
-end
+include("Q_operators/Q_operator_interface.jl")  # Base interface and abstract types
+include("Q_operators/QAP_operator.jl")           # QAP operator
+include("Q_operators/LASSO_operator.jl")         # LASSO operator
+include("Q_operators/sparse_matrix_operator.jl") # Standard sparse matrix QP
 
-# This struct stores the problem data for LASSO.
-# Q(x) = A'*(A*x) where A is the data matrix
-mutable struct LASSO_Q_operator_gpu <: AbstractQOperator
-    A::CuSparseMatrixCSR{Float64,Int32}
-    AT::CuSparseMatrixCSR{Float64,Int32}
-end
-
-# Union type for Q that can be either a sparse matrix or an operator
-const QType = Union{CuSparseMatrixCSR{Float64,Int32}, AbstractQOperator}
+# ============================================================================
+# Problem Data Structures
+# ============================================================================
 
 # This struct stores the problem data.
 mutable struct QP_info_cpu
     """
-        Q::SparseMatrixCSC{Float64,Int32}
-            The quadratic coefficient matrix in compressed sparse column (CSC) format.
+        Q::QTypeCPU
+            The Q matrix/operator. Can be:
+            - SparseMatrixCSC{Float64,Int32}: Standard QP with explicit Q matrix
+            - AbstractQOperatorCPU: Operator-based Q (QAP, LASSO, custom)
+            Use to_gpu(qp.Q) to transfer to GPU.
 
         c::Vector{Float64}
             The linear coefficient vector in the objective function.
@@ -59,8 +54,11 @@ mutable struct QP_info_cpu
 
         noC::Bool
             Indicates whether there are no l≤x≤u constraints (`C` is empty).
+        
+        lambda::Float64
+            Regularization parameter for LASSO problems. Ignored for other problems.
     """
-    Q::SparseMatrixCSC{Float64,Int32}
+    Q::QTypeCPU  # Sparse matrix or CPU operator (QAP/LASSO/custom)
     c::Vector{Float64}
     A::SparseMatrixCSC{Float64,Int32}
     AT::SparseMatrixCSC{Float64,Int32}
@@ -72,6 +70,7 @@ mutable struct QP_info_cpu
     diag_Q::Vector{Float64}
     Q_is_diag::Bool
     noC::Bool
+    lambda::Float64  # Regularization parameter for LASSO (0.0 for other problems)
 end
 
 # This struct stores the problem data for GPU computations.
@@ -139,8 +138,10 @@ mutable struct HPRQP_parameters
             Frequency (in iterations) to check for convergence or perform other checks.
         warm_up::Bool
             If true, enables a warm-up phase before the main algorithm starts.
-        spmv_mode::String
-            Mode for sparse matrix-vector multiplication (e.g., "auto", "CUSPARSE", "customized").
+        spmv_mode_Q::String
+            Mode for Q matrix-vector multiplication (e.g., "auto", "CUSPARSE", "customized", "operator").
+        spmv_mode_A::String
+            Mode for A matrix-vector multiplication (e.g., "auto", "CUSPARSE", "customized").
         print_frequency::Int
             Frequency (in iterations) for printing progress or logging information.
         device_number::Int32
@@ -158,7 +159,6 @@ mutable struct HPRQP_parameters
         lambda::Float64
             Regularization parameter for LASSO problems.
     """
-    restart::Int
     stoptol::Float64
     sigma::Float64
     max_iter::Int
@@ -167,7 +167,8 @@ mutable struct HPRQP_parameters
     eig_factor::Float64
     check_iter::Int
     warm_up::Bool
-    spmv_mode::String
+    spmv_mode_Q::String
+    spmv_mode_A::String
     print_frequency::Int
     device_number::Int32
     # scaling
@@ -178,7 +179,7 @@ mutable struct HPRQP_parameters
     # problem type and regularization
     problem_type::String
     lambda::Float64
-    HPRQP_parameters() = new(-1, 1e-6, -1, typemax(Int32), false, 3600.0, 1.05, 100, false, "auto", -1, 0, true, false, false, true, "QP", 0.0)
+    HPRQP_parameters() = new(1e-6, -1, typemax(Int32), false, 3600.0, 1.05, 100, false, "auto", "auto", -1, 0, true, false, false, true, "QP", 0.0)
 end
 
 # This struct stores the residuals and other metrics during the HPR-QP algorithm.
@@ -267,7 +268,6 @@ mutable struct HPRQP_workspace_gpu
     fact2::CuVector{Float64}
     fact::CuVector{Float64}
     fact_M::CuVector{Float64}
-    temp1::CuVector{Float64}  # Temporary vector for Q operator computations
     lambda::CuVector{Float64}  # Regularization parameter for LASSO
     HPRQP_workspace_gpu() = new()
 end
