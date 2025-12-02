@@ -51,7 +51,7 @@ function compute_residuals_gpu(ws::HPRQP_workspace_gpu,
 
     ### Dual residuals
     # For LASSO, we need to use compute_Rd_gpu! even when noC=true to include z term (subdifferential of L1)
-    if qp.noC && params.problem_type != "LASSO"
+    if qp.noC
         compute_Rd_noC_gpu!(ws, sc)
     else
         compute_Rd_gpu!(ws, sc)
@@ -72,6 +72,147 @@ function compute_residuals_gpu(ws::HPRQP_workspace_gpu,
     end
     res.KKTx_and_gap_org_bar = max(res.err_Rp_org_bar, res.err_Rd_org_bar, res.rel_gap_bar)
 
+    # Save best values if auto_save is enabled
+    if params.auto_save
+        if iter == 0 || res.KKTx_and_gap_org_bar < max(ws.saved_state.save_err_Rp, ws.saved_state.save_err_Rd, ws.saved_state.save_rel_gap)
+            ws.saved_state.save_x .= ws.x_bar
+            ws.saved_state.save_y .= ws.y_bar
+            ws.saved_state.save_z .= ws.z_bar
+            ws.saved_state.save_w .= ws.w_bar
+            ws.saved_state.save_sigma = ws.sigma
+            ws.saved_state.save_iter = iter
+            ws.saved_state.save_err_Rp = res.err_Rp_org_bar
+            ws.saved_state.save_err_Rd = res.err_Rd_org_bar
+            ws.saved_state.save_primal_obj = res.primal_obj_bar
+            ws.saved_state.save_dual_obj = res.dual_obj_bar
+            ws.saved_state.save_rel_gap = res.rel_gap_bar
+        end
+    end
+
+end
+
+# This function saves the current and best-so-far state to an HDF5 file
+# It is called whenever the log is printed (if auto_save is enabled)
+# It saves:
+#   - Current solution (x_bar, y_bar, z_bar, w_bar) - scaled to original problem
+#   - Best solution so far (save_x, save_y, save_z, save_w) - scaled to original problem
+#   - Current and best sigma values
+#   - Current and best residuals, objectives, and iteration numbers
+#   - Current iteration number and elapsed time
+#   - All solver parameters including initial solutions
+function save_state_to_hdf5(
+    filename::String,
+    ws::HPRQP_workspace_gpu,
+    sc::Scaling_info_gpu,
+    residuals::HPRQP_residuals,
+    params::HPRQP_parameters,
+    iter::Int,
+    t_start_alg::Float64,
+)
+    # Convert GPU arrays to CPU
+    x_bar = Vector(ws.x_bar)
+    y_bar = Vector(ws.y_bar)
+    z_bar = Vector(ws.z_bar)
+    w_bar = Vector(ws.w_bar)
+    save_x = Vector(ws.saved_state.save_x)
+    save_y = Vector(ws.saved_state.save_y)
+    save_z = Vector(ws.saved_state.save_z)
+    save_w = Vector(ws.saved_state.save_w)
+    col_norm = Vector(sc.col_norm)
+    row_norm = Vector(sc.row_norm)
+
+    # Scale the variables (same as in collect_results)
+    x_bar_scaled = sc.b_scale * (x_bar ./ col_norm)
+    w_bar_scaled = sc.b_scale * (w_bar ./ col_norm)
+    save_x_scaled = sc.b_scale * (save_x ./ col_norm)
+    save_w_scaled = sc.b_scale * (save_w ./ col_norm)
+    
+    if ws.m > 0
+        y_bar_scaled = sc.c_scale * (y_bar ./ row_norm)
+        save_y_scaled = sc.c_scale * (save_y ./ row_norm)
+        z_bar_scaled = sc.c_scale * (z_bar ./ col_norm)
+        save_z_scaled = sc.c_scale * (save_z ./ col_norm)
+    else
+        # For problems without constraints (m=0), y and dual variables are empty or not used
+        y_bar_scaled = Float64[]
+        save_y_scaled = Float64[]
+        z_bar_scaled = sc.c_scale * (z_bar ./ col_norm)
+        save_z_scaled = sc.c_scale * (save_z ./ col_norm)
+    end
+
+    # Create or open HDF5 file
+    if isfile(filename)
+        rm(filename, force=true)
+    end
+    h5open(filename, "w") do file
+        # Save current iteration info
+        file["current/iteration"] = iter
+        file["current/time_elapsed"] = time() - t_start_alg
+        file["current/timestamp"] = string(Dates.now())
+
+        # Save current solution (scaled)
+        file["current/x_org"] = x_bar_scaled
+        file["current/w_org"] = w_bar_scaled
+        if ws.m > 0
+            file["current/y_org"] = y_bar_scaled
+        end
+        file["current/z_org"] = z_bar_scaled
+        file["current/sigma"] = ws.sigma
+
+        # Save current residuals
+        file["current/err_Rp"] = residuals.err_Rp_org_bar
+        file["current/err_Rd"] = residuals.err_Rd_org_bar
+        file["current/primal_obj"] = residuals.primal_obj_bar
+        file["current/dual_obj"] = residuals.dual_obj_bar
+        file["current/rel_gap"] = residuals.rel_gap_bar
+        file["current/KKTx_and_gap"] = residuals.KKTx_and_gap_org_bar
+
+        # Save best solution so far (scaled)
+        file["best/x_org"] = save_x_scaled
+        file["best/w_org"] = save_w_scaled
+        if ws.m > 0
+            file["best/y_org"] = save_y_scaled
+        end
+        file["best/z_org"] = save_z_scaled
+        file["best/sigma"] = ws.saved_state.save_sigma
+        file["best/iteration"] = ws.saved_state.save_iter
+
+        # Save best residuals
+        file["best/err_Rp"] = ws.saved_state.save_err_Rp
+        file["best/err_Rd"] = ws.saved_state.save_err_Rd
+        file["best/primal_obj"] = ws.saved_state.save_primal_obj
+        file["best/dual_obj"] = ws.saved_state.save_dual_obj
+        file["best/rel_gap"] = ws.saved_state.save_rel_gap
+
+        # Save parameters
+        file["parameters/stoptol"] = params.stoptol
+        file["parameters/sigma"] = params.sigma
+        file["parameters/max_iter"] = params.max_iter
+        file["parameters/sigma_fixed"] = params.sigma_fixed
+        file["parameters/time_limit"] = params.time_limit
+        file["parameters/eig_factor"] = params.eig_factor
+        file["parameters/check_iter"] = params.check_iter
+        file["parameters/warm_up"] = params.warm_up
+        file["parameters/spmv_mode_Q"] = params.spmv_mode_Q
+        file["parameters/spmv_mode_A"] = params.spmv_mode_A
+        file["parameters/print_frequency"] = params.print_frequency
+        file["parameters/device_number"] = params.device_number
+        file["parameters/use_Ruiz_scaling"] = params.use_Ruiz_scaling
+        file["parameters/use_bc_scaling"] = params.use_bc_scaling
+        file["parameters/use_l2_scaling"] = params.use_l2_scaling
+        file["parameters/use_Pock_Chambolle_scaling"] = params.use_Pock_Chambolle_scaling
+        file["parameters/problem_type"] = params.problem_type
+        file["parameters/lambda"] = params.lambda
+        file["parameters/auto_save"] = params.auto_save
+
+        # Save initial solutions if provided
+        if params.initial_x !== nothing
+            file["parameters/initial_x"] = params.initial_x
+        end
+        if params.initial_y !== nothing
+            file["parameters/initial_y"] = params.initial_y
+        end
+    end
 end
 
 # This function updates the penalty parameter (sigma) based on the current state of the algorithm.
@@ -365,6 +506,61 @@ function allocate_workspace_gpu(qp::QP_info_gpu,
     # Copy lambda for LASSO problems
     ws.lambda = qp.lambda
 
+    # Initialize saved_state for auto_save feature
+    if params.auto_save
+        ws.saved_state = HPRQP_saved_state_gpu()
+        ws.saved_state.save_x = CUDA.zeros(Float64, n)
+        ws.saved_state.save_y = CUDA.zeros(Float64, m)
+        ws.saved_state.save_z = CUDA.zeros(Float64, n)
+        ws.saved_state.save_w = CUDA.zeros(Float64, n)
+        ws.saved_state.save_sigma = ws.sigma
+        ws.saved_state.save_iter = 0
+        ws.saved_state.save_err_Rp = Inf
+        ws.saved_state.save_err_Rd = Inf
+        ws.saved_state.save_primal_obj = Inf
+        ws.saved_state.save_dual_obj = Inf
+        ws.saved_state.save_rel_gap = Inf
+    end
+
+    # Initialize with user-provided initial x if available
+    if params.initial_x !== nothing
+        # Copy initial_x to GPU first
+        initial_x_gpu = CuArray(params.initial_x)
+
+        # Scale x on GPU: inverse of x_result = b_scale * (x_bar / col_norm)
+        # So x_bar = x_input * col_norm / b_scale
+        scaled_x = initial_x_gpu .* scaling_info.col_norm ./ scaling_info.b_scale
+        
+        # Initialize x and related variables
+        ws.x .= scaled_x
+        ws.x_bar .= scaled_x
+        ws.last_x .= scaled_x
+        
+        # Initialize w and related variables with the same initial x
+        ws.w .= scaled_x
+        ws.w_bar .= scaled_x
+        ws.last_w .= scaled_x
+    end
+
+    # Initialize with user-provided initial y if available
+    if params.initial_y !== nothing
+        # Copy initial_y to GPU first
+        ws.y .= CuArray(params.initial_y)
+
+        # Scale y on GPU: inverse of y_result = c_scale * (y_bar / row_norm)
+        # So y_bar = y_input * row_norm / c_scale
+        ws.y .= ws.y .* scaling_info.row_norm ./ scaling_info.c_scale
+        ws.y_bar .= ws.y
+        ws.last_y .= ws.y
+
+        # Compute ATy_bar from y_bar
+        if m > 0
+            CUDA.CUSPARSE.mv!('N', 1, ws.AT, ws.y_bar, 0, ws.ATy_bar, 'O', CUDA.CUSPARSE.CUSPARSE_SPMV_CSR_ALG2)
+            ws.ATy .= ws.ATy_bar
+            ws.last_ATy .= ws.ATy_bar
+        end
+    end
+
     return ws
 end
 
@@ -388,27 +584,6 @@ end
 
 function print_step(iter::Int)
     return max(10^floor(log10(iter)) / 10, 10)
-end
-
-# This function updates the variables for operator-based Q (QAP/LASSO)
-function main_update_operator!(ws::HPRQP_workspace_gpu,
-    qp::QP_info_gpu,
-    params::HPRQP_parameters,
-    restart_info::HPRQP_restart,
-    spmv_mode_A::String,
-)
-    Halpern_fact1 = 1.0 / (restart_info.inner + 2.0)
-    Halpern_fact2 = 1.0 - Halpern_fact1
-
-    if params.problem_type == "LASSO"
-        # LASSO update with soft-thresholding (no A matrix for LASSO)
-        update_zxw_LASSO_gpu!(ws, qp, Halpern_fact1, Halpern_fact2)
-    elseif params.problem_type == "QAP"
-        # QAP update with box constraints (A operations can use CUSPARSE or customized)
-        update_zxw1_QAP_gpu!(ws, qp, Halpern_fact1, Halpern_fact2)
-        update_y_QAP_gpu!(ws, qp, Halpern_fact1, Halpern_fact2; spmv_mode_A=spmv_mode_A)
-        update_w2_QAP_gpu!(ws, Halpern_fact1, Halpern_fact2; spmv_mode_A=spmv_mode_A)
-    end
 end
 
 # This function updates the variables in the HPR-QP algorithm, when Q is diagonal, there's no proximal term on w;
@@ -551,8 +726,10 @@ end
 # ==================== Helper Functions for Solver ====================
 
 # Transfer model data from CPU to GPU
-function transfer_to_gpu(model::QP_info_cpu)
-    println("COPY TO GPU ...")
+function transfer_to_gpu(model::QP_info_cpu, params::HPRQP_parameters)
+    if params.verbose
+        println("COPY TO GPU ...")
+    end
     t_start = time()
     CUDA.synchronize()
 
@@ -590,27 +767,37 @@ function transfer_to_gpu(model::QP_info_cpu)
 
     CUDA.synchronize()
     transfer_time = time() - t_start
-    println(@sprintf("COPY TO GPU time: %.2f seconds", transfer_time))
+    if params.verbose
+        println(@sprintf("COPY TO GPU time: %.2f seconds", transfer_time))
+    end
 
     return qp, transfer_time
 end
 
 # Perform scaling on GPU
 function scale_on_gpu!(qp::QP_info_gpu, params::HPRQP_parameters)
-    println("SCALING QP ON GPU ...")
+    if params.verbose
+        println("SCALING QP ON GPU ...")
+    end
     t_start = time()
 
     scaling_info_gpu = scaling_gpu!(qp, params)
     CUDA.synchronize()
 
     scaling_time = time() - t_start
-    println(@sprintf("GPU SCALING time: %.2f seconds", scaling_time))
+    if params.verbose
+        println(@sprintf("GPU SCALING time: %.2f seconds", scaling_time))
+    end
 
     return scaling_info_gpu, scaling_time
 end
 
 # Print QP problem information
 function print_problem_info(qp::QP_info_gpu, params::HPRQP_parameters)
+    if !params.verbose
+        return
+    end
+    
     m, n = size(qp.A)
 
     println("="^80)
@@ -658,27 +845,77 @@ end
 
 # Print solver parameters
 function print_solver_params(params::HPRQP_parameters, qp::QP_info_gpu, spmv_mode_Q::String, spmv_mode_A::String)
+    if !params.verbose
+        return
+    end
+    
+    m = size(qp.A, 1)
+    n = size(qp.A, 2)
+    
     println("="^80)
-    println("SOLVER PARAMETERS")
+    println("SOLVER PARAMETERS:")
+    println("  Problem size: m = ", m, ", n = ", n)
+    println("  Device: GPU (device $(params.device_number))")
+    println("  Stop tolerance: ", params.stoptol)
+    println("  Max iterations: ", params.max_iter)
+    println("  Time limit: ", params.time_limit, " seconds")
+    println("  Check interval: ", params.check_iter)
+    println("  Print frequency: ", params.print_frequency == -1 ? "Adaptive" : params.print_frequency)
+    println("  Eigenvalue factor: ", params.eig_factor)
+    println("  Sigma fixed: ", params.sigma_fixed)
+    println("  SpMV mode Q: ", spmv_mode_Q, params.spmv_mode_Q == "auto" ? " (auto-detected)" : "")
+    println("  SpMV mode A: ", spmv_mode_A, params.spmv_mode_A == "auto" ? " (auto-detected)" : "")
+    println("  Scaling options:")
+    println("    Ruiz scaling: ", params.use_Ruiz_scaling ? "Enabled" : "Disabled")
+    println("    Pock-Chambolle scaling: ", params.use_Pock_Chambolle_scaling ? "Enabled" : "Disabled")
+    println("    b/c scaling: ", params.use_bc_scaling ? "Enabled" : "Disabled")
+    println("    L2 scaling: ", params.use_l2_scaling ? "Enabled" : "Disabled")
+    
+    if params.warm_up
+        println("  Warm-up: Enabled (avoids JIT compilation overhead)")
+    else
+        println("  Warm-up: Disabled")
+        println("    ⚠ WARNING: First run of each function may be slower due to JIT compilation.")
+        println("    ⚠ Consider enabling warm_up for more accurate timing measurements.")
+    end
+    
+    if params.initial_x !== nothing
+        println("  Initial x: Provided (length ", length(params.initial_x), ")")
+    end
+    if params.initial_y !== nothing
+        println("  Initial y: Provided (length ", length(params.initial_y), ")")
+    end
+    
+    if params.auto_save
+        # Calculate estimated memory for auto_save
+        memory_bytes = (n + m + 2*n) * 16  # x, y, z, w (8 bytes per Float64, 2 copies)
+        memory_mb = memory_bytes / (1024 * 1024)
+        memory_gb = memory_bytes / (1024 * 1024 * 1024)
+        
+        println("  Auto-save: ENABLED")
+        println("    ⚠ WARNING: Auto-save will write to disk at each print iteration.")
+        println("    ⚠ This may consume significant I/O bandwidth and slightly reduce speed.")
+        if memory_gb >= 1.0
+            println(@sprintf("    ⚠ Estimated memory for saved state: %.2f GB", memory_gb))
+        elseif memory_mb >= 1.0
+            println(@sprintf("    ⚠ Estimated memory for saved state: %.2f MB", memory_mb))
+        elseif memory_bytes >= 1024.0
+            println(@sprintf("    ⚠ Estimated memory for saved state: %.2f KB", memory_bytes / 1024))
+        else
+            println(@sprintf("    ⚠ Estimated memory for saved state: %.2f bytes", memory_bytes))
+        end
+        println("    Save file: ", params.save_filename)
+    else
+        println("  Auto-save: Disabled")
+    end
     println("="^80)
-    println("Max Iterations: $(params.max_iter)")
-    println("Time Limit: $(params.time_limit)s")
-    println("Stop Tolerance: $(params.stoptol)")
-    println("Eigenvalue Factor: $(params.eig_factor)")
-    println("Sigma Fixed: $(params.sigma_fixed)")
-    println("Check Iteration: every $(params.check_iter) iterations")
-    println("SpMV Mode Q: $(spmv_mode_Q)", params.spmv_mode_Q == "auto" ? " (auto-detected)" : "")
-    println("SpMV Mode A: $(spmv_mode_A)", params.spmv_mode_A == "auto" ? " (auto-detected)" : "")
-    println("Print Frequency: $(params.print_frequency == -1 ? "adaptive" : "every $(params.print_frequency) iterations")")
-    println("Device Number: $(params.device_number)")
-    println("Warm Up: $(params.warm_up)")
-    println("="^80)
-    println()
 end
 
 # Estimate maximum eigenvalues using power iteration
 function estimate_eigenvalues(qp::QP_info_gpu, params::HPRQP_parameters)
-    println("ESTIMATING MAXIMUM EIGENVALUES ...")
+    if params.verbose
+        println("ESTIMATING MAXIMUM EIGENVALUES ...")
+    end
     t_start = time()
     CUDA.synchronize()
 
@@ -713,9 +950,11 @@ function estimate_eigenvalues(qp::QP_info_gpu, params::HPRQP_parameters)
     CUDA.synchronize()
     power_time = time() - t_start
 
-    println(@sprintf("ESTIMATING MAXIMUM EIGENVALUES time = %.2f seconds", power_time))
-    # println(@sprintf("estimated maximum eigenvalue of AAT = %.2e", lambda_max_A))
-    # println(@sprintf("estimated maximum eigenvalue of Q = %.2e", lambda_max_Q))
+    if params.verbose
+        println(@sprintf("ESTIMATING MAXIMUM EIGENVALUES time = %.2f seconds", power_time))
+        # println(@sprintf("estimated maximum eigenvalue of AAT = %.2e", lambda_max_A))
+        # println(@sprintf("estimated maximum eigenvalue of Q = %.2e", lambda_max_Q))
+    end
 
     return lambda_max_A, lambda_max_Q, power_time
 end
@@ -792,39 +1031,48 @@ function optimize(model::QP_info_cpu, params::HPRQP_parameters)
 
     # Handle warmup if requested
     if params.warm_up
-        println("="^80)
-        println("WARM UP PHASE")
-        println("  ℹ Running warmup to avoid JIT compilation overhead in main solve")
-        println("="^80)
+        if params.verbose
+            println("="^80)
+            println("WARM UP PHASE")
+            println("  ℹ Running warmup to avoid JIT compilation overhead in main solve")
+            println("="^80)
+        end
         t_start_warmup = time()
 
-        # Save original max_iter
+        # Save original max_iter and verbose
         original_max_iter = params.max_iter
+        original_verbose = params.verbose
         params.max_iter = 200
+        params.verbose = false
 
-        # Run warmup solve with suppressed output
-        redirect_stdout(devnull) do
-            solve(model, params)
-        end
+        # Run warmup solve
+        solve(model, params)
 
         # Restore original parameters
         params.max_iter = original_max_iter
+        params.verbose = original_verbose
 
         warmup_time = time() - t_start_warmup
-        println(@sprintf("Warmup time: %.2f seconds", warmup_time))
-        println("="^80)
-        println()
+        if params.verbose
+            println(@sprintf("Warmup time: %.2f seconds", warmup_time))
+            println("="^80)
+            println()
+        end
     end
 
     # Main solve
-    println("="^80)
-    println("MAIN SOLVE")
-    println("="^80)
+    if params.verbose
+        println("="^80)
+        println("MAIN SOLVE")
+        println("="^80)
+    end
 
     # Run the main algorithm (scaling and GPU transfer happen inside solve)
     results = solve(model, params)
 
-    println("="^80)
+    if params.verbose
+        println("="^80)
+    end
 
     return results
 end
@@ -840,8 +1088,10 @@ function initialize_solver_state(qp::QP_info_gpu, params::HPRQP_parameters,
 end
 
 # Helper function: Benchmark A operations only
-function benchmark_A_operations(ws::HPRQP_workspace_gpu)
-    println("  Benchmarking A operations...")
+function benchmark_A_operations(ws::HPRQP_workspace_gpu, verbose::Bool=true)
+    if verbose
+        println("  Benchmarking A operations...")
+    end
 
     # Save workspace state
     saved_y = copy(ws.y)
@@ -888,7 +1138,9 @@ function benchmark_A_operations(ws::HPRQP_workspace_gpu)
     copyto!(ws.w_bar, saved_w_bar)
 
     spmv_mode_A = (t_A_cusparse < t_A_custom) ? "CUSPARSE" : "customized"
-    println("    A: CUSPARSE=$(round(t_A_cusparse*1000, digits=2))ms, customized=$(round(t_A_custom*1000, digits=2))ms → $(spmv_mode_A)")
+    if verbose
+        println("    A: CUSPARSE=$(round(t_A_cusparse*1000, digits=2))ms, customized=$(round(t_A_custom*1000, digits=2))ms → $(spmv_mode_A)")
+    end
 
     return spmv_mode_A
 end
@@ -904,23 +1156,29 @@ function determine_spmv_mode(qp::QP_info_gpu, params::HPRQP_parameters, ws::HPRQ
     # (operator Q cannot use CUSPARSE or customized sparse matrix kernels)
     if isa(qp.Q, AbstractQOperator)
         # Force operator mode regardless of user setting
-        if params.spmv_mode_Q != "auto" && params.spmv_mode_Q != "operator"
-            println("Warning: Q is AbstractQOperator, forcing spmv_mode_Q = operator (user setting '$(params.spmv_mode_Q)' ignored)")
-        else
-            println("Q is AbstractQOperator → spmv_mode_Q = operator")
+        if params.verbose
+            if params.spmv_mode_Q != "auto" && params.spmv_mode_Q != "operator"
+                println("Warning: Q is AbstractQOperator, forcing spmv_mode_Q = operator (user setting '$(params.spmv_mode_Q)' ignored)")
+            else
+                println("Q is AbstractQOperator → spmv_mode_Q = operator")
+            end
         end
         spmv_mode_Q = "operator"
 
         # Benchmark A operations if auto mode and A matrix exists
         if ws.m > 0
             if params.spmv_mode_A == "auto"
-                spmv_mode_A = benchmark_A_operations(ws)
+                spmv_mode_A = benchmark_A_operations(ws, params.verbose)
             else
-                println("A operations: spmv_mode_A = $(spmv_mode_A) (user-specified)")
+                if params.verbose
+                    println("A operations: spmv_mode_A = $(spmv_mode_A) (user-specified)")
+                end
             end
         else
             # No A matrix (e.g., LASSO unconstrained problem)
-            println("No A matrix (unconstrained problem) → spmv_mode_A not applicable")
+            if params.verbose
+                println("No A matrix (unconstrained problem) → spmv_mode_A not applicable")
+            end
             spmv_mode_A = "auto"  # Placeholder, won't be used
         end
 
@@ -929,11 +1187,15 @@ function determine_spmv_mode(qp::QP_info_gpu, params::HPRQP_parameters, ws::HPRQ
 
     # For sparse matrix Q, benchmark Q and/or A based on auto mode settings
     if isa(qp.Q, CuSparseMatrixCSR)
-        println("Auto-detecting SPMV modes via benchmarking...")
+        if params.verbose
+            println("Auto-detecting SPMV modes via benchmarking...")
+        end
 
         # Benchmark Q if auto mode
         if params.spmv_mode_Q == "auto" && length(qp.Q.nzVal) > 0
-            println("  Benchmarking Q operations...")
+            if params.verbose
+                println("  Benchmarking Q operations...")
+            end
 
             # Save workspace state
             saved_z = copy(ws.z_bar)
@@ -981,19 +1243,27 @@ function determine_spmv_mode(qp::QP_info_gpu, params::HPRQP_parameters, ws::HPRQ
             copyto!(ws.w_bar, saved_w_bar)
 
             spmv_mode_Q = (t_Q_cusparse < t_Q_custom) ? "CUSPARSE" : "customized"
-            println("    Q: CUSPARSE=$(round(t_Q_cusparse*1000, digits=2))ms, customized=$(round(t_Q_custom*1000, digits=2))ms → $(spmv_mode_Q)")
+            if params.verbose
+                println("    Q: CUSPARSE=$(round(t_Q_cusparse*1000, digits=2))ms, customized=$(round(t_Q_custom*1000, digits=2))ms → $(spmv_mode_Q)")
+            end
         else
-            println("  Q operations: spmv_mode_Q = $(spmv_mode_Q) (user-specified)")
+            if params.verbose
+                println("  Q operations: spmv_mode_Q = $(spmv_mode_Q) (user-specified)")
+            end
         end
 
         # Benchmark A if auto mode
         if params.spmv_mode_A == "auto" && ws.m > 0
-            spmv_mode_A = benchmark_A_operations(ws)
+            spmv_mode_A = benchmark_A_operations(ws, params.verbose)
         else
-            println("  A operations: spmv_mode_A = $(spmv_mode_A) (user-specified)")
+            if params.verbose
+                println("  A operations: spmv_mode_A = $(spmv_mode_A) (user-specified)")
+            end
         end
 
-        println("  Selected: spmv_mode_Q = $(spmv_mode_Q), spmv_mode_A = $(spmv_mode_A)")
+        if params.verbose
+            println("  Selected: spmv_mode_Q = $(spmv_mode_Q), spmv_mode_A = $(spmv_mode_A)")
+        end
         return (spmv_mode_Q, spmv_mode_A)
     end
 
@@ -1036,34 +1306,39 @@ end
 # Helper function: Print iteration log
 function print_iteration_log(iter::Int, residuals::HPRQP_residuals,
     ws::HPRQP_workspace_gpu, t_start_alg::Float64)
-    print(@sprintf("%5.0f", iter),
-        @sprintf("    %3.2e", residuals.err_Rp_org_bar),
-        @sprintf("    %3.2e", residuals.err_Rd_org_bar),
-        @sprintf("    %7.6e", residuals.primal_obj_bar),
-        @sprintf("    %7.6e", residuals.dual_obj_bar),
-        @sprintf("    %3.2e", residuals.rel_gap_bar))
-    print(@sprintf("    %3.2e", ws.sigma),
-        @sprintf("    %6.2f", time() - t_start_alg))
-    println()
+    println(@sprintf("%5.0f    %3.2e    %3.2e    %+7.6e    %+7.6e    %3.2e    %3.2e    %6.2f",
+        iter,
+        residuals.err_Rp_org_bar,
+        residuals.err_Rd_org_bar,
+        residuals.primal_obj_bar,
+        residuals.dual_obj_bar,
+        residuals.rel_gap_bar,
+        ws.sigma,
+        time() - t_start_alg))
 end
 
 # Helper function: Update milestone tracking for KKT thresholds
 function update_milestone_tracking!(residuals::HPRQP_residuals, iter::Int,
     t_start_alg::Float64,
     iter_4::Int, time_4::Float64, first_4::Bool,
-    iter_6::Int, time_6::Float64, first_6::Bool)
+    iter_6::Int, time_6::Float64, first_6::Bool,
+    verbose::Bool)
     if residuals.KKTx_and_gap_org_bar < 1e-4 && first_4
         time_4 = time() - t_start_alg
         iter_4 = iter
         first_4 = false
-        println("KKT < 1e-4 at iter = ", iter)
+        if verbose
+            println("KKT < 1e-4 at iter = ", iter)
+        end
     end
 
     if residuals.KKTx_and_gap_org_bar < 1e-6 && first_6
         time_6 = time() - t_start_alg
         iter_6 = iter
         first_6 = false
-        println("KKT < 1e-6 at iter = ", iter)
+        if verbose
+            println("KKT < 1e-6 at iter = ", iter)
+        end
     end
 
     return iter_4, time_4, first_4, iter_6, time_6, first_6
@@ -1074,15 +1349,17 @@ function handle_termination(status::String, residuals::HPRQP_residuals,
     ws::HPRQP_workspace_gpu, scaling_info_gpu::Scaling_info_gpu,
     iter::Int, t_start_alg::Float64, power_time::Float64,
     setup_time::Float64, iter_4::Int, time_4::Float64,
-    iter_6::Int, time_6::Float64)
+    iter_6::Int, time_6::Float64, verbose::Bool)
     # Print termination message
-    if status == "OPTIMAL"
-        println("The instance is solved, the accuracy is ", residuals.KKTx_and_gap_org_bar)
-    elseif status == "MAX_ITER"
-        println("The maximum number of iterations is reached, the accuracy is ",
-            residuals.KKTx_and_gap_org_bar)
-    elseif status == "TIME_LIMIT"
-        println("The time limit is reached, the accuracy is ", residuals.KKTx_and_gap_org_bar)
+    if verbose
+        if status == "OPTIMAL"
+            println("The instance is solved, the accuracy is ", residuals.KKTx_and_gap_org_bar)
+        elseif status == "MAX_ITER"
+            println("The maximum number of iterations is reached, the accuracy is ",
+                residuals.KKTx_and_gap_org_bar)
+        elseif status == "TIME_LIMIT"
+            println("The time limit is reached, the accuracy is ", residuals.KKTx_and_gap_org_bar)
+        end
     end
 
     # Collect results
@@ -1094,10 +1371,25 @@ function handle_termination(status::String, residuals::HPRQP_residuals,
     results.time_6 = time_6 == 0.0 ? results.time : time_6
     results.iter_6 = iter_6 == 0 ? iter : iter_6
 
-    # Print timing summary
-    println(@sprintf("Total time: %.2fs", setup_time + results.time),
-        @sprintf("  setup time = %.2fs", setup_time),
-        @sprintf("  solve time = %.2fs", results.time))
+    # Print solution summary
+    if verbose
+        println()
+        println("="^80)
+        println("SOLUTION SUMMARY")
+        println("="^80)
+        println(@sprintf("Status: %s", status))
+        println(@sprintf("Iterations: %d", iter))
+        println(@sprintf("Time: %.2f seconds", results.time))
+        println(@sprintf("Primal Objective: %.12e", residuals.primal_obj_bar))
+        println(@sprintf("Dual Objective: %.12e", residuals.dual_obj_bar))
+        println(@sprintf("Primal Residual: %.6e", residuals.err_Rp_org_bar))
+        println(@sprintf("Dual Residual: %.6e", residuals.err_Rd_org_bar))
+        println(@sprintf("Relative Gap: %.6e", residuals.rel_gap_bar))
+        println("="^80)
+        println(@sprintf("Total time: %.2fs  (setup = %.2fs, solve = %.2fs)", 
+            setup_time + results.time, setup_time, results.time))
+        println("="^80)
+    end
 
     return results
 end
@@ -1127,7 +1419,7 @@ function solve(model::QP_info_cpu, params::HPRQP_parameters)
     setup_start = time()
 
     # Step 1: Transfer to GPU
-    qp, transfer_time = transfer_to_gpu(model)
+    qp, transfer_time = transfer_to_gpu(model, params)
 
     # Step 2: Scaling on GPU
     scaling_info_gpu, scaling_time = scale_on_gpu!(qp, params)
@@ -1152,8 +1444,10 @@ function solve(model::QP_info_cpu, params::HPRQP_parameters)
     # Step 7: Setup iteration loop
     iter_4, time_4, iter_6, time_6, first_4, first_6 = setup_iteration_loop!(qp, ws)
 
-    println("HPRQP SOLVER starts...")
-    println(" iter     errRp        errRd         p_obj           d_obj          gap        sigma       time")
+    if params.verbose
+        println("HPRQP SOLVER starts...")
+        println(" iter     errRp        errRd         p_obj           d_obj          gap        sigma       time")
+    end
 
     check_iter = params.check_iter
 
@@ -1183,20 +1477,31 @@ function solve(model::QP_info_cpu, params::HPRQP_parameters)
         do_restart(restart_info, ws, qp, qp.noC)
 
         # Print iteration log
-        if print_yes || (status != "CONTINUE")
+        if (print_yes || (status != "CONTINUE")) && params.verbose
             print_iteration_log(iter, residuals, ws, t_start_alg)
+        end
+            
+        # Save to HDF5 if auto_save is enabled
+        if (print_yes || (status != "CONTINUE")) && params.auto_save
+            try
+                save_state_to_hdf5(params.save_filename, ws, scaling_info_gpu, residuals, params, iter, t_start_alg)
+            catch e
+                if params.verbose
+                    println("Warning: Failed to save to HDF5 file: ", e)
+                end
+            end
         end
 
         # Update milestone tracking
         iter_4, time_4, first_4, iter_6, time_6, first_6 =
             update_milestone_tracking!(residuals, iter, t_start_alg,
-                iter_4, time_4, first_4, iter_6, time_6, first_6)
+                iter_4, time_4, first_4, iter_6, time_6, first_6, params.verbose)
 
         # Handle termination
         if status != "CONTINUE"
             return handle_termination(status, residuals, ws, scaling_info_gpu,
                 iter, t_start_alg, power_time, setup_time,
-                iter_4, time_4, iter_6, time_6)
+                iter_4, time_4, iter_6, time_6, params.verbose)
         end
 
         # Perform main iteration step

@@ -37,3 +37,9 @@ function to_gpu(Q_cpu::LASSO_Q_operator_cpu)
         CUDA.zeros(Float64, m)
     )
 end
+
+# Q operator mapping for LASSO problem: Q(x) = A'*(A*x)
+@inline function Qmap!(x::CuVector{Float64}, Qx::CuVector{Float64}, Q::LASSO_Q_operator_gpu)
+    CUDA.CUSPARSE.mv!('N', 1, Q.A, x, 0, Q.temp, 'O', CUDA.CUSPARSE.CUSPARSE_SPMV_CSR_ALG2)
+    CUDA.CUSPARSE.mv!('N', 1, Q.AT, Q.temp, 0, Qx, 'O', CUDA.CUSPARSE.CUSPARSE_SPMV_CSR_ALG2)
+end

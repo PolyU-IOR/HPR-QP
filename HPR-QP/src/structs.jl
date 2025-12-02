@@ -158,6 +158,16 @@ mutable struct HPRQP_parameters
             Type of problem being solved (e.g., "QP", "LASSO", "QAP").
         lambda::Float64
             Regularization parameter for LASSO problems.
+        initial_x::Union{Vector{Float64},Nothing}
+            Initial primal solution (default: nothing).
+        initial_y::Union{Vector{Float64},Nothing}
+            Initial dual solution (default: nothing).
+        auto_save::Bool
+            Automatically save best x, y, z, w, and sigma during optimization (default: false).
+        save_filename::String
+            Filename for auto-save HDF5 file (default: "hprqp_autosave.h5").
+        verbose::Bool
+            Enable verbose output (default: true).
     """
     stoptol::Float64
     sigma::Float64
@@ -179,7 +189,15 @@ mutable struct HPRQP_parameters
     # problem type and regularization
     problem_type::String
     lambda::Float64
-    HPRQP_parameters() = new(1e-6, -1, typemax(Int32), false, 3600.0, 1.05, 100, false, "auto", "auto", -1, 0, true, false, false, true, "QP", 0.0)
+    # warm-start
+    initial_x::Union{Vector{Float64},Nothing}
+    initial_y::Union{Vector{Float64},Nothing}
+    # auto-save
+    auto_save::Bool
+    save_filename::String
+    # verbose output
+    verbose::Bool
+    HPRQP_parameters() = new(1e-6, -1, typemax(Int32), false, 3600.0, 1.05, 100, false, "auto", "auto", -1, 0, true, false, false, true, "QP", 0.0, nothing, nothing, false, "hprqp_autosave.h5", true)
 end
 
 # This struct stores the residuals and other metrics during the HPR-QP algorithm.
@@ -214,6 +232,45 @@ mutable struct HPRQP_results
     z::Vector{Float64}       # Solution vector for the dual variables (bounds).
     w::Vector{Float64}       # Auxiliary variable vector.
     HPRQP_results() = new()
+end
+
+# This struct stores the best-so-far state for auto-save feature
+mutable struct HPRQP_saved_state_gpu
+    # Best x found so far (GPU)
+    save_x::CuVector{Float64}
+    
+    # Best y found so far (GPU)
+    save_y::CuVector{Float64}
+    
+    # Best z found so far (GPU)
+    save_z::CuVector{Float64}
+    
+    # Best w found so far (GPU)
+    save_w::CuVector{Float64}
+    
+    # Best sigma value
+    save_sigma::Float64
+    
+    # Iteration when best state was saved
+    save_iter::Int
+    
+    # Primal residual at best state
+    save_err_Rp::Float64
+    
+    # Dual residual at best state
+    save_err_Rd::Float64
+    
+    # Primal objective at best state
+    save_primal_obj::Float64
+    
+    # Dual objective at best state
+    save_dual_obj::Float64
+    
+    # Relative gap at best state
+    save_rel_gap::Float64
+    
+    # Default constructor
+    HPRQP_saved_state_gpu() = new()
 end
 
 # This struct stores the workspace for the HPR-QP algorithm on the GPU.
@@ -269,6 +326,8 @@ mutable struct HPRQP_workspace_gpu
     fact::CuVector{Float64}
     fact_M::CuVector{Float64}
     lambda::CuVector{Float64}  # Regularization parameter for LASSO
+    # Saved state for auto_save feature
+    saved_state::HPRQP_saved_state_gpu
     HPRQP_workspace_gpu() = new()
 end
 

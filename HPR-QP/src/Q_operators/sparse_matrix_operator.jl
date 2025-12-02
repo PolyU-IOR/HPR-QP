@@ -18,3 +18,8 @@ function to_gpu(Q::SparseMatrixCSC{Float64,Int})
 end
 
 get_operator_name(::Type{CuSparseMatrixCSR{Float64,Int32}}) = "SparseMatrix"
+
+# Q operator mapping for sparse matrix Q (standard case)
+@inline function Qmap!(x::CuVector{Float64}, Qx::CuVector{Float64}, Q::CuSparseMatrixCSR{Float64,Int32})
+    CUDA.CUSPARSE.mv!('N', 1, Q, x, 0, Qx, 'O', CUDA.CUSPARSE.CUSPARSE_SPMV_CSR_ALG2)
+end
