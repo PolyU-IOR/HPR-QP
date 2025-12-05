@@ -91,6 +91,47 @@ Return the problem dimension (size of x vector) for the operator.
 """
 function get_problem_size end
 
+# ============================================================================
+# Optional CUSPARSE Preprocessing Interface
+# ============================================================================
+
+"""
+    supports_cusparse_preprocessing(Q::AbstractQOperator) -> Bool
+
+Return true if the operator supports CUSPARSE preprocessing for its internal SpMV operations.
+Default implementation returns false. Override for operators with internal sparse matrices.
+
+# Example
+```julia
+supports_cusparse_preprocessing(Q::LASSO_Q_operator_gpu) = true
+```
+"""
+supports_cusparse_preprocessing(Q::AbstractQOperator) = false
+
+"""
+    prepare_operator_spmv!(Q::AbstractQOperator, workspace_vectors...)
+
+Prepare CUSPARSE preprocessing for operator's internal SpMV operations.
+Only called if supports_cusparse_preprocessing returns true.
+Stores preprocessing data in the operator's mutable fields.
+
+# Arguments
+- `Q`: GPU operator that supports preprocessing
+- `workspace_vectors...`: Relevant workspace vectors for buffer allocation
+
+# Returns
+- Nothing (modifies Q in-place to store CUSPARSE structures)
+
+# Example
+```julia
+function prepare_operator_spmv!(Q::LASSO_Q_operator_gpu, x, temp, Qx)
+    # Prepare A and AT SpMV operations
+    # Store CUSPARSE structures in Q.spmv_A and Q.spmv_AT
+end
+```
+"""
+function prepare_operator_spmv! end
+
 # Union type for Q on GPU (sparse matrix or operator)
 const QType = Union{CuSparseMatrixCSR{Float64,Int32}, AbstractQOperator}
 

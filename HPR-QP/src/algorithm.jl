@@ -506,6 +506,28 @@ function allocate_workspace_gpu(qp::QP_info_gpu,
     # Copy lambda for LASSO problems
     ws.lambda = qp.lambda
 
+    # Prepare CUSPARSE SpMV structures for A and AT (if m > 0)
+    if m > 0
+        ws.spmv_A, ws.spmv_AT = prepare_spmv_A!(qp.A, qp.AT, ws.x_bar, ws.x_hat, ws.dx, ws.Ax,
+                                                 ws.y_bar, ws.y, ws.ATy)
+    else
+        ws.spmv_A = nothing
+        ws.spmv_AT = nothing
+    end
+
+    # Prepare CUSPARSE SpMV structure for Q (only if Q is a sparse matrix, not an operator)
+    if isa(qp.Q, CuSparseMatrixCSR{Float64,Int32})
+        ws.spmv_Q = prepare_spmv_Q!(qp.Q, ws.w, ws.w_bar, ws.w_hat, ws.Qw)
+    else
+        # Q is an operator (QAP/LASSO/custom) - check if it supports preprocessing
+        ws.spmv_Q = nothing
+        if supports_cusparse_preprocessing(qp.Q)
+            # Operator supports preprocessing - call its prepare function
+            # This stores CUSPARSE structures inside the operator itself
+            prepare_operator_spmv!(qp.Q, ws.w, ws.Qw)
+        end
+    end
+
     # Initialize saved_state for auto_save feature
     if params.auto_save
         ws.saved_state = HPRQP_saved_state_gpu()
@@ -555,7 +577,14 @@ function allocate_workspace_gpu(qp::QP_info_gpu,
 
         # Compute ATy_bar from y_bar
         if m > 0
-            CUDA.CUSPARSE.mv!('N', 1, ws.AT, ws.y_bar, 0, ws.ATy_bar, 'O', CUDA.CUSPARSE.CUSPARSE_SPMV_CSR_ALG2)
+            # Use CUSPARSE preprocessed spmv if available
+            if ws.spmv_AT !== nothing
+                CUDA.CUSPARSE.cusparseSpMV(ws.spmv_AT.handle, ws.spmv_AT.operator, ws.spmv_AT.alpha,
+                    ws.spmv_AT.desc_AT, ws.spmv_AT.desc_y_bar, ws.spmv_AT.beta, ws.spmv_AT.desc_ATy,
+                    ws.spmv_AT.compute_type, ws.spmv_AT.alg, ws.spmv_AT.buf)
+            else
+                CUDA.CUSPARSE.mv!('N', 1, ws.AT, ws.y_bar, 0, ws.ATy_bar, 'O', CUDA.CUSPARSE.CUSPARSE_SPMV_CSR_ALG2)
+            end
             ws.ATy .= ws.ATy_bar
             ws.last_ATy .= ws.ATy_bar
         end

@@ -234,6 +234,60 @@ mutable struct HPRQP_results
     HPRQP_results() = new()
 end
 
+# ============================================================================
+# CUSPARSE SpMV Structures (for buffer management and preprocessing)
+# ============================================================================
+
+# CUSPARSE SpMV structure for A matrix operations
+mutable struct CUSPARSE_spmv_A
+    handle::CUDA.CUSPARSE.cusparseHandle_t
+    operator::Char
+    alpha::Ref{Float64}
+    desc_A::CUDA.CUSPARSE.CuSparseMatrixDescriptor
+    desc_x_bar::CUDA.CUSPARSE.CuDenseVectorDescriptor
+    desc_x_hat::CUDA.CUSPARSE.CuDenseVectorDescriptor
+    desc_dx::CUDA.CUSPARSE.CuDenseVectorDescriptor
+    beta::Ref{Float64}
+    desc_Ax::CUDA.CUSPARSE.CuDenseVectorDescriptor
+    compute_type::DataType
+    alg::CUDA.CUSPARSE.cusparseSpMVAlg_t
+    buf::CuArray{UInt8}
+end
+
+# CUSPARSE SpMV structure for AT (transpose of A) matrix operations
+mutable struct CUSPARSE_spmv_AT
+    handle::CUDA.CUSPARSE.cusparseHandle_t
+    operator::Char
+    alpha::Ref{Float64}
+    desc_AT::CUDA.CUSPARSE.CuSparseMatrixDescriptor
+    desc_y_bar::CUDA.CUSPARSE.CuDenseVectorDescriptor
+    desc_y::CUDA.CUSPARSE.CuDenseVectorDescriptor
+    beta::Ref{Float64}
+    desc_ATy::CUDA.CUSPARSE.CuDenseVectorDescriptor
+    compute_type::DataType
+    alg::CUDA.CUSPARSE.cusparseSpMVAlg_t
+    buf::CuArray{UInt8}
+end
+
+# CUSPARSE SpMV structure for Q matrix operations (when Q is a sparse matrix)
+mutable struct CUSPARSE_spmv_Q
+    handle::CUDA.CUSPARSE.cusparseHandle_t
+    operator::Char
+    alpha::Ref{Float64}
+    desc_Q::CUDA.CUSPARSE.CuSparseMatrixDescriptor
+    desc_w::CUDA.CUSPARSE.CuDenseVectorDescriptor
+    desc_w_bar::CUDA.CUSPARSE.CuDenseVectorDescriptor
+    desc_w_hat::CUDA.CUSPARSE.CuDenseVectorDescriptor
+    beta::Ref{Float64}
+    desc_Qw::CUDA.CUSPARSE.CuDenseVectorDescriptor
+    compute_type::DataType
+    alg::CUDA.CUSPARSE.cusparseSpMVAlg_t
+    buf::CuArray{UInt8}
+end
+
+# Note: Operator-specific CUSPARSE structures are defined in their respective operator files
+# e.g., CUSPARSE_spmv_LASSO_A and CUSPARSE_spmv_LASSO_AT are in Q_operators/LASSO_operator.jl
+
 # This struct stores the best-so-far state for auto-save feature
 mutable struct HPRQP_saved_state_gpu
     # Best x found so far (GPU)
@@ -326,6 +380,10 @@ mutable struct HPRQP_workspace_gpu
     fact::CuVector{Float64}
     fact_M::CuVector{Float64}
     lambda::CuVector{Float64}  # Regularization parameter for LASSO
+    # CUSPARSE SpMV structures for preprocessed matrix operations
+    spmv_A::Union{CUSPARSE_spmv_A, Nothing}  # For A matrix operations (nothing if m=0)
+    spmv_AT::Union{CUSPARSE_spmv_AT, Nothing}  # For AT matrix operations (nothing if m=0)
+    spmv_Q::Union{CUSPARSE_spmv_Q, Nothing}  # For Q matrix operations (nothing if Q is operator)
     # Saved state for auto_save feature
     saved_state::HPRQP_saved_state_gpu
     HPRQP_workspace_gpu() = new()
