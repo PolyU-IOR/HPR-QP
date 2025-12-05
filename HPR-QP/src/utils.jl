@@ -1062,10 +1062,10 @@ function run_dataset(data_path::String, result_path::String, params::HPRQP_param
     files = readdir(data_path)
 
     # Specify the path and filename for the CSV file
-    csv_file = result_path * "HPRQP_result.csv"
+    csv_file = joinpath(result_path, "HPRQP_result.csv")
 
     # redirect the output to a file
-    log_path = result_path * "HPRQP_log.txt"
+    log_path = joinpath(result_path, "HPRQP_log.txt")
 
     if !isdir(result_path)
         mkdir(result_path)
@@ -1105,7 +1105,7 @@ function run_dataset(data_path::String, result_path::String, params::HPRQP_param
     for i = 1:length(files)
         file = files[i]
         if occursin(".mps", file) && !(file in namelist)
-            FILE_NAME = data_path * file
+            FILE_NAME = joinpath(data_path, file)
             if params.warm_up && !warm_up_done
                 max_iter = params.max_iter
                 params.max_iter = 200

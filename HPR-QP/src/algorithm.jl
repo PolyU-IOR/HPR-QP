@@ -222,6 +222,7 @@ function update_sigma(params::HPRQP_parameters,
     qp::QP_info_gpu,
     Q_is_diag::Bool,
     noC::Bool,
+    residuals::HPRQP_residuals,
 )
     if ~params.sigma_fixed && (restart_info.restart_flag >= 1)
         sigma_old = ws.sigma
@@ -246,9 +247,20 @@ function update_sigma(params::HPRQP_parameters,
 
             primal_move = max(primal_move, 1e-12)
             dual_move = max(dual_move, 1e-12)
-            sigma_new = sqrt(primal_move / dual_move)
-            fact = exp(-restart_info.current_gap / restart_info.weighted_norm)
-            ws.sigma = exp(fact * log(sigma_new) + (1 - fact) * log(ws.sigma))
+            sigma_estimation = sqrt(primal_move / dual_move)
+            fact = exp(-0.05 * (restart_info.current_gap / restart_info.best_gap))
+            temp_1 = max(min(residuals.err_Rd_org_bar, residuals.err_Rp_org_bar), min(residuals.rel_gap_bar, restart_info.current_gap))
+            sigma_cand = exp(fact * log(sigma_estimation) + (1 - fact) * log(restart_info.best_sigma))
+            if temp_1 > 9e-10
+                κ = 1.0
+            elseif temp_1 > 5e-10
+                ratio_infeas_org = residuals.err_Rd_org_bar / residuals.err_Rp_org_bar
+                κ = clamp(sqrt(ratio_infeas_org), 1e-2, 100.0)
+            else
+                ratio_infeas_org = residuals.err_Rd_org_bar / residuals.err_Rp_org_bar
+                κ = clamp((ratio_infeas_org), 1e-2, 100.0)
+            end
+            ws.sigma = κ * sigma_cand
         else
             axpby_gpu!(1.0, ws.x_bar, -1.0, ws.last_x, ws.dx, ws.n)
             axpby_gpu!(1.0, ws.w_bar, -1.0, ws.last_w, ws.dw, ws.n)
@@ -282,22 +294,33 @@ function update_sigma(params::HPRQP_parameters,
             b = max(b, 1e-12)
             if Q_is_diag
                 if ws.m > 0
-                    sigma_new = golden_Q_diag(a, b, ws.diag_Q, ws.ATdy, ws.QATdy, ws.tempv; lo=1e-12, hi=1e12, tol=1e-13)
+                    sigma_estimation = golden_Q_diag(a, b, ws.diag_Q, ws.ATdy, ws.QATdy, ws.tempv; lo=1e-12, hi=1e12, tol=1e-13)
                 else
                     # No constraints: simplified sigma update for diagonal Q
-                    sigma_new = sqrt(b / a)
+                    sigma_estimation = sqrt(b / a)
                 end
             else
                 # min a * x + b / x + c * x^2 / (1 + d * x)
                 if ws.m > 0
-                    sigma_new = golden(a, b, c, d; lo=1e-12, hi=1e12, tol=1e-13)
+                    sigma_estimation = golden(a, b, c, d; lo=1e-12, hi=1e12, tol=1e-13)
                 else
                     # No constraints: simplified sigma update
-                    sigma_new = sqrt(b / a)
+                    sigma_estimation = sqrt(b / a)
                 end
             end
-            fact = exp(-restart_info.current_gap / restart_info.weighted_norm)
-            ws.sigma = exp(fact * log(sigma_new) + (1 - fact) * log(ws.sigma))
+            fact = exp(-0.05 * (restart_info.current_gap / restart_info.best_gap))
+            temp_1 = max(min(residuals.err_Rd_org_bar, residuals.err_Rp_org_bar), min(residuals.rel_gap_bar, restart_info.current_gap))
+            sigma_cand = exp(fact * log(sigma_estimation) + (1 - fact) * log(restart_info.best_sigma))
+            if temp_1 > 9e-10
+                κ = 1.0
+            elseif temp_1 > 5e-10
+                ratio_infeas_org = residuals.err_Rd_org_bar / residuals.err_Rp_org_bar
+                κ = clamp(sqrt(ratio_infeas_org), 1e-2, 100.0)
+            else
+                ratio_infeas_org = residuals.err_Rd_org_bar / residuals.err_Rp_org_bar
+                κ = clamp((ratio_infeas_org), 1e-2, 100.0)
+            end
+            ws.sigma = κ * sigma_cand
         end
 
         # update Q factors if sigma changes
@@ -317,6 +340,7 @@ end
 function check_restart(restart_info::HPRQP_restart,
     iter::Int,
     check_iter::Int,
+    sigma::Float64,
 )
     restart_info.restart_flag = 0
     if restart_info.first_restart
@@ -324,9 +348,15 @@ function check_restart(restart_info::HPRQP_restart,
             restart_info.first_restart = false
             restart_info.restart_flag = 1
             restart_info.weighted_norm = restart_info.current_gap
+            restart_info.best_gap = restart_info.current_gap
+            restart_info.best_sigma = sigma
         end
     else
         if rem(iter, check_iter) == 0
+            if restart_info.current_gap < 0
+                restart_info.current_gap = 1e-6
+                println("current_gap < 0")
+            end
 
             if restart_info.current_gap <= 0.2 * restart_info.last_gap
                 restart_info.sufficient += 1
@@ -348,6 +378,13 @@ function check_restart(restart_info::HPRQP_restart,
                 restart_info.long += 1
                 restart_info.restart_flag = 3
             end
+            
+            # Update best_gap and best_sigma if current gap is better
+            if restart_info.best_gap > restart_info.current_gap
+                restart_info.best_gap = restart_info.current_gap
+                restart_info.best_sigma = sigma
+            end
+            
             restart_info.save_gap = restart_info.current_gap
         end
     end
@@ -600,6 +637,8 @@ function initialize_restart()
     restart_info.save_gap = Inf
     restart_info.current_gap = Inf
     restart_info.last_gap = Inf
+    restart_info.best_gap = Inf
+    restart_info.best_sigma = 1.0
     restart_info.inner = 0
     restart_info.times = 0
     restart_info.sufficient = 0
@@ -1113,6 +1152,8 @@ function initialize_solver_state(qp::QP_info_gpu, params::HPRQP_parameters,
     residuals = HPRQP_residuals()
     restart_info = initialize_restart()
     ws = allocate_workspace_gpu(qp, params, lambda_max_A, lambda_max_Q, scaling_info_gpu)
+    # Initialize best_sigma with the initial sigma value
+    restart_info.best_sigma = ws.sigma
     return ws, residuals, restart_info
 end
 
@@ -1497,10 +1538,10 @@ function solve(model::QP_info_cpu, params::HPRQP_parameters)
         status = check_break(residuals, iter, t_start_alg, params)
 
         # Check and perform restart if needed
-        check_restart(restart_info, iter, check_iter)
+        check_restart(restart_info, iter, check_iter, ws.sigma)
 
         # Update sigma parameter
-        update_sigma(params, restart_info, ws, qp, qp.Q_is_diag, qp.noC)
+        update_sigma(params, restart_info, ws, qp, qp.Q_is_diag, qp.noC, residuals)
 
         # Perform restart
         do_restart(restart_info, ws, qp, qp.noC)

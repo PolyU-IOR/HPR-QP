@@ -405,6 +405,8 @@ mutable struct HPRQP_restart
     times::Int
 
     weighted_norm::Float64
+    best_gap::Float64
+    best_sigma::Float64
 
     HPRQP_restart() = new()
 end
