@@ -62,7 +62,10 @@ function compute_residuals_gpu(ws::HPRQP_workspace_gpu,
     end
 
     if iter == 0
-        @cuda threads = 256 blocks = ceil(Int, ws.n / 256) compute_err_lu_kernel!(ws.dx, ws.x_bar, ws.l, ws.u, sc.col_norm, sc.b_scale, ws.n)
+        threads, blocks = gpu_launch_config(ws.n)
+        if threads > 0
+            @cuda threads = threads blocks = blocks compute_err_lu_kernel!(ws.dx, ws.x_bar, ws.l, ws.u, sc.col_norm, sc.b_scale, ws.n)
+        end
         res.err_Rp_org_bar = max(res.err_Rp_org_bar, CUDA.norm(ws.dx, Inf))
     end
     res.KKTx_and_gap_org_bar = max(res.err_Rp_org_bar, res.err_Rd_org_bar, res.rel_gap_bar)

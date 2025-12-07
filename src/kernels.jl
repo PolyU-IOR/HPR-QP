@@ -11,6 +11,18 @@
 ##   end
 
 ## LASSO-specific update kernel with soft-thresholding
+const DEFAULT_KERNEL_THREADS = 256
+
+@inline function gpu_launch_config(length::Int)
+    @assert length >= 0 "kernel launch length must be non-negative"
+    if length == 0
+        return 0, 0
+    end
+    threads = min(DEFAULT_KERNEL_THREADS, max(32, 32 * cld(length, 32)))
+    blocks = cld(length, threads)
+    return threads, blocks
+end
+
 CUDA.@fastmath @inline function update_zxw_LASSO_kernel!(lambda::CuDeviceVector{Float64},
     dw::CuDeviceVector{Float64},
     dx::CuDeviceVector{Float64},
@@ -33,22 +45,40 @@ CUDA.@fastmath @inline function update_zxw_LASSO_kernel!(lambda::CuDeviceVector{
     n::Int)
     i = threadIdx().x + (blockDim().x * (blockIdx().x - 1))
     @inbounds if i <= n
-        tmp = -Qw[i] + ATy[i] - c[i]
-        z_bar[i] = x[i] + sigma * tmp
+        qw_i = Qw[i]
+        atyi = ATy[i]
+        c_i = c[i]
+        x_i = x[i]
+        last_x_i = last_x[i]
+        w_i = w[i]
+
+        tmp = -(qw_i) + atyi - c_i
+        z_raw = x_i + sigma * tmp
 
         # Soft-thresholding for L1 regularization
         lambda_sigma = lambda[i] * sigma
-        x_bar[i] = (z_bar[i] < -lambda_sigma) ? (z_bar[i] + lambda_sigma) : ((z_bar[i] > lambda_sigma) ? (z_bar[i] - lambda_sigma) : 0.0)
-        x_hat[i] = 2 * x_bar[i] - x[i]
-        z_bar[i] = (x_bar[i] - z_bar[i]) / sigma
-        dx[i] = x_bar[i] - x[i]
+        abs_z = abs(z_raw)
+        shrink = max(abs_z - lambda_sigma, 0.0)
+        # Original ternary: (z_raw < -lambda_sigma) ? (z_raw + lambda_sigma) : ((z_raw > lambda_sigma) ? (z_raw - lambda_sigma) : 0.0)
+        x_bar_i = copysign(shrink, z_raw)
+        x_bar[i] = x_bar_i
 
-        x[i] = Halpern_fact1 * last_x[i] + Halpern_fact2 * x_hat[i]
-        tempv[i] = x_hat[i] + sigma * Qw[i]
+        x_hat_i = 2.0 * x_bar_i - x_i
+        x_hat[i] = x_hat_i
+        dx[i] = x_bar_i - x_i
+        z_bar[i] = (x_bar_i - z_raw) / sigma
 
-        w_bar[i] = fact1 * w[i] + fact2 * x_hat[i]
-        w[i] = Halpern_fact1 * w[i] + Halpern_fact2 * (2 * w_bar[i] - w[i])
-        dw[i] = w_bar[i] - w[i]
+        x_new = muladd(Halpern_fact2, x_hat_i, Halpern_fact1 * last_x_i)
+        x[i] = x_new
+
+        tempv[i] = x_hat_i + sigma * qw_i
+
+        w_bar_i = muladd(fact1, w_i, fact2 * x_hat_i)
+        w_bar[i] = w_bar_i
+        two_w_bar_minus_w = 2.0 * w_bar_i - w_i
+        w_new = muladd(Halpern_fact2, two_w_bar_minus_w, Halpern_fact1 * w_i)
+        w[i] = w_new
+        dw[i] = w_bar_i - w_new
     end
     return
 end
@@ -58,7 +88,9 @@ function update_zxw_LASSO_gpu!(ws::HPRQP_workspace_gpu, qp::QP_info_gpu, Halpern
     Qmap!(ws.w, ws.Qw, qp.Q)
     fact2 = 1.0 / (1.0 + ws.sigma * ws.lambda_max_Q)
     fact1 = 1.0 - fact2
-    @cuda threads = 256 blocks = ceil(Int, ws.n / 256) update_zxw_LASSO_kernel!(ws.lambda, ws.dw, ws.dx, ws.w_bar, ws.w, ws.z_bar, ws.x_bar, ws.x_hat, ws.last_x, ws.x, ws.Qw, ws.ATy, ws.c, ws.tempv, ws.sigma, fact1, fact2, Halpern_fact1, Halpern_fact2, ws.n)
+    threads, blocks = gpu_launch_config(ws.n)
+    threads == 0 && return
+    @cuda threads = threads blocks = blocks update_zxw_LASSO_kernel!(ws.lambda, ws.dw, ws.dx, ws.w_bar, ws.w, ws.z_bar, ws.x_bar, ws.x_hat, ws.last_x, ws.x, ws.Qw, ws.ATy, ws.c, ws.tempv, ws.sigma, fact1, fact2, Halpern_fact1, Halpern_fact2, ws.n)
 end
 
 ## normal z x w1 y w2 kernels (customized and unified)
@@ -80,50 +112,67 @@ end
 #
 # Note: tempv computation is separated into compute_tempv_unified_kernel! for clarity
 #
-CUDA.@fastmath @inline function unified_update_zxw1_kernel!(dx::CuDeviceVector{Float64},
+CUDA.@fastmath @inline function unified_update_zxw1_kernel!(::Val{UseCustom}, ::Val{IsDiag},
+    dx::CuDeviceVector{Float64},
     rowPtrQ::CuDeviceVector{Int32}, colValQ::CuDeviceVector{Int32}, nzValQ::CuDeviceVector{Float64},
     w_bar::CuDeviceVector{Float64}, w::CuDeviceVector{Float64},
     z_bar::CuDeviceVector{Float64}, x_bar::CuDeviceVector{Float64}, x_hat::CuDeviceVector{Float64},
     last_x::CuDeviceVector{Float64}, x::CuDeviceVector{Float64},
     Qw::CuDeviceVector{Float64}, ATy::CuDeviceVector{Float64}, c::CuDeviceVector{Float64},
-    tempv::CuDeviceVector{Float64}, l::CuDeviceVector{Float64}, u::CuDeviceVector{Float64},
-    sigma::Float64, fact1_scalar::Float64, fact2_scalar::Float64, 
+    l::CuDeviceVector{Float64}, u::CuDeviceVector{Float64},
+    sigma::Float64, fact1_scalar::Float64, fact2_scalar::Float64,
     fact1_vec::CuDeviceVector{Float64}, fact2_vec::CuDeviceVector{Float64},
-    Halpern_fact1::Float64, Halpern_fact2::Float64, 
-    use_custom_spmv::Bool, is_diag_Q::Bool, n::Int)
+    Halpern_fact1::Float64, Halpern_fact2::Float64, n::Int) where {UseCustom, IsDiag}
     i = threadIdx().x + (blockDim().x * (blockIdx().x - 1))
     @inbounds if i <= n
-        # Conditionally compute SpMV inline or use pre-computed value
-        qw_val = if use_custom_spmv
+        qw_val = if UseCustom
             startQ = rowPtrQ[i]
-            stopQ = rowPtrQ[i+1] - 1
-            qr1 = 0.0
+            stopQ = rowPtrQ[i + 1] - 1
+            acc = 0.0
             @inbounds for k in startQ:stopQ
-                qr1 += nzValQ[k] * w[colValQ[k]]
+                acc += nzValQ[k] * w[colValQ[k]]
             end
-            Qw[i] = qr1
-            qr1
+            Qw[i] = acc
+            acc
         else
-            Qw[i]  # Already computed by cuSPARSE
+            Qw[i]
         end
-        
-        tmp = -qw_val + ATy[i] - c[i]
-        z_bar[i] = x[i] + sigma * tmp
 
-        x_bar[i] = z_bar[i] < (l[i]) ? l[i] : (z_bar[i] > (u[i]) ? u[i] : z_bar[i])
-        x_hat[i] = 2 * x_bar[i] - x[i]
-        z_bar[i] = (x_bar[i] - z_bar[i]) / sigma
+        atyi = ATy[i]
+        c_i = c[i]
+        x_i = x[i]
+        last_x_i = last_x[i]
+        l_i = l[i]
+        u_i = u[i]
+        w_i = w[i]
 
-        dx[i] = x_bar[i] - x[i]
+        tmp = -qw_val + atyi - c_i
+        z_raw = x_i + sigma * tmp
+        # Original ternary clamp: (z_raw < l_i) ? l_i : ((z_raw > u_i) ? u_i : z_raw)
+        x_bar_i = min(max(z_raw, l_i), u_i)
 
-        x[i] = Halpern_fact1 * last_x[i] + Halpern_fact2 * x_hat[i]
+        x_hat_i = 2.0 * x_bar_i - x_i
+        dx_val = x_bar_i - x_i
+        x_new = muladd(Halpern_fact2, x_hat_i, Halpern_fact1 * last_x_i)
 
-        # w_bar computation: use vector or scalar fact1/fact2 depending on Q type
-        if is_diag_Q
-            w_bar[i] = fact1_vec[i] * w[i] + fact2_vec[i] * x_hat[i]
+        w_bar_i = if IsDiag
+            fact1_i = fact1_vec[i]
+            fact2_i = fact2_vec[i]
+            muladd(fact1_i, w_i, fact2_i * x_hat_i)
         else
-            w_bar[i] = fact1_scalar * w[i] + fact2_scalar * x_hat[i]
+            muladd(fact1_scalar, w_i, fact2_scalar * x_hat_i)
         end
+
+        two_w_bar_minus_w = 2.0 * w_bar_i - w_i
+        w_new = muladd(Halpern_fact2, two_w_bar_minus_w, Halpern_fact1 * w_i)
+
+        dx[i] = dx_val
+        x[i] = x_new
+        x_bar[i] = x_bar_i
+        x_hat[i] = x_hat_i
+        z_bar[i] = (x_bar_i - z_raw) / sigma
+        w_bar[i] = w_bar_i
+        w[i] = w_new
     end
     return
 end
@@ -131,7 +180,7 @@ end
 # Unified tempv computation kernel
 # Computes: tempv = x_hat + sigma * (Qw - Qw_bar)
 # where Qw_bar can be computed inline (custom) or pre-computed (cuSPARSE)
-CUDA.@fastmath @inline function compute_tempv_unified_kernel!(
+CUDA.@fastmath @inline function compute_tempv_unified_kernel!(::Val{UseCustom},
     tempv::CuDeviceVector{Float64},
     rowPtrQ::CuDeviceVector{Int32},
     colValQ::CuDeviceVector{Int32},
@@ -141,22 +190,24 @@ CUDA.@fastmath @inline function compute_tempv_unified_kernel!(
     Qw::CuDeviceVector{Float64},
     Qw_bar::CuDeviceVector{Float64},
     sigma::Float64,
-    use_custom_spmv::Bool,
-    n::Int)
+    n::Int) where {UseCustom}
     i = threadIdx().x + (blockDim().x * (blockIdx().x - 1))
     @inbounds if i <= n
-        if use_custom_spmv
-            # Compute Qw_bar inline
+        if UseCustom
             startQ = rowPtrQ[i]
-            stopQ = rowPtrQ[i+1] - 1
-            qr1 = 0.0
+            stopQ = rowPtrQ[i + 1] - 1
+            acc = 0.0
             @inbounds for k in startQ:stopQ
-                qr1 += nzValQ[k] * w_bar[colValQ[k]]
+                acc += nzValQ[k] * w_bar[colValQ[k]]
             end
-            tempv[i] = x_hat[i] + sigma * (Qw[i] - qr1)
+            x_hat_i = x_hat[i]
+            qw_i = Qw[i]
+            tempv[i] = x_hat_i + sigma * (qw_i - acc)
         else
-            # Use pre-computed Qw_bar (from cuSPARSE)
-            tempv[i] = x_hat[i] + sigma * (Qw[i] - Qw_bar[i])
+            x_hat_i = x_hat[i]
+            qw_i = Qw[i]
+            qw_bar_i = Qw_bar[i]
+            tempv[i] = x_hat_i + sigma * (qw_i - qw_bar_i)
         end
     end
     return
@@ -171,7 +222,7 @@ end
 #
 # Key optimization: Fuses A*tempv SpMV with y update to reduce memory traffic
 #
-CUDA.@fastmath @inline function unified_update_y_kernel!(
+CUDA.@fastmath @inline function unified_update_y_kernel!(::Val{UseCustom},
     dy::CuDeviceVector{Float64},
     rowPtrA::CuDeviceVector{Int32},
     colValA::CuDeviceVector{Int32},
@@ -188,30 +239,40 @@ CUDA.@fastmath @inline function unified_update_y_kernel!(
     fact2::Float64,
     Halpern_fact1::Float64,
     Halpern_fact2::Float64,
-    use_custom_spmv::Bool,
-    m::Int)
+    m::Int) where {UseCustom}
     i = threadIdx().x + (blockDim().x * (blockIdx().x - 1))
     @inbounds if i <= m
-        # Conditionally compute A*tempv inline or use pre-computed value
-        Ax_val = if use_custom_spmv
+        Ax_val = if UseCustom
             startA = rowPtrA[i]
-            stopA = rowPtrA[i+1] - 1
-            Ai = 0.0
+            stopA = rowPtrA[i + 1] - 1
+            acc = 0.0
             @inbounds for k in startA:stopA
-                Ai += nzValA[k] * tempv[colValA[k]]
+                acc += nzValA[k] * tempv[colValA[k]]
             end
-            Ax[i] = Ai
-            Ai
+            Ax[i] = acc
+            acc
         else
-            Ax[i]  # Already computed by cuSPARSE
+            Ax[i]
         end
-        
-        s[i] = Ax_val - fact1 * y[i]
-        y_bar[i] = s[i] < (AL[i]) ? (AL[i] - s[i]) : (s[i] > (AU[i]) ? (AU[i] - s[i]) : 0.0)
-        s[i] = s[i] + y_bar[i]
-        y_bar[i] = fact2 * y_bar[i]
-        dy[i] = y_bar[i] - y[i]
-        y[i] = Halpern_fact1 * last_y[i] + Halpern_fact2 * (2 * y_bar[i] - y[i])
+
+        y_i = y[i]
+        last_y_i = last_y[i]
+        AL_i = AL[i]
+        AU_i = AU[i]
+
+        s_raw = Ax_val - fact1 * y_i
+        s_proj = min(max(s_raw, AL_i), AU_i)
+        # Original ternary correction: (s_raw < AL_i) ? (AL_i - s_raw) : ((s_raw > AU_i) ? (AU_i - s_raw) : 0.0)
+        corr = s_proj - s_raw
+        s_total = s_proj
+        y_bar_i = fact2 * corr
+        dy_i = y_bar_i - y_i
+        y_new = Halpern_fact1 * last_y_i + Halpern_fact2 * (2.0 * y_bar_i - y_i)
+
+        s[i] = s_total
+        y_bar[i] = y_bar_i
+        dy[i] = dy_i
+        y[i] = y_new
     end
     return
 end
@@ -229,7 +290,7 @@ end
 #
 # Key optimization: Fuses AT*y_bar SpMV with w2 update to reduce memory traffic
 #
-CUDA.@fastmath @inline function unified_update_w2_kernel!(
+CUDA.@fastmath @inline function unified_update_w2_kernel!(::Val{UseCustom}, ::Val{IsDiag},
     dw::CuDeviceVector{Float64},
     ATdy::CuDeviceVector{Float64},
     rowPtrAT::CuDeviceVector{Int32},
@@ -246,33 +307,46 @@ CUDA.@fastmath @inline function unified_update_w2_kernel!(
     fact_vec::CuDeviceVector{Float64},
     Halpern_fact1::Float64,
     Halpern_fact2::Float64,
-    use_custom_spmv::Bool,
-    is_diag_Q::Bool,
-    n::Int)
+    n::Int) where {UseCustom, IsDiag}
     i = threadIdx().x + (blockDim().x * (blockIdx().x - 1))
     @inbounds if i <= n
-        # Conditionally compute AT*y_bar inline or use pre-computed value
-        ATy_bar_val = if use_custom_spmv
+        ATy_bar_val = if UseCustom
             startAT = rowPtrAT[i]
-            stopAT = rowPtrAT[i+1] - 1
-            sAT = 0.0
+            stopAT = rowPtrAT[i + 1] - 1
+            acc = 0.0
             @inbounds for k in startAT:stopAT
-                sAT += nzValAT[k] * y_bar[colValAT[k]]
+                acc += nzValAT[k] * y_bar[colValAT[k]]
             end
-            ATy_bar[i] = sAT
-            sAT
+            ATy_bar[i] = acc
+            acc
         else
-            ATy_bar[i]  # Already computed by cuSPARSE
+            ATy_bar[i]
         end
-        
-        # Use vector or scalar fact depending on Q type
-        fact = is_diag_Q ? fact_vec[i] : fact_scalar
-        
-        w_bar[i] = w_bar[i] + fact * (ATy_bar_val - ATy[i])
-        dw[i] = w_bar[i] - w[i]
-        ATdy[i] = ATy_bar_val - ATy[i]
-        w[i] = Halpern_fact1 * last_w[i] + Halpern_fact2 * (2 * w_bar[i] - w[i])
-        ATy[i] = Halpern_fact1 * last_ATy[i] + Halpern_fact2 * (2 * ATy_bar_val - ATy[i])
+
+        # Original ternary: fact = IsDiag ? fact_vec[i] : fact_scalar
+        fact = if IsDiag
+            fact_vec[i]
+        else
+            fact_scalar
+        end
+
+        w_i = w[i]
+        w_bar_i = w_bar[i]
+        ATy_i = ATy[i]
+        last_w_i = last_w[i]
+        last_ATy_i = last_ATy[i]
+
+        w_bar_new = w_bar_i + fact * (ATy_bar_val - ATy_i)
+        w_new = Halpern_fact1 * last_w_i + Halpern_fact2 * (2.0 * w_bar_new - w_i)
+        ATy_new = Halpern_fact1 * last_ATy_i + Halpern_fact2 * (2.0 * ATy_bar_val - ATy_i)
+        dw_i = w_bar_new - w_new
+        ATdy_i = ATy_bar_val - ATy_i
+
+        w_bar[i] = w_bar_new
+        w[i] = w_new
+        ATy[i] = ATy_new
+        dw[i] = dw_i
+        ATdy[i] = ATdy_i
     end
     return
 end
@@ -288,9 +362,9 @@ function unified_update_zxw1_gpu!(ws::HPRQP_workspace_gpu, qp::QP_info_gpu, Halp
     fact2_scalar = 1.0 / (1.0 + ws.sigma * ws.lambda_max_Q)
     fact1_scalar = 1.0 - fact2_scalar
     
-    # For diagonal Q, use pre-computed vector factors; for regular Q, pass dummy vectors
-    fact1_vec = is_diag_Q ? ws.fact1 : ws.dx  # dummy if not diagonal
-    fact2_vec = is_diag_Q ? ws.fact2 : ws.dx  # dummy if not diagonal
+    # Pre-computed diagonal scaling factors (ignored when Q is not diagonal)
+    fact1_vec = ws.fact1
+    fact2_vec = ws.fact2
     
     # Get Q matrix structure (use dummy vectors for operators)
     # For operators, rowPtr/colVal/nzVal won't be accessed since use_custom_spmv_Q will be false
@@ -307,11 +381,15 @@ function unified_update_zxw1_gpu!(ws::HPRQP_workspace_gpu, qp::QP_info_gpu, Halp
     end
     
     # Step 1: Update z, x, w1
-    @cuda threads = 256 blocks = ceil(Int, ws.n / 256) unified_update_zxw1_kernel!(
-        ws.dx, rowPtrQ, colValQ, nzValQ,
-        ws.w_bar, ws.w, ws.z_bar, ws.x_bar, ws.x_hat, ws.last_x, ws.x, ws.Qw, ws.ATy, ws.c, 
-        ws.tempv, ws.l, ws.u, ws.sigma, fact1_scalar, fact2_scalar, fact1_vec, fact2_vec,
-        Halpern_fact1, Halpern_fact2, use_custom_spmv_Q, is_diag_Q, ws.n)
+    threads, blocks = gpu_launch_config(ws.n)
+    if threads > 0
+        @cuda threads = threads blocks = blocks unified_update_zxw1_kernel!(
+            Val(use_custom_spmv_Q), Val(is_diag_Q),
+            ws.dx, rowPtrQ, colValQ, nzValQ,
+            ws.w_bar, ws.w, ws.z_bar, ws.x_bar, ws.x_hat, ws.last_x, ws.x, ws.Qw, ws.ATy, ws.c,
+            ws.l, ws.u, ws.sigma, fact1_scalar, fact2_scalar, fact1_vec, fact2_vec,
+            Halpern_fact1, Halpern_fact2, ws.n)
+    end
     
     # Step 2: Compute tempv for subsequent use in update_y
     # Use Qmap! for Q*w_bar (works for both sparse matrices and operators)
@@ -319,9 +397,12 @@ function unified_update_zxw1_gpu!(ws::HPRQP_workspace_gpu, qp::QP_info_gpu, Halp
         Qmap!(ws.w_bar, ws.Qw_bar, qp.Q)
     end
     
-    @cuda threads = 256 blocks = ceil(Int, ws.n / 256) compute_tempv_unified_kernel!(
-        ws.tempv, rowPtrQ, colValQ, nzValQ,
-        ws.w_bar, ws.x_hat, ws.Qw, ws.Qw_bar, ws.sigma, use_custom_spmv_Q, ws.n)
+    if threads > 0
+        @cuda threads = threads blocks = blocks compute_tempv_unified_kernel!(
+            Val(use_custom_spmv_Q),
+            ws.tempv, rowPtrQ, colValQ, nzValQ,
+            ws.w_bar, ws.x_hat, ws.Qw, ws.Qw_bar, ws.sigma, ws.n)
+    end
 end
 
 # Unified wrapper for update_y that handles both custom and cuSPARSE SpMV
@@ -340,10 +421,14 @@ function unified_update_y_gpu!(ws::HPRQP_workspace_gpu, Halpern_fact1::Float64, 
     end
     
     if ws.m > 0
-        @cuda threads = 256 blocks = ceil(Int, ws.m / 256) unified_update_y_kernel!(
-            ws.dy, ws.A.rowPtr, ws.A.colVal, ws.A.nzVal,
-            ws.tempv, ws.Ax, ws.y_bar, ws.y, ws.last_y, ws.s, ws.AL, ws.AU,
-            fact1, fact2, Halpern_fact1, Halpern_fact2, use_custom_spmv_A, ws.m)
+        threads_A, blocks_A = gpu_launch_config(ws.m)
+        if threads_A > 0
+            @cuda threads = threads_A blocks = blocks_A unified_update_y_kernel!(
+                Val(use_custom_spmv_A),
+                ws.dy, ws.A.rowPtr, ws.A.colVal, ws.A.nzVal,
+                ws.tempv, ws.Ax, ws.y_bar, ws.y, ws.last_y, ws.s, ws.AL, ws.AU,
+                fact1, fact2, Halpern_fact1, Halpern_fact2, ws.m)
+        end
     end
 end
 
@@ -357,25 +442,28 @@ function unified_update_w2_gpu!(ws::HPRQP_workspace_gpu, Halpern_fact1::Float64,
     # Prepare scalar factor for regular Q
     fact_scalar = ws.sigma / (1.0 + ws.sigma * ws.lambda_max_Q)
     
-    # For diagonal Q, use pre-computed vector factor; for regular Q, pass dummy vector
-    fact_vec = is_diag_Q ? ws.fact : ws.dx  # dummy if not diagonal
+    # Pre-computed vector factor for diagonal Q (ignored otherwise)
+    fact_vec = ws.fact
     
     # Only compute AT*y_bar via cuSPARSE if not using custom SpMV for A
     if !use_custom_spmv_A
         CUDA.CUSPARSE.mv!('N', 1, ws.AT, ws.y_bar, 0, ws.ATy_bar, 'O', CUDA.CUSPARSE.CUSPARSE_SPMV_CSR_ALG2)
     end
     
-    @cuda threads = 256 blocks = ceil(Int, ws.n / 256) unified_update_w2_kernel!(
-        ws.dw, ws.ATdy, ws.AT.rowPtr, ws.AT.colVal, ws.AT.nzVal,
-        ws.y_bar, ws.ATy_bar, ws.w, ws.w_bar, ws.last_w, ws.last_ATy, ws.ATy,
-        fact_scalar, fact_vec, Halpern_fact1, Halpern_fact2,
-        use_custom_spmv_A, is_diag_Q, ws.n)
+    threads, blocks = gpu_launch_config(ws.n)
+    if threads > 0
+        @cuda threads = threads blocks = blocks unified_update_w2_kernel!(
+            Val(use_custom_spmv_A), Val(is_diag_Q),
+            ws.dw, ws.ATdy, ws.AT.rowPtr, ws.AT.colVal, ws.AT.nzVal,
+            ws.y_bar, ws.ATy_bar, ws.w, ws.w_bar, ws.last_w, ws.last_ATy, ws.ATy,
+            fact_scalar, fact_vec, Halpern_fact1, Halpern_fact2, ws.n)
+    end
 end
 
 ## Unified kernels for empty Q case (Q.nzVal has length 0 - linear program)
 
 # Unified update_zx kernel - handles both custom inline AT*y and cuSPARSE
-CUDA.@fastmath @inline function unified_update_zx_kernel!(
+CUDA.@fastmath @inline function unified_update_zx_kernel!(::Val{UseCustom},
     dx::CuDeviceVector{Float64},
     rowPtrAT::CuDeviceVector{Int32}, 
     colValAT::CuDeviceVector{Int32}, 
@@ -393,39 +481,42 @@ CUDA.@fastmath @inline function unified_update_zx_kernel!(
     sigma::Float64,
     Halpern_fact1::Float64, 
     Halpern_fact2::Float64,
-    use_custom_spmv::Bool,
-    n::Int)
+    n::Int) where {UseCustom}
     
     i = threadIdx().x + (blockDim().x * (blockIdx().x - 1))
     @inbounds if i <= n
-        # Compute AT*y either inline or use pre-computed value
-        ATy_val = if use_custom_spmv
-            # Custom inline computation of AT*y
+        ATy_val = if UseCustom
             startAT = rowPtrAT[i]
-            stopAT = rowPtrAT[i+1] - 1
-            sAT = 0.0
-            for k in startAT:stopAT
-                sAT += nzValAT[k] * y[colValAT[k]]
+            stopAT = rowPtrAT[i + 1] - 1
+            acc = 0.0
+            @inbounds for k in startAT:stopAT
+                acc += nzValAT[k] * y[colValAT[k]]
             end
-            sAT
+            acc
         else
-            # Use pre-computed ATy from cuSPARSE
             ATy[i]
         end
-        
-        # Update z and x (no w since Q=0)
-        tmp = ATy_val - c[i]
-        z_bar[i] = x[i] + sigma * tmp
-        
-        # Project onto [l, u]
-        x_bar[i] = z_bar[i] < l[i] ? l[i] : (z_bar[i] > u[i] ? u[i] : z_bar[i])
-        x_hat[i] = 2 * x_bar[i] - x[i]
-        z_bar[i] = (x_bar[i] - z_bar[i]) / sigma
-        
-        dx[i] = x_bar[i] - x[i]
-        
-        # Halpern averaging
-        x[i] = Halpern_fact1 * last_x[i] + Halpern_fact2 * x_hat[i]
+
+        x_i = x[i]
+        last_x_i = last_x[i]
+        l_i = l[i]
+        u_i = u[i]
+        c_i = c[i]
+
+        tmp = ATy_val - c_i
+        z_raw = x_i + sigma * tmp
+        # Original ternary clamp: (z_raw < l_i) ? l_i : ((z_raw > u_i) ? u_i : z_raw)
+        x_bar_i = min(max(z_raw, l_i), u_i)
+        x_hat_i = 2.0 * x_bar_i - x_i
+        z_bar_i = (x_bar_i - z_raw) / sigma
+        dx_i = x_bar_i - x_i
+        x_new = Halpern_fact1 * last_x_i + Halpern_fact2 * x_hat_i
+
+        dx[i] = dx_i
+        x[i] = x_new
+        x_bar[i] = x_bar_i
+        x_hat[i] = x_hat_i
+        z_bar[i] = z_bar_i
     end
     return
 end
@@ -441,11 +532,15 @@ function unified_update_zx_gpu!(ws::HPRQP_workspace_gpu, Halpern_fact1::Float64,
         CUDA.CUSPARSE.mv!('N', 1, ws.AT, ws.y, 0, ws.ATy, 'O', CUDA.CUSPARSE.CUSPARSE_SPMV_CSR_ALG2)
     end
     
-    @cuda threads = 256 blocks = ceil(Int, ws.n / 256) unified_update_zx_kernel!(
-        ws.dx, ws.AT.rowPtr, ws.AT.colVal, ws.AT.nzVal,
-        ws.y, ws.ATy, ws.z_bar, ws.x_bar, ws.x_hat, ws.x, ws.last_x,
-        ws.c, ws.l, ws.u, ws.sigma,
-        Halpern_fact1, Halpern_fact2, use_custom_spmv_A, ws.n)
+    threads, blocks = gpu_launch_config(ws.n)
+    if threads > 0
+        @cuda threads = threads blocks = blocks unified_update_zx_kernel!(
+            Val(use_custom_spmv_A),
+            ws.dx, ws.AT.rowPtr, ws.AT.colVal, ws.AT.nzVal,
+            ws.y, ws.ATy, ws.z_bar, ws.x_bar, ws.x_hat, ws.x, ws.last_x,
+            ws.c, ws.l, ws.u, ws.sigma,
+            Halpern_fact1, Halpern_fact2, ws.n)
+    end
 end
 
 # Unified update_y_noQ - uses x_hat directly instead of tempv
@@ -463,21 +558,25 @@ function unified_update_y_noQ_gpu!(ws::HPRQP_workspace_gpu, Halpern_fact1::Float
     end
     
     if ws.m > 0
-        # Reuse unified_update_y_kernel but pass x_hat instead of tempv
-        @cuda threads = 256 blocks = ceil(Int, ws.m / 256) unified_update_y_kernel!(
-            ws.dy, ws.A.rowPtr, ws.A.colVal, ws.A.nzVal,
-            ws.x_hat, ws.Ax, ws.y_bar, ws.y, ws.last_y, ws.s, ws.AL, ws.AU,
-            fact1, fact2, Halpern_fact1, Halpern_fact2, use_custom_spmv_A, ws.m)
+        threads_A, blocks_A = gpu_launch_config(ws.m)
+        if threads_A > 0
+            # Reuse unified_update_y_kernel but pass x_hat instead of tempv
+            @cuda threads = threads_A blocks = blocks_A unified_update_y_kernel!(
+                Val(use_custom_spmv_A),
+                ws.dy, ws.A.rowPtr, ws.A.colVal, ws.A.nzVal,
+                ws.x_hat, ws.Ax, ws.y_bar, ws.y, ws.last_y, ws.s, ws.AL, ws.AU,
+                fact1, fact2, Halpern_fact1, Halpern_fact2, ws.m)
+        end
     end
 end
 
 
-function cust_compute_r2_kernel!(rowPtrQ::CuDeviceVector{Int32}, colValQ::CuDeviceVector{Int32}, nzValQ::CuDeviceVector{Float64},
+CUDA.@fastmath @inline function cust_compute_r2_kernel!(rowPtrQ::CuDeviceVector{Int32}, colValQ::CuDeviceVector{Int32}, nzValQ::CuDeviceVector{Float64},
     w_bar::CuDeviceVector{Float64}, Qw::CuDeviceVector{Float64},
     sigma::Float64, x_hat::CuDeviceVector{Float64},
     tempv::CuDeviceVector{Float64}, n::Int)
     i = threadIdx().x + (blockDim().x * (blockIdx().x - 1))
-    if i <= n
+    @inbounds if i <= n
         startQ = rowPtrQ[i]
         stopQ = rowPtrQ[i+1] - 1
         qr1 = 0.0
@@ -625,7 +724,7 @@ end
 
 ## kernels to compute residuals
 
-function compute_Rd_kernel!(ATy::CuDeviceVector{Float64},
+CUDA.@fastmath @inline function compute_Rd_kernel!(ATy::CuDeviceVector{Float64},
     z::CuDeviceVector{Float64},
     c::CuDeviceVector{Float64},
     Qx::CuDeviceVector{Float64},
@@ -634,12 +733,16 @@ function compute_Rd_kernel!(ATy::CuDeviceVector{Float64},
     c_scale::Float64,
     n::Int)
     i = threadIdx().x + (blockDim().x * (blockIdx().x - 0x1))
-    if i <= n
-        Rd[i] = Qx[i] + c[i] - ATy[i] - z[i]
+    @inbounds if i <= n
+        qx_i = Qx[i]
+        c_i = c[i]
+        atyi = ATy[i]
+        z_i = z[i]
         scale_fact = col_norm[i] * c_scale
-        Rd[i] *= scale_fact
-        Qx[i] *= scale_fact
-        ATy[i] *= scale_fact
+        rd_i = (qx_i + c_i - atyi - z_i) * scale_fact
+        Rd[i] = rd_i
+        Qx[i] = qx_i * scale_fact
+        ATy[i] = atyi * scale_fact
     end
     return
 end
@@ -648,10 +751,13 @@ function compute_Rd_gpu!(ws::HPRQP_workspace_gpu, sc::Scaling_info_gpu)
     if ws.m > 0
         CUDA.CUSPARSE.mv!('N', 1, ws.AT, ws.y_bar, 0, ws.ATdy, 'O', CUDA.CUSPARSE.CUSPARSE_SPMV_CSR_ALG2)
     end
-    @cuda threads = 256 blocks = ceil(Int, ws.n / 256) compute_Rd_kernel!(ws.ATdy, ws.z_bar, ws.c, ws.Qx, ws.Rd, sc.col_norm, sc.c_scale, ws.n)
+    threads, blocks = gpu_launch_config(ws.n)
+    if threads > 0
+        @cuda threads = threads blocks = blocks compute_Rd_kernel!(ws.ATdy, ws.z_bar, ws.c, ws.Qx, ws.Rd, sc.col_norm, sc.c_scale, ws.n)
+    end
 end
 
-function compute_Rp_kernel!(Rp::CuDeviceVector{Float64},
+CUDA.@fastmath @inline function compute_Rp_kernel!(Rp::CuDeviceVector{Float64},
     AL::CuDeviceVector{Float64},
     AU::CuDeviceVector{Float64},
     Ax::CuDeviceVector{Float64},
@@ -659,21 +765,29 @@ function compute_Rp_kernel!(Rp::CuDeviceVector{Float64},
     b_scale::Float64,
     m::Int)
     i = threadIdx().x + (blockDim().x * (blockIdx().x - 0x1))
-    if i <= m
-        Rp[i] = (Ax[i] < AL[i]) ? (AL[i] - Ax[i]) : (Ax[i] > AU[i] ? (AU[i] - Ax[i]) : 0.0)
+    @inbounds if i <= m
+        ax_i = Ax[i]
+        AL_i = AL[i]
+        AU_i = AU[i]
+        ax_proj = min(max(ax_i, AL_i), AU_i)
+        # Original ternary correction: (ax_i < AL_i) ? (AL_i - ax_i) : ((ax_i > AU_i) ? (AU_i - ax_i) : 0.0)
+        corr = ax_proj - ax_i
         scale_fact = row_norm[i] * b_scale
-        Rp[i] *= scale_fact
-        Ax[i] *= scale_fact
+        Rp[i] = corr * scale_fact
+        Ax[i] = ax_i * scale_fact
     end
     return
 end
 
 function compute_Rp_gpu!(ws::HPRQP_workspace_gpu, sc::Scaling_info_gpu)
     CUDA.CUSPARSE.mv!('N', 1, ws.A, ws.x_bar, 0, ws.Ax, 'O', CUDA.CUSPARSE.CUSPARSE_SPMV_CSR_ALG2)
-    @cuda threads = 256 blocks = ceil(Int, ws.m / 256) compute_Rp_kernel!(ws.Rp, ws.AL, ws.AU, ws.Ax, sc.row_norm, sc.b_scale, ws.m)
+    threads, blocks = gpu_launch_config(ws.m)
+    if threads > 0
+        @cuda threads = threads blocks = blocks compute_Rp_kernel!(ws.Rp, ws.AL, ws.AU, ws.Ax, sc.row_norm, sc.b_scale, ws.m)
+    end
 end
 
-function compute_err_lu_kernel!(dx::CuDeviceVector{Float64},
+CUDA.@fastmath @inline function compute_err_lu_kernel!(dx::CuDeviceVector{Float64},
     x::CuDeviceVector{Float64},
     l::CuDeviceVector{Float64},
     u::CuDeviceVector{Float64},
@@ -681,19 +795,25 @@ function compute_err_lu_kernel!(dx::CuDeviceVector{Float64},
     b_scale::Float64,
     n::Int)
     i = threadIdx().x + (blockDim().x * (blockIdx().x - 1))
-    if i <= n
-        dx[i] = (x[i] < l[i]) ? (l[i] - x[i]) : ((x[i] > u[i]) ? (x[i] - u[i]) : 0.0)
-        dx[i] *= b_scale / col_norm[i]
+    @inbounds if i <= n
+        x_i = x[i]
+        l_i = l[i]
+        u_i = u[i]
+        lower_violation = max(l_i - x_i, 0.0)
+        upper_violation = max(x_i - u_i, 0.0)
+        # Original ternary: (x_i < l_i) ? (l_i - x_i) : ((x_i > u_i) ? (x_i - u_i) : 0.0)
+        corr = lower_violation + upper_violation
+        dx[i] = corr * (b_scale / col_norm[i])
     end
     return
 end
 
-function axpby_kernel!(a::Float64, x::CuDeviceVector{Float64},
+CUDA.@fastmath @inline function axpby_kernel!(a::Float64, x::CuDeviceVector{Float64},
     b::Float64, y::CuDeviceVector{Float64},
     z::CuDeviceVector{Float64}, n::Int)
     i = threadIdx().x + (blockDim().x * (blockIdx().x - 0x1))
-    if i <= n
-        @inbounds z[i] = a * x[i] + b * y[i]
+    @inbounds if i <= n
+        z[i] = muladd(a, x[i], b * y[i])
     end
     return
 end
@@ -701,7 +821,10 @@ end
 function axpby_gpu!(a::Float64, x::CuArray{Float64},
     b::Float64, y::CuArray{Float64},
     z::CuArray{Float64}, n::Int)
-    @cuda threads = 256 blocks = ceil(Int, n / 256) axpby_kernel!(a, x, b, y, z, n)
+    threads, blocks = gpu_launch_config(n)
+    if threads > 0
+        @cuda threads = threads blocks = blocks axpby_kernel!(a, x, b, y, z, n)
+    end
 end
 
 # GPU kernels for scaling operations
@@ -721,7 +844,10 @@ function compute_row_max_abs_kernel!(rowPtr::CuDeviceVector{Int32},
                 val = abs(nzVal[k])
                 max_val = max(max_val, val)
             end
-            row_norm[i] = max_val > 0.0 ? sqrt(max_val) : 1.0
+            sqrt_max = sqrt(max_val)
+            mask = Float64(max_val > 0.0)
+            # Original ternary: max_val > 0.0 ? sqrt(max_val) : 1.0
+            row_norm[i] = muladd(mask, sqrt_max - 1.0, 1.0)
         end
     end
     return
@@ -742,7 +868,10 @@ function compute_col_max_abs_kernel!(rowPtr::CuDeviceVector{Int32},
                 val = abs(nzVal[k])
                 max_val = max(max_val, val)
             end
-            col_norm[i] = max_val > 0.0 ? sqrt(max_val) : 1.0
+            sqrt_max = sqrt(max_val)
+            mask = Float64(max_val > 0.0)
+            # Original ternary: max_val > 0.0 ? sqrt(max_val) : 1.0
+            col_norm[i] = muladd(mask, sqrt_max - 1.0, 1.0)
         end
     end
     return
@@ -762,7 +891,10 @@ function compute_row_sum_abs_kernel!(rowPtr::CuDeviceVector{Int32},
             for k in start_idx:end_idx
                 sum_val += abs(nzVal[k])
             end
-            row_norm[i] = sum_val > 0.0 ? sqrt(sum_val) : 1.0
+            sqrt_sum = sqrt(sum_val)
+            mask = Float64(sum_val > 0.0)
+            # Original ternary: sum_val > 0.0 ? sqrt(sum_val) : 1.0
+            row_norm[i] = muladd(mask, sqrt_sum - 1.0, 1.0)
         end
     end
     return
@@ -782,7 +914,10 @@ function compute_col_sum_abs_kernel!(rowPtr::CuDeviceVector{Int32},
             for k in start_idx:end_idx
                 sum_val += abs(nzVal[k])
             end
-            col_norm[i] = sum_val > 0.0 ? sqrt(sum_val) : 1.0
+            sqrt_sum = sqrt(sum_val)
+            mask = Float64(sum_val > 0.0)
+            # Original ternary: sum_val > 0.0 ? sqrt(sum_val) : 1.0
+            col_norm[i] = muladd(mask, sqrt_sum - 1.0, 1.0)
         end
     end
     return
@@ -817,7 +952,10 @@ function compute_row_max_abs_with_Q_kernel!(A_rowPtr::CuDeviceVector{Int32},
             end
             
             max_val = max(max_val_Q, max_val_A)
-            row_norm[i] = max_val > 0.0 ? sqrt(max_val) : 1.0
+            sqrt_max = sqrt(max_val)
+            mask = Float64(max_val > 0.0)
+            # Original ternary: max_val > 0.0 ? sqrt(max_val) : 1.0
+            row_norm[i] = muladd(mask, sqrt_max - 1.0, 1.0)
         end
     end
     return
@@ -850,7 +988,10 @@ function compute_col_sum_abs_with_Q_kernel!(A_rowPtr::CuDeviceVector{Int32},
             end
             
             sum_val = sum_val_Q + sum_val_A
-            col_norm[i] = sum_val > 0.0 ? sqrt(sum_val) : 1.0
+            sqrt_sum = sqrt(sum_val)
+            mask = Float64(sum_val > 0.0)
+            # Original ternary: sum_val > 0.0 ? sqrt(sum_val) : 1.0
+            col_norm[i] = muladd(mask, sqrt_sum - 1.0, 1.0)
         end
     end
     return
