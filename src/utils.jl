@@ -31,136 +31,6 @@ function read_mps(file::String)
     return Q, c, A, lcon, ucon, lvar, uvar, c0
 end
 
-# Formulate the QP problem without the C constraints (l ≤ x ≤ u)
-function qp_formulation_noC(Q::SparseMatrixCSC,
-    c::Vector{Float64},
-    A::SparseMatrixCSC,
-    AL::Vector{Float64},
-    AU::Vector{Float64},
-    l::Vector{Float64},
-    u::Vector{Float64},
-    c0::Float64=0.0)
-
-    # ====================================================================
-    # Input Validation
-    # ====================================================================
-
-    # Check Q matrix properties
-    m_Q, n_Q = size(Q)
-    if m_Q != n_Q
-        error("Q matrix must be square. Got size ($m_Q, $n_Q).")
-    end
-    n = n_Q
-
-    # Check Q is symmetric (within tolerance)
-    if nnz(Q) > 0
-        Q_diff = Q - Q'
-        if norm(Q_diff, Inf) > 1e-10
-            @warn "Q matrix is not symmetric (max deviation: $(norm(Q_diff, Inf))). Symmetrizing Q = 0.5*(Q + Q')."
-            Q = 0.5 * (Q + Q')
-            dropzeros!(Q)
-        end
-    end
-
-    # Check vector dimensions
-    if length(c) != n
-        error("Dimension mismatch: Q is $n×$n but c has length $(length(c)).")
-    end
-    if length(l) != n
-        error("Dimension mismatch: Q is $n×$n but l has length $(length(l)).")
-    end
-    if length(u) != n
-        error("Dimension mismatch: Q is $n×$n but u has length $(length(u)).")
-    end
-
-    # Check A matrix dimensions
-    m_A, n_A = size(A)
-    if n_A != n
-        error("Dimension mismatch: Q is $n×$n but A has $n_A columns.")
-    end
-    if length(AL) != m_A
-        error("Dimension mismatch: A has $m_A rows but AL has length $(length(AL)).")
-    end
-    if length(AU) != m_A
-        error("Dimension mismatch: A has $m_A rows but AU has length $(length(AU)).")
-    end
-
-    # Check bound consistency
-    infeasible_bounds = findall(l .> u)
-    if !isempty(infeasible_bounds)
-        error("Infeasible variable bounds: l > u at indices: $(infeasible_bounds[1:min(5, length(infeasible_bounds))]) $(length(infeasible_bounds) > 5 ? "..." : "")")
-    end
-
-    infeasible_constraints = findall(AL .> AU)
-    if !isempty(infeasible_constraints)
-        error("Infeasible constraint bounds: AL > AU at rows: $(infeasible_constraints[1:min(5, length(infeasible_constraints))]) $(length(infeasible_constraints) > 5 ? "..." : "")")
-    end
-
-    # Check for NaN or Inf in problem data (except bounds which can be ±Inf)
-    if any(isnan, Q.nzval) || any(isinf, Q.nzval)
-        error("Q matrix contains NaN or Inf values.")
-    end
-    if any(isnan, c) || any(isinf, c)
-        error("c vector contains NaN or Inf values.")
-    end
-    if any(isnan, A.nzval) || any(isinf, A.nzval)
-        error("A matrix contains NaN or Inf values.")
-    end
-    if any(isnan.(AL) .& isfinite.(AL)) || any(isnan.(AU) .& isfinite.(AU))
-        error("Constraint bounds AL or AU contain NaN values.")
-    end
-    if any(isnan.(l) .& isfinite.(l)) || any(isnan.(u) .& isfinite.(u))
-        error("Variable bounds l or u contain NaN values.")
-    end
-
-    # ====================================================================
-    # Problem Preprocessing
-    # ====================================================================
-
-    # Remove the rows of A that are all zeros
-    abs_A = abs.(A)
-    del_row = findall(sum(abs_A, dims=2)[:, 1] .== 0)
-
-    A = vcat(A, spdiagm(ones(length(l))))
-    AL = vcat(AL, l)
-    AU = vcat(AU, u)
-
-    # rows that AL and AU are -Inf and Inf
-    del_row = union(del_row, findall((AL .== -Inf) .& (AU .== Inf)))
-
-    if length(del_row) > 0
-        keep_rows = setdiff(1:size(A, 1), del_row)
-        A = A[keep_rows, :]
-        AL = AL[keep_rows]
-        AU = AU[keep_rows]
-        println("Deleted ", length(del_row), " rows of A (empty or free bounds).")
-    end
-
-
-    idxE = findall(AL .== AU)
-    idxG = findall((AL .> -Inf) .& (AU .== Inf))
-    idxL = findall((AL .== -Inf) .& (AU .< Inf))
-    idxB = findall((AL .> -Inf) .& (AU .< Inf))
-    idxB = setdiff(idxB, idxE)
-
-    # check dimension of Q, c, A, l, u, AL, AU
-    # println("problem information: nRow = ", size(A, 1), ", nCol = ", size(A, 2), ", nnz Q = ", nnz(Q), ", nnz A = ", nnz(A))
-    # println("                     number of equalities = ", length(idxE))
-    # println("                     number of inequalities = ", length(idxG) + length(idxL) + length(idxB))
-    @assert size(Q, 1) == size(Q, 2)
-    @assert size(Q, 1) == length(c)
-    @assert size(A, 2) == length(c)
-    @assert length(l) == length(u)
-    @assert length(c) == size(Q, 1)
-    @assert length(AL) == length(AU)
-    @assert length(AL) == size(A, 1)
-
-    standard_qp = QP_info_cpu(Q, c, A, A', AL, AU, l, u, c0, [], false, true, 0.0)
-
-    # Return the modified qp
-    return standard_qp
-end
-
 # Formulate the QP problem with the C constraints (l ≤ x ≤ u)
 function qp_formulation(Q::SparseMatrixCSC,
     c::Vector{Float64},
@@ -279,7 +149,7 @@ function qp_formulation(Q::SparseMatrixCSC,
     @assert length(AL) == size(A, 1)
 
 
-    standard_qp = QP_info_cpu(Q, c, A, A', AL, AU, l, u, c0, [], false, false, 0.0)
+    standard_qp = QP_info_cpu(Q, c, A, A', AL, AU, l, u, c0, [], false, 0.0)
 
     # Return the modified qp
     return standard_qp
@@ -807,18 +677,9 @@ function build_from_mps(filename::String; verbose::Bool=true)
     if verbose
         println("FORMULATING QP ...")
     end
-    number_empty_lu = sum((lvar .== -Inf) .& (uvar .== Inf))
-    if (number_empty_lu > 0.8 * length(lvar)) && false
-        ## dont use this branch for now
-        standard_qp = qp_formulation_noC(Q, c, A, lcon, ucon, lvar, uvar, c0)
-        if verbose
-            println("QP formulation without C")
-        end
-    else
-        standard_qp = qp_formulation(Q, c, A, lcon, ucon, lvar, uvar, c0)
-        if verbose
-            println("QP formulation with C")
-        end
+    standard_qp = qp_formulation(Q, c, A, lcon, ucon, lvar, uvar, c0)
+    if verbose
+        println("QP formulation with C")
     end
     if verbose
         println(@sprintf("FORMULATING QP time: %.2f seconds", time() - t_start))
@@ -923,18 +784,9 @@ function build_from_QAbc(Q::Union{SparseMatrixCSC,Matrix{Float64}},
     if verbose
         println("FORMULATING QP ...")
     end
-    number_empty_lu = sum((lvar .== -Inf) .& (uvar .== Inf))
-    if (number_empty_lu > 0.8 * length(lvar)) && false
-        ## dont use this branch for now
-        standard_qp = qp_formulation_noC(Q, c, A, lcon, ucon, lvar, uvar, obj_constant)
-        if verbose
-            println("QP formulation without C")
-        end
-    else
-        standard_qp = qp_formulation(Q, c, A, lcon, ucon, lvar, uvar, obj_constant)
-        if verbose
-            println("QP formulation with C")
-        end
+    standard_qp = qp_formulation(Q, c, A, lcon, ucon, lvar, uvar, obj_constant)
+    if verbose
+        println("QP formulation with C")
     end
     if verbose
         println(@sprintf("FORMULATING QP time: %.2f seconds", time() - t_start))
@@ -1100,7 +952,6 @@ function build_from_ABST(A::Matrix{Float64}, B::Matrix{Float64},
         0.0,  # obj_constant
         Float64[],  # diag_Q (empty for operator)
         false,  # Q_is_diag
-        false,  # noC
         0.0,  # lambda (not used for QAP)
     )
 
@@ -1190,7 +1041,6 @@ function build_from_Ab_lambda(A::SparseMatrixCSC{Float64}, b::Vector{Float64},
         obj_constant,  # obj_constant = 0.5 * ||b||²
         Float64[],  # diag_Q (empty for operator)
         false,  # Q_is_diag
-        false,  # noC (we handle bounds via proximal operator)
         lambda,  # lambda for LASSO regularization
     )
 

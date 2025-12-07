@@ -18,7 +18,6 @@ Last updated: 2025-12-05
 
 ## Nice-to-have / future
 - Complete Documenter.jl docs and examples.
-- Consider deprecating the `noC` (no box constraints) special-case code if unused.
 - Small performance kernels and profiling on large problems.
 - Gradually migrate kernel functions to use preprocessed CUSPARSE operations.
 

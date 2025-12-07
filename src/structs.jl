@@ -49,11 +49,8 @@ mutable struct QP_info_cpu
         diag_Q::Vector{Float64}
             The diagonal elements of the matrix `Q`.
 
-        Q_is_diag::Bool
-            Indicates whether the matrix `Q` is diagonal.
-
-        noC::Bool
-            Indicates whether there are no l≤x≤u constraints (`C` is empty).
+    Q_is_diag::Bool
+        Indicates whether the matrix `Q` is diagonal.
         
         lambda::Float64
             Regularization parameter for LASSO problems. Ignored for other problems.
@@ -69,7 +66,6 @@ mutable struct QP_info_cpu
     obj_constant::Float64
     diag_Q::Vector{Float64}
     Q_is_diag::Bool
-    noC::Bool
     lambda::Float64  # Regularization parameter for LASSO (0.0 for other problems)
 end
 
@@ -87,7 +83,6 @@ mutable struct QP_info_gpu
     obj_constant::Float64
     diag_Q::CuVector{Float64}
     Q_is_diag::Bool
-    noC::Bool
     lambda::CuVector{Float64}  # Regularization parameter for LASSO problems
 end
 
