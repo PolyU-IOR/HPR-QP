@@ -496,6 +496,9 @@ function allocate_workspace_gpu(qp::QP_info_gpu,
     # Copy lambda for LASSO problems
     ws.lambda = qp.lambda
 
+    # Default to full updates until iteration loop sets adaptive flag
+    ws.to_check = true
+
     # Prepare CUSPARSE SpMV structures for A and AT (if m > 0)
     if m > 0
         ws.spmv_A, ws.spmv_AT = prepare_spmv_A!(qp.A, qp.AT, ws.x_bar, ws.x_hat, ws.dx, ws.Ax,
@@ -617,21 +620,22 @@ function main_update!(ws::HPRQP_workspace_gpu,
 )
     Halpern_fact1 = 1.0 / (restart_info.inner + 2.0)
     Halpern_fact2 = 1.0 - Halpern_fact1
+    compute_full = ws.to_check
 
     # Handle operator-based Q (QAP/LASSO) within main_update
     if spmv_mode_Q == "operator"
         # Use operator-specific updates with configurable A mode
         if isa(qp.Q, LASSO_Q_operator_gpu)
             # LASSO update with soft-thresholding (no A matrix for LASSO)
-            update_zxw_LASSO_gpu!(ws, qp, Halpern_fact1, Halpern_fact2)
+            update_zxw_LASSO_gpu!(ws, qp, Halpern_fact1, Halpern_fact2; compute_full=compute_full)
         elseif isa(qp.Q, QAP_Q_operator_gpu)
             # QAP update using unified kernels (operator mode for Q, configurable mode for A)
             unified_update_zxw1_gpu!(ws, qp, Halpern_fact1, Halpern_fact2;
-                spmv_mode_Q="operator", spmv_mode_A=spmv_mode_A, is_diag_Q=false)
+                spmv_mode_Q="operator", spmv_mode_A=spmv_mode_A, is_diag_Q=false, compute_full=compute_full)
             unified_update_y_gpu!(ws, Halpern_fact1, Halpern_fact2;
-                spmv_mode_Q="operator", spmv_mode_A=spmv_mode_A)
+                spmv_mode_Q="operator", spmv_mode_A=spmv_mode_A, compute_full=compute_full)
             unified_update_w2_gpu!(ws, Halpern_fact1, Halpern_fact2;
-                spmv_mode_Q="operator", spmv_mode_A=spmv_mode_A, is_diag_Q=false)
+                spmv_mode_Q="operator", spmv_mode_A=spmv_mode_A, is_diag_Q=false, compute_full=compute_full)
         else
             error("Unknown Q operator type: $(typeof(qp.Q))")
         end
@@ -642,15 +646,15 @@ function main_update!(ws::HPRQP_workspace_gpu,
     if length(qp.Q.nzVal) > 0
             # Standard case with Q matrix - use unified kernels with separate Q and A modes
             unified_update_zxw1_gpu!(ws, qp, Halpern_fact1, Halpern_fact2;
-                spmv_mode_Q=spmv_mode_Q, spmv_mode_A=spmv_mode_A, is_diag_Q=qp.Q_is_diag)
+                spmv_mode_Q=spmv_mode_Q, spmv_mode_A=spmv_mode_A, is_diag_Q=qp.Q_is_diag, compute_full=compute_full)
             unified_update_y_gpu!(ws, Halpern_fact1, Halpern_fact2;
-                spmv_mode_Q=spmv_mode_Q, spmv_mode_A=spmv_mode_A)
+                spmv_mode_Q=spmv_mode_Q, spmv_mode_A=spmv_mode_A, compute_full=compute_full)
             unified_update_w2_gpu!(ws, Halpern_fact1, Halpern_fact2;
-                spmv_mode_Q=spmv_mode_Q, spmv_mode_A=spmv_mode_A, is_diag_Q=qp.Q_is_diag)
+                spmv_mode_Q=spmv_mode_Q, spmv_mode_A=spmv_mode_A, is_diag_Q=qp.Q_is_diag, compute_full=compute_full)
     else
         # Empty Q case (linear program) - use unified kernels with A mode only
-        unified_update_zx_gpu!(ws, Halpern_fact1, Halpern_fact2; spmv_mode_A=spmv_mode_A)
-        unified_update_y_noQ_gpu!(ws, Halpern_fact1, Halpern_fact2; spmv_mode_A=spmv_mode_A)
+        unified_update_zx_gpu!(ws, Halpern_fact1, Halpern_fact2; spmv_mode_A=spmv_mode_A, compute_full=compute_full)
+        unified_update_y_noQ_gpu!(ws, Halpern_fact1, Halpern_fact2; spmv_mode_A=spmv_mode_A, compute_full=compute_full)
     end
 end
 
@@ -1476,6 +1480,14 @@ function solve(model::QP_info_cpu, params::HPRQP_parameters)
             return handle_termination(status, residuals, ws, scaling_info_gpu,
                 iter, t_start_alg, power_time, setup_time,
                 iter_4, time_4, iter_6, time_6, params.verbose)
+        end
+
+        next_iter = iter + 1
+        ws.to_check = (rem(next_iter, check_iter) == 0) || (restart_info.restart_flag > 0)
+        if params.print_frequency == -1
+            ws.to_check = ws.to_check || (rem(next_iter, print_step(next_iter)) == 0)
+        elseif params.print_frequency > 0
+            ws.to_check = ws.to_check || (rem(next_iter, params.print_frequency) == 0)
         end
 
         # Perform main iteration step

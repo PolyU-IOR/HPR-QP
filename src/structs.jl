@@ -375,6 +375,7 @@ mutable struct HPRQP_workspace_gpu
     fact::CuVector{Float64}
     fact_M::CuVector{Float64}
     lambda::CuVector{Float64}  # Regularization parameter for LASSO
+    to_check::Bool
     # CUSPARSE SpMV structures for preprocessed matrix operations
     spmv_A::Union{CUSPARSE_spmv_A, Nothing}  # For A matrix operations (nothing if m=0)
     spmv_AT::Union{CUSPARSE_spmv_AT, Nothing}  # For AT matrix operations (nothing if m=0)

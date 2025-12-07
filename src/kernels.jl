@@ -23,7 +23,8 @@ const DEFAULT_KERNEL_THREADS = 256
     return threads, blocks
 end
 
-CUDA.@fastmath @inline function update_zxw_LASSO_kernel!(lambda::CuDeviceVector{Float64},
+CUDA.@fastmath @inline function update_zxw_LASSO_kernel!(::Val{ComputeFull},
+    lambda::CuDeviceVector{Float64},
     dw::CuDeviceVector{Float64},
     dx::CuDeviceVector{Float64},
     w_bar::CuDeviceVector{Float64},
@@ -42,7 +43,7 @@ CUDA.@fastmath @inline function update_zxw_LASSO_kernel!(lambda::CuDeviceVector{
     fact2::Float64,
     Halpern_fact1::Float64,
     Halpern_fact2::Float64,
-    n::Int)
+    n::Int) where {ComputeFull}
     i = threadIdx().x + (blockDim().x * (blockIdx().x - 1))
     @inbounds if i <= n
         qw_i = Qw[i]
@@ -61,12 +62,16 @@ CUDA.@fastmath @inline function update_zxw_LASSO_kernel!(lambda::CuDeviceVector{
         shrink = max(abs_z - lambda_sigma, 0.0)
         # Original ternary: (z_raw < -lambda_sigma) ? (z_raw + lambda_sigma) : ((z_raw > lambda_sigma) ? (z_raw - lambda_sigma) : 0.0)
         x_bar_i = copysign(shrink, z_raw)
-        x_bar[i] = x_bar_i
+        if ComputeFull
+            x_bar[i] = x_bar_i
+        end
 
         x_hat_i = 2.0 * x_bar_i - x_i
         x_hat[i] = x_hat_i
-        dx[i] = x_bar_i - x_i
-        z_bar[i] = (x_bar_i - z_raw) / sigma
+        if ComputeFull
+            dx[i] = x_bar_i - x_i
+            z_bar[i] = (x_bar_i - z_raw) / sigma
+        end
 
         x_new = muladd(Halpern_fact2, x_hat_i, Halpern_fact1 * last_x_i)
         x[i] = x_new
@@ -78,19 +83,25 @@ CUDA.@fastmath @inline function update_zxw_LASSO_kernel!(lambda::CuDeviceVector{
         two_w_bar_minus_w = 2.0 * w_bar_i - w_i
         w_new = muladd(Halpern_fact2, two_w_bar_minus_w, Halpern_fact1 * w_i)
         w[i] = w_new
-        dw[i] = w_bar_i - w_new
+        if ComputeFull
+            dw[i] = w_bar_i - w_new
+        end
     end
     return
 end
 
 # Wrapper function for LASSO update
-function update_zxw_LASSO_gpu!(ws::HPRQP_workspace_gpu, qp::QP_info_gpu, Halpern_fact1::Float64, Halpern_fact2::Float64)
+function update_zxw_LASSO_gpu!(ws::HPRQP_workspace_gpu, qp::QP_info_gpu,
+    Halpern_fact1::Float64, Halpern_fact2::Float64; compute_full::Bool=true)
     Qmap!(ws.w, ws.Qw, qp.Q)
     fact2 = 1.0 / (1.0 + ws.sigma * ws.lambda_max_Q)
     fact1 = 1.0 - fact2
     threads, blocks = gpu_launch_config(ws.n)
     threads == 0 && return
-    @cuda threads = threads blocks = blocks update_zxw_LASSO_kernel!(ws.lambda, ws.dw, ws.dx, ws.w_bar, ws.w, ws.z_bar, ws.x_bar, ws.x_hat, ws.last_x, ws.x, ws.Qw, ws.ATy, ws.c, ws.tempv, ws.sigma, fact1, fact2, Halpern_fact1, Halpern_fact2, ws.n)
+    @cuda threads = threads blocks = blocks update_zxw_LASSO_kernel!(Val(compute_full),
+        ws.lambda, ws.dw, ws.dx, ws.w_bar, ws.w, ws.z_bar, ws.x_bar, ws.x_hat,
+        ws.last_x, ws.x, ws.Qw, ws.ATy, ws.c, ws.tempv, ws.sigma, fact1, fact2,
+        Halpern_fact1, Halpern_fact2, ws.n)
 end
 
 ## normal z x w1 y w2 kernels (customized and unified)
@@ -112,7 +123,7 @@ end
 #
 # Note: tempv computation is separated into compute_tempv_unified_kernel! for clarity
 #
-CUDA.@fastmath @inline function unified_update_zxw1_kernel!(::Val{UseCustom}, ::Val{IsDiag},
+CUDA.@fastmath @inline function unified_update_zxw1_kernel!(::Val{UseCustom}, ::Val{IsDiag}, ::Val{ComputeFull},
     dx::CuDeviceVector{Float64},
     rowPtrQ::CuDeviceVector{Int32}, colValQ::CuDeviceVector{Int32}, nzValQ::CuDeviceVector{Float64},
     w_bar::CuDeviceVector{Float64}, w::CuDeviceVector{Float64},
@@ -122,7 +133,7 @@ CUDA.@fastmath @inline function unified_update_zxw1_kernel!(::Val{UseCustom}, ::
     l::CuDeviceVector{Float64}, u::CuDeviceVector{Float64},
     sigma::Float64, fact1_scalar::Float64, fact2_scalar::Float64,
     fact1_vec::CuDeviceVector{Float64}, fact2_vec::CuDeviceVector{Float64},
-    Halpern_fact1::Float64, Halpern_fact2::Float64, n::Int) where {UseCustom, IsDiag}
+    Halpern_fact1::Float64, Halpern_fact2::Float64, n::Int) where {UseCustom, IsDiag, ComputeFull}
     i = threadIdx().x + (blockDim().x * (blockIdx().x - 1))
     @inbounds if i <= n
         qw_val = if UseCustom
@@ -166,11 +177,13 @@ CUDA.@fastmath @inline function unified_update_zxw1_kernel!(::Val{UseCustom}, ::
         two_w_bar_minus_w = 2.0 * w_bar_i - w_i
         w_new = muladd(Halpern_fact2, two_w_bar_minus_w, Halpern_fact1 * w_i)
 
-        dx[i] = dx_val
+        if ComputeFull
+            dx[i] = dx_val
+            x_bar[i] = x_bar_i
+            z_bar[i] = (x_bar_i - z_raw) / sigma
+        end
         x[i] = x_new
-        x_bar[i] = x_bar_i
         x_hat[i] = x_hat_i
-        z_bar[i] = (x_bar_i - z_raw) / sigma
         w_bar[i] = w_bar_i
         w[i] = w_new
     end
@@ -222,7 +235,7 @@ end
 #
 # Key optimization: Fuses A*tempv SpMV with y update to reduce memory traffic
 #
-CUDA.@fastmath @inline function unified_update_y_kernel!(::Val{UseCustom},
+CUDA.@fastmath @inline function unified_update_y_kernel!(::Val{UseCustom}, ::Val{ComputeFull},
     dy::CuDeviceVector{Float64},
     rowPtrA::CuDeviceVector{Int32},
     colValA::CuDeviceVector{Int32},
@@ -239,7 +252,7 @@ CUDA.@fastmath @inline function unified_update_y_kernel!(::Val{UseCustom},
     fact2::Float64,
     Halpern_fact1::Float64,
     Halpern_fact2::Float64,
-    m::Int) where {UseCustom}
+    m::Int) where {UseCustom, ComputeFull}
     i = threadIdx().x + (blockDim().x * (blockIdx().x - 1))
     @inbounds if i <= m
         Ax_val = if UseCustom
@@ -269,9 +282,11 @@ CUDA.@fastmath @inline function unified_update_y_kernel!(::Val{UseCustom},
         dy_i = y_bar_i - y_i
         y_new = Halpern_fact1 * last_y_i + Halpern_fact2 * (2.0 * y_bar_i - y_i)
 
-        s[i] = s_total
+        if ComputeFull
+            s[i] = s_total
+            dy[i] = dy_i
+        end
         y_bar[i] = y_bar_i
-        dy[i] = dy_i
         y[i] = y_new
     end
     return
@@ -290,7 +305,7 @@ end
 #
 # Key optimization: Fuses AT*y_bar SpMV with w2 update to reduce memory traffic
 #
-CUDA.@fastmath @inline function unified_update_w2_kernel!(::Val{UseCustom}, ::Val{IsDiag},
+CUDA.@fastmath @inline function unified_update_w2_kernel!(::Val{UseCustom}, ::Val{IsDiag}, ::Val{ComputeFull},
     dw::CuDeviceVector{Float64},
     ATdy::CuDeviceVector{Float64},
     rowPtrAT::CuDeviceVector{Int32},
@@ -307,7 +322,7 @@ CUDA.@fastmath @inline function unified_update_w2_kernel!(::Val{UseCustom}, ::Va
     fact_vec::CuDeviceVector{Float64},
     Halpern_fact1::Float64,
     Halpern_fact2::Float64,
-    n::Int) where {UseCustom, IsDiag}
+    n::Int) where {UseCustom, IsDiag, ComputeFull}
     i = threadIdx().x + (blockDim().x * (blockIdx().x - 1))
     @inbounds if i <= n
         ATy_bar_val = if UseCustom
@@ -345,16 +360,20 @@ CUDA.@fastmath @inline function unified_update_w2_kernel!(::Val{UseCustom}, ::Va
         w_bar[i] = w_bar_new
         w[i] = w_new
         ATy[i] = ATy_new
-        dw[i] = dw_i
-        ATdy[i] = ATdy_i
+        if ComputeFull
+            dw[i] = dw_i
+            ATdy[i] = ATdy_i
+        end
     end
     return
 end
 
 # Unified wrapper that handles all cases: regular/diagonal Q, custom/cuSPARSE SpMV
 # Unified wrapper for update_zxw1 that handles both custom and cuSPARSE SpMV, and regular/diagonal Q
-function unified_update_zxw1_gpu!(ws::HPRQP_workspace_gpu, qp::QP_info_gpu, Halpern_fact1::Float64, Halpern_fact2::Float64; 
-                                   spmv_mode_Q::String="CUSPARSE", spmv_mode_A::String="CUSPARSE", is_diag_Q::Bool=false)
+function unified_update_zxw1_gpu!(ws::HPRQP_workspace_gpu, qp::QP_info_gpu,
+    Halpern_fact1::Float64, Halpern_fact2::Float64;
+    spmv_mode_Q::String="CUSPARSE", spmv_mode_A::String="CUSPARSE",
+    is_diag_Q::Bool=false, compute_full::Bool=true)
     # Determine whether to use custom inline SpMV for Q operations
     use_custom_spmv_Q = (spmv_mode_Q == "customized")
     
@@ -384,7 +403,7 @@ function unified_update_zxw1_gpu!(ws::HPRQP_workspace_gpu, qp::QP_info_gpu, Halp
     threads, blocks = gpu_launch_config(ws.n)
     if threads > 0
         @cuda threads = threads blocks = blocks unified_update_zxw1_kernel!(
-            Val(use_custom_spmv_Q), Val(is_diag_Q),
+            Val(use_custom_spmv_Q), Val(is_diag_Q), Val(compute_full),
             ws.dx, rowPtrQ, colValQ, nzValQ,
             ws.w_bar, ws.w, ws.z_bar, ws.x_bar, ws.x_hat, ws.last_x, ws.x, ws.Qw, ws.ATy, ws.c,
             ws.l, ws.u, ws.sigma, fact1_scalar, fact2_scalar, fact1_vec, fact2_vec,
@@ -407,8 +426,9 @@ end
 
 # Unified wrapper for update_y that handles both custom and cuSPARSE SpMV
 # Unified wrapper for update_y that handles both custom and cuSPARSE SpMV
-function unified_update_y_gpu!(ws::HPRQP_workspace_gpu, Halpern_fact1::Float64, Halpern_fact2::Float64;
-                                spmv_mode_Q::String="CUSPARSE", spmv_mode_A::String="CUSPARSE")
+function unified_update_y_gpu!(ws::HPRQP_workspace_gpu, Halpern_fact1::Float64,
+    Halpern_fact2::Float64; spmv_mode_Q::String="CUSPARSE",
+    spmv_mode_A::String="CUSPARSE", compute_full::Bool=true)
     # Determine whether to use custom inline SpMV for A operations
     use_custom_spmv_A = (spmv_mode_A == "customized")
     
@@ -424,7 +444,7 @@ function unified_update_y_gpu!(ws::HPRQP_workspace_gpu, Halpern_fact1::Float64, 
         threads_A, blocks_A = gpu_launch_config(ws.m)
         if threads_A > 0
             @cuda threads = threads_A blocks = blocks_A unified_update_y_kernel!(
-                Val(use_custom_spmv_A),
+                Val(use_custom_spmv_A), Val(compute_full),
                 ws.dy, ws.A.rowPtr, ws.A.colVal, ws.A.nzVal,
                 ws.tempv, ws.Ax, ws.y_bar, ws.y, ws.last_y, ws.s, ws.AL, ws.AU,
                 fact1, fact2, Halpern_fact1, Halpern_fact2, ws.m)
@@ -434,8 +454,9 @@ end
 
 # Unified wrapper for update_w2 that handles both custom and cuSPARSE SpMV, and regular/diagonal Q
 # Unified wrapper for update_w2 that handles both custom and cuSPARSE SpMV, and regular/diagonal Q
-function unified_update_w2_gpu!(ws::HPRQP_workspace_gpu, Halpern_fact1::Float64, Halpern_fact2::Float64;
-                                 spmv_mode_Q::String="CUSPARSE", spmv_mode_A::String="CUSPARSE", is_diag_Q::Bool=false)
+function unified_update_w2_gpu!(ws::HPRQP_workspace_gpu, Halpern_fact1::Float64,
+    Halpern_fact2::Float64; spmv_mode_Q::String="CUSPARSE",
+    spmv_mode_A::String="CUSPARSE", is_diag_Q::Bool=false, compute_full::Bool=true)
     # Determine whether to use custom inline SpMV for A operations
     use_custom_spmv_A = (spmv_mode_A == "customized")
     
@@ -453,7 +474,7 @@ function unified_update_w2_gpu!(ws::HPRQP_workspace_gpu, Halpern_fact1::Float64,
     threads, blocks = gpu_launch_config(ws.n)
     if threads > 0
         @cuda threads = threads blocks = blocks unified_update_w2_kernel!(
-            Val(use_custom_spmv_A), Val(is_diag_Q),
+            Val(use_custom_spmv_A), Val(is_diag_Q), Val(compute_full),
             ws.dw, ws.ATdy, ws.AT.rowPtr, ws.AT.colVal, ws.AT.nzVal,
             ws.y_bar, ws.ATy_bar, ws.w, ws.w_bar, ws.last_w, ws.last_ATy, ws.ATy,
             fact_scalar, fact_vec, Halpern_fact1, Halpern_fact2, ws.n)
@@ -463,26 +484,26 @@ end
 ## Unified kernels for empty Q case (Q.nzVal has length 0 - linear program)
 
 # Unified update_zx kernel - handles both custom inline AT*y and cuSPARSE
-CUDA.@fastmath @inline function unified_update_zx_kernel!(::Val{UseCustom},
+CUDA.@fastmath @inline function unified_update_zx_kernel!(::Val{UseCustom}, ::Val{ComputeFull},
     dx::CuDeviceVector{Float64},
-    rowPtrAT::CuDeviceVector{Int32}, 
-    colValAT::CuDeviceVector{Int32}, 
+    rowPtrAT::CuDeviceVector{Int32},
+    colValAT::CuDeviceVector{Int32},
     nzValAT::CuDeviceVector{Float64},
     y::CuDeviceVector{Float64},
     ATy::CuDeviceVector{Float64},
-    z_bar::CuDeviceVector{Float64}, 
-    x_bar::CuDeviceVector{Float64}, 
+    z_bar::CuDeviceVector{Float64},
+    x_bar::CuDeviceVector{Float64},
     x_hat::CuDeviceVector{Float64},
-    x::CuDeviceVector{Float64}, 
+    x::CuDeviceVector{Float64},
     last_x::CuDeviceVector{Float64},
     c::CuDeviceVector{Float64},
-    l::CuDeviceVector{Float64}, 
+    l::CuDeviceVector{Float64},
     u::CuDeviceVector{Float64},
     sigma::Float64,
-    Halpern_fact1::Float64, 
+    Halpern_fact1::Float64,
     Halpern_fact2::Float64,
-    n::Int) where {UseCustom}
-    
+    n::Int) where {UseCustom, ComputeFull}
+
     i = threadIdx().x + (blockDim().x * (blockIdx().x - 1))
     @inbounds if i <= n
         ATy_val = if UseCustom
@@ -505,37 +526,37 @@ CUDA.@fastmath @inline function unified_update_zx_kernel!(::Val{UseCustom},
 
         tmp = ATy_val - c_i
         z_raw = x_i + sigma * tmp
-        # Original ternary clamp: (z_raw < l_i) ? l_i : ((z_raw > u_i) ? u_i : z_raw)
         x_bar_i = min(max(z_raw, l_i), u_i)
         x_hat_i = 2.0 * x_bar_i - x_i
+        dx_val = x_bar_i - x_i
         z_bar_i = (x_bar_i - z_raw) / sigma
-        dx_i = x_bar_i - x_i
         x_new = Halpern_fact1 * last_x_i + Halpern_fact2 * x_hat_i
 
-        dx[i] = dx_i
+        if ComputeFull
+            dx[i] = dx_val
+            x_bar[i] = x_bar_i
+            z_bar[i] = z_bar_i
+        end
         x[i] = x_new
-        x_bar[i] = x_bar_i
         x_hat[i] = x_hat_i
-        z_bar[i] = z_bar_i
     end
     return
 end
 
 # Unified wrapper for update_zx
 function unified_update_zx_gpu!(ws::HPRQP_workspace_gpu, Halpern_fact1::Float64, Halpern_fact2::Float64;
-                                 spmv_mode_A::String="CUSPARSE")
-    # Determine whether to use custom inline SpMV for A operations
+    spmv_mode_A::String="CUSPARSE", compute_full::Bool=true)
     use_custom_spmv_A = (spmv_mode_A == "customized")
-    
+
     # Only compute AT*y via cuSPARSE if not using custom SpMV for A
     if !use_custom_spmv_A
         CUDA.CUSPARSE.mv!('N', 1, ws.AT, ws.y, 0, ws.ATy, 'O', CUDA.CUSPARSE.CUSPARSE_SPMV_CSR_ALG2)
     end
-    
+
     threads, blocks = gpu_launch_config(ws.n)
     if threads > 0
         @cuda threads = threads blocks = blocks unified_update_zx_kernel!(
-            Val(use_custom_spmv_A),
+            Val(use_custom_spmv_A), Val(compute_full),
             ws.dx, ws.AT.rowPtr, ws.AT.colVal, ws.AT.nzVal,
             ws.y, ws.ATy, ws.z_bar, ws.x_bar, ws.x_hat, ws.x, ws.last_x,
             ws.c, ws.l, ws.u, ws.sigma,
@@ -545,7 +566,7 @@ end
 
 # Unified update_y_noQ - uses x_hat directly instead of tempv
 function unified_update_y_noQ_gpu!(ws::HPRQP_workspace_gpu, Halpern_fact1::Float64, Halpern_fact2::Float64;
-                                    spmv_mode_A::String="CUSPARSE")
+    spmv_mode_A::String="CUSPARSE", compute_full::Bool=true)
     # Determine whether to use custom inline SpMV for A operations
     use_custom_spmv_A = (spmv_mode_A == "customized")
     
@@ -562,7 +583,7 @@ function unified_update_y_noQ_gpu!(ws::HPRQP_workspace_gpu, Halpern_fact1::Float
         if threads_A > 0
             # Reuse unified_update_y_kernel but pass x_hat instead of tempv
             @cuda threads = threads_A blocks = blocks_A unified_update_y_kernel!(
-                Val(use_custom_spmv_A),
+                Val(use_custom_spmv_A), Val(compute_full),
                 ws.dy, ws.A.rowPtr, ws.A.colVal, ws.A.nzVal,
                 ws.x_hat, ws.Ax, ws.y_bar, ws.y, ws.last_y, ws.s, ws.AL, ws.AU,
                 fact1, fact2, Halpern_fact1, Halpern_fact2, ws.m)
