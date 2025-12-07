@@ -269,6 +269,7 @@ function update_sigma(params::HPRQP_parameters,
                     sigma_estimation = sqrt(b / a)
                 end
             end
+            
             fact = exp(-0.05 * (restart_info.current_gap / restart_info.best_gap))
             temp_1 = max(min(residuals.err_Rd_org_bar, residuals.err_Rp_org_bar), min(residuals.rel_gap_bar, restart_info.current_gap))
             sigma_cand = exp(fact * log(sigma_estimation) + (1 - fact) * log(restart_info.best_sigma))
@@ -282,6 +283,9 @@ function update_sigma(params::HPRQP_parameters,
                 κ = clamp((ratio_infeas_org), 1e-2, 100.0)
             end
             ws.sigma = κ * sigma_cand
+
+            # fact = exp(-restart_info.current_gap / restart_info.weighted_norm)
+            # ws.sigma = exp(fact * log(sigma_estimation) + (1 - fact) * log(ws.sigma))
 
         # update Q factors if sigma changes
         if Q_is_diag

@@ -163,7 +163,6 @@ CUDA.@fastmath @inline function unified_update_zxw1_kernel!(::Val{UseCustom}, ::
         x_bar_i = min(max(z_raw, l_i), u_i)
 
         x_hat_i = 2.0 * x_bar_i - x_i
-        dx_val = x_bar_i - x_i
         x_new = muladd(Halpern_fact2, x_hat_i, Halpern_fact1 * last_x_i)
 
         w_bar_i = if IsDiag
@@ -174,10 +173,8 @@ CUDA.@fastmath @inline function unified_update_zxw1_kernel!(::Val{UseCustom}, ::
             muladd(fact1_scalar, w_i, fact2_scalar * x_hat_i)
         end
 
-        two_w_bar_minus_w = 2.0 * w_bar_i - w_i
-        w_new = muladd(Halpern_fact2, two_w_bar_minus_w, Halpern_fact1 * w_i)
-
         if ComputeFull
+            dx_val = x_bar_i - x_i
             dx[i] = dx_val
             x_bar[i] = x_bar_i
             z_bar[i] = (x_bar_i - z_raw) / sigma
@@ -185,7 +182,6 @@ CUDA.@fastmath @inline function unified_update_zxw1_kernel!(::Val{UseCustom}, ::
         x[i] = x_new
         x_hat[i] = x_hat_i
         w_bar[i] = w_bar_i
-        w[i] = w_new
     end
     return
 end
@@ -277,13 +273,12 @@ CUDA.@fastmath @inline function unified_update_y_kernel!(::Val{UseCustom}, ::Val
         s_proj = min(max(s_raw, AL_i), AU_i)
         # Original ternary correction: (s_raw < AL_i) ? (AL_i - s_raw) : ((s_raw > AU_i) ? (AU_i - s_raw) : 0.0)
         corr = s_proj - s_raw
-        s_total = s_proj
         y_bar_i = fact2 * corr
-        dy_i = y_bar_i - y_i
         y_new = Halpern_fact1 * last_y_i + Halpern_fact2 * (2.0 * y_bar_i - y_i)
 
         if ComputeFull
-            s[i] = s_total
+            s[i] = s_proj
+            dy_i = y_bar_i - y_i
             dy[i] = dy_i
         end
         y_bar[i] = y_bar_i
@@ -354,15 +349,15 @@ CUDA.@fastmath @inline function unified_update_w2_kernel!(::Val{UseCustom}, ::Va
         w_bar_new = w_bar_i + fact * (ATy_bar_val - ATy_i)
         w_new = Halpern_fact1 * last_w_i + Halpern_fact2 * (2.0 * w_bar_new - w_i)
         ATy_new = Halpern_fact1 * last_ATy_i + Halpern_fact2 * (2.0 * ATy_bar_val - ATy_i)
-        dw_i = w_bar_new - w_new
-        ATdy_i = ATy_bar_val - ATy_i
 
-        w_bar[i] = w_bar_new
         w[i] = w_new
         ATy[i] = ATy_new
         if ComputeFull
+            dw_i = w_bar_new - w_new
+            ATdy_i = ATy_bar_val - ATy_i
             dw[i] = dw_i
             ATdy[i] = ATdy_i
+            w_bar[i] = w_bar_new
         end
     end
     return
@@ -583,7 +578,7 @@ function unified_update_y_noQ_gpu!(ws::HPRQP_workspace_gpu, Halpern_fact1::Float
         if threads_A > 0
             # Reuse unified_update_y_kernel but pass x_hat instead of tempv
             @cuda threads = threads_A blocks = blocks_A unified_update_y_kernel!(
-                Val(use_custom_spmv_A), Val(compute_full),
+                Val(use_custom_spmv_A),
                 ws.dy, ws.A.rowPtr, ws.A.colVal, ws.A.nzVal,
                 ws.x_hat, ws.Ax, ws.y_bar, ws.y, ws.last_y, ws.s, ws.AL, ws.AU,
                 fact1, fact2, Halpern_fact1, Halpern_fact2, ws.m)
