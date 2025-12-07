@@ -286,13 +286,46 @@ println("x2 = ", result.x[2])
     <tr><td><b>Objective Values</b></td><td><code>primal_obj</code></td><td>The primal objective value obtained.</td></tr>
     <tr><td></td><td><code>gap</code></td><td>The gap between the primal and dual objective values.</td></tr>
     <tr><td><b>Residuals</b></td><td><code>residuals</code></td><td>Relative residuals of the primal feasibility, dual feasibility, and duality gap.</td></tr>
-    <tr><td><b>Algorithm Status</b></td><td><code>output_type</code></td><td>The final status of the algorithm:<br/>- <code>OPTIMAL</code>: Found optimal solution<br/>- <code>MAX_ITER</code>: Max iterations reached<br/>- <code>TIME_LIMIT</code>: Time limit reached</td></tr>
+    <tr><td><b>Algorithm Status</b></td><td><code>status</code></td><td>The final status of the algorithm:<br/>- <code>OPTIMAL</code>: Found optimal solution<br/>- <code>MAX_ITER</code>: Max iterations reached<br/>- <code>TIME_LIMIT</code>: Time limit reached</td></tr>
     <tr><td><b>Solution Vectors</b></td><td><code>x</code></td><td>The final solution vector <code>x</code>.</td></tr>
     <tr><td></td><td><code>y</code></td><td>The final solution vector <code>y</code>.</td></tr>
     <tr><td></td><td><code>z</code></td><td>The final solution vector <code>z</code>.</td></tr>
     <tr><td></td><td><code>w</code></td><td>The final solution vector <code>w</code>.</td></tr>
   </tbody>
 </table>
+
+---
+
+## Documentation
+
+Comprehensive documentation is available in the `docs/` directory:
+
+📚 **[View Full Documentation](docs/README.md)**
+
+### Quick Links
+
+- **[Getting Started](docs/src/getting_started.md)** - Installation and first examples
+- **[User Guide](docs/src/guide/input_overview.md)** - Detailed usage guides
+  - [Direct API](docs/src/guide/direct_api.md) - Matrix-based input
+  - [JuMP Integration](docs/src/guide/jump_integration.md) - Modeling interface
+  - [MPS Files](docs/src/guide/mps_files.md) - File-based input
+  - [Q Operators](docs/src/guide/q_operators_overview.md) - QAP, LASSO, and custom operators
+  - [Parameters](docs/src/guide/parameters.md) - Solver configuration
+  - [Output & Results](docs/src/guide/output_results.md) - Interpreting results
+- **[API Reference](docs/src/api.md)** - Complete API documentation
+- **[Examples](docs/src/examples.md)** - Collection of examples
+
+### Building Documentation Locally
+
+To build the HTML documentation:
+
+```bash
+cd docs
+julia --project -e 'using Pkg; Pkg.instantiate()'
+julia --project make.jl
+```
+
+The generated documentation will be in `docs/build/`.
 
 ---
 
