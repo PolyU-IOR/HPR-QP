@@ -23,7 +23,8 @@ const DEFAULT_KERNEL_THREADS = 256
     return threads, blocks
 end
 
-CUDA.@fastmath @inline function update_zxw_LASSO_kernel!(::Val{ComputeFull},
+# Full version: computes all intermediate values
+CUDA.@fastmath @inline function update_zxw_LASSO_kernel_full!(
     lambda::CuDeviceVector{Float64},
     dw::CuDeviceVector{Float64},
     dx::CuDeviceVector{Float64},
@@ -43,7 +44,7 @@ CUDA.@fastmath @inline function update_zxw_LASSO_kernel!(::Val{ComputeFull},
     fact2::Float64,
     Halpern_fact1::Float64,
     Halpern_fact2::Float64,
-    n::Int) where {ComputeFull}
+    n::Int)
     i = threadIdx().x + (blockDim().x * (blockIdx().x - 1))
     @inbounds if i <= n
         qw_i = Qw[i]
@@ -60,18 +61,13 @@ CUDA.@fastmath @inline function update_zxw_LASSO_kernel!(::Val{ComputeFull},
         lambda_sigma = lambda[i] * sigma
         abs_z = abs(z_raw)
         shrink = max(abs_z - lambda_sigma, 0.0)
-        # Original ternary: (z_raw < -lambda_sigma) ? (z_raw + lambda_sigma) : ((z_raw > lambda_sigma) ? (z_raw - lambda_sigma) : 0.0)
         x_bar_i = copysign(shrink, z_raw)
-        if ComputeFull
-            x_bar[i] = x_bar_i
-        end
+        x_bar[i] = x_bar_i
 
         x_hat_i = 2.0 * x_bar_i - x_i
         x_hat[i] = x_hat_i
-        if ComputeFull
-            dx[i] = x_bar_i - x_i
-            z_bar[i] = (x_bar_i - z_raw) / sigma
-        end
+        dx[i] = x_bar_i - x_i
+        z_bar[i] = (x_bar_i - z_raw) / sigma
 
         x_new = muladd(Halpern_fact2, x_hat_i, Halpern_fact1 * last_x_i)
         x[i] = x_new
@@ -83,9 +79,64 @@ CUDA.@fastmath @inline function update_zxw_LASSO_kernel!(::Val{ComputeFull},
         two_w_bar_minus_w = 2.0 * w_bar_i - w_i
         w_new = muladd(Halpern_fact2, two_w_bar_minus_w, Halpern_fact1 * w_i)
         w[i] = w_new
-        if ComputeFull
-            dw[i] = w_bar_i - w_new
-        end
+        dw[i] = w_bar_i - w_i
+    end
+    return
+end
+
+# Partial version: skips some intermediate writes
+CUDA.@fastmath @inline function update_zxw_LASSO_kernel_partial!(
+    lambda::CuDeviceVector{Float64},
+    dw::CuDeviceVector{Float64},
+    dx::CuDeviceVector{Float64},
+    w_bar::CuDeviceVector{Float64},
+    w::CuDeviceVector{Float64},
+    z_bar::CuDeviceVector{Float64},
+    x_bar::CuDeviceVector{Float64},
+    x_hat::CuDeviceVector{Float64},
+    last_x::CuDeviceVector{Float64},
+    x::CuDeviceVector{Float64},
+    Qw::CuDeviceVector{Float64},
+    ATy::CuDeviceVector{Float64},
+    c::CuDeviceVector{Float64},
+    tempv::CuDeviceVector{Float64},
+    sigma::Float64,
+    fact1::Float64,
+    fact2::Float64,
+    Halpern_fact1::Float64,
+    Halpern_fact2::Float64,
+    n::Int)
+    i = threadIdx().x + (blockDim().x * (blockIdx().x - 1))
+    @inbounds if i <= n
+        qw_i = Qw[i]
+        atyi = ATy[i]
+        c_i = c[i]
+        x_i = x[i]
+        last_x_i = last_x[i]
+        w_i = w[i]
+
+        tmp = -(qw_i) + atyi - c_i
+        z_raw = x_i + sigma * tmp
+
+        # Soft-thresholding for L1 regularization
+        lambda_sigma = lambda[i] * sigma
+        abs_z = abs(z_raw)
+        shrink = max(abs_z - lambda_sigma, 0.0)
+        x_bar_i = copysign(shrink, z_raw)
+
+        x_hat_i = 2.0 * x_bar_i - x_i
+        x_hat[i] = x_hat_i
+
+        x_new = muladd(Halpern_fact2, x_hat_i, Halpern_fact1 * last_x_i)
+        x[i] = x_new
+
+        tempv[i] = x_hat_i + sigma * qw_i
+
+        w_bar_i = muladd(fact1, w_i, fact2 * x_hat_i)
+        w_bar[i] = w_bar_i
+        two_w_bar_minus_w = 2.0 * w_bar_i - w_i
+        w_new = muladd(Halpern_fact2, two_w_bar_minus_w, Halpern_fact1 * w_i)
+        w[i] = w_new
     end
     return
 end
@@ -98,10 +149,19 @@ function update_zxw_LASSO_gpu!(ws::HPRQP_workspace_gpu, qp::QP_info_gpu,
     fact1 = 1.0 - fact2
     threads, blocks = gpu_launch_config(ws.n)
     threads == 0 && return
-    @cuda threads = threads blocks = blocks update_zxw_LASSO_kernel!(Val(compute_full),
-        ws.lambda, ws.dw, ws.dx, ws.w_bar, ws.w, ws.z_bar, ws.x_bar, ws.x_hat,
-        ws.last_x, ws.x, ws.Qw, ws.ATy, ws.c, ws.tempv, ws.sigma, fact1, fact2,
-        Halpern_fact1, Halpern_fact2, ws.n)
+    
+    # Choose kernel based on compute_full flag - no recompilation overhead
+    if compute_full
+        @cuda threads = threads blocks = blocks update_zxw_LASSO_kernel_full!(
+            ws.lambda, ws.dw, ws.dx, ws.w_bar, ws.w, ws.z_bar, ws.x_bar, ws.x_hat,
+            ws.last_x, ws.x, ws.Qw, ws.ATy, ws.c, ws.tempv, ws.sigma, fact1, fact2,
+            Halpern_fact1, Halpern_fact2, ws.n)
+    else
+        @cuda threads = threads blocks = blocks update_zxw_LASSO_kernel_partial!(
+            ws.lambda, ws.dw, ws.dx, ws.w_bar, ws.w, ws.z_bar, ws.x_bar, ws.x_hat,
+            ws.last_x, ws.x, ws.Qw, ws.ATy, ws.c, ws.tempv, ws.sigma, fact1, fact2,
+            Halpern_fact1, Halpern_fact2, ws.n)
+    end
 end
 
 ## normal z x w1 y w2 kernels (customized and unified)
@@ -123,7 +183,8 @@ end
 #
 # Note: tempv computation is separated into compute_tempv_unified_kernel! for clarity
 #
-CUDA.@fastmath @inline function unified_update_zxw1_kernel!(::Val{UseCustom}, ::Val{IsDiag}, ::Val{ComputeFull},
+# Full version: computes all intermediate values
+CUDA.@fastmath @inline function unified_update_zxw1_kernel_full!(::Val{UseCustom}, ::Val{IsDiag},
     dx::CuDeviceVector{Float64},
     rowPtrQ::CuDeviceVector{Int32}, colValQ::CuDeviceVector{Int32}, nzValQ::CuDeviceVector{Float64},
     w_bar::CuDeviceVector{Float64}, w::CuDeviceVector{Float64},
@@ -133,7 +194,7 @@ CUDA.@fastmath @inline function unified_update_zxw1_kernel!(::Val{UseCustom}, ::
     l::CuDeviceVector{Float64}, u::CuDeviceVector{Float64},
     sigma::Float64, fact1_scalar::Float64, fact2_scalar::Float64,
     fact1_vec::CuDeviceVector{Float64}, fact2_vec::CuDeviceVector{Float64},
-    Halpern_fact1::Float64, Halpern_fact2::Float64, n::Int) where {UseCustom, IsDiag, ComputeFull}
+    Halpern_fact1::Float64, Halpern_fact2::Float64, n::Int) where {UseCustom, IsDiag}
     i = threadIdx().x + (blockDim().x * (blockIdx().x - 1))
     @inbounds if i <= n
         qw_val = if UseCustom
@@ -159,7 +220,6 @@ CUDA.@fastmath @inline function unified_update_zxw1_kernel!(::Val{UseCustom}, ::
 
         tmp = -qw_val + atyi - c_i
         z_raw = x_i + sigma * tmp
-        # Original ternary clamp: (z_raw < l_i) ? l_i : ((z_raw > u_i) ? u_i : z_raw)
         x_bar_i = min(max(z_raw, l_i), u_i)
 
         x_hat_i = 2.0 * x_bar_i - x_i
@@ -173,12 +233,67 @@ CUDA.@fastmath @inline function unified_update_zxw1_kernel!(::Val{UseCustom}, ::
             muladd(fact1_scalar, w_i, fact2_scalar * x_hat_i)
         end
 
-        if ComputeFull
-            dx_val = x_bar_i - x_i
-            dx[i] = dx_val
-            x_bar[i] = x_bar_i
-            z_bar[i] = (x_bar_i - z_raw) / sigma
+        dx_val = x_bar_i - x_i
+        dx[i] = dx_val
+        x_bar[i] = x_bar_i
+        z_bar[i] = (x_bar_i - z_raw) / sigma
+        x[i] = x_new
+        x_hat[i] = x_hat_i
+        w_bar[i] = w_bar_i
+    end
+    return
+end
+
+# Partial version: skips intermediate writes
+CUDA.@fastmath @inline function unified_update_zxw1_kernel_partial!(::Val{UseCustom}, ::Val{IsDiag},
+    dx::CuDeviceVector{Float64},
+    rowPtrQ::CuDeviceVector{Int32}, colValQ::CuDeviceVector{Int32}, nzValQ::CuDeviceVector{Float64},
+    w_bar::CuDeviceVector{Float64}, w::CuDeviceVector{Float64},
+    z_bar::CuDeviceVector{Float64}, x_bar::CuDeviceVector{Float64}, x_hat::CuDeviceVector{Float64},
+    last_x::CuDeviceVector{Float64}, x::CuDeviceVector{Float64},
+    Qw::CuDeviceVector{Float64}, ATy::CuDeviceVector{Float64}, c::CuDeviceVector{Float64},
+    l::CuDeviceVector{Float64}, u::CuDeviceVector{Float64},
+    sigma::Float64, fact1_scalar::Float64, fact2_scalar::Float64,
+    fact1_vec::CuDeviceVector{Float64}, fact2_vec::CuDeviceVector{Float64},
+    Halpern_fact1::Float64, Halpern_fact2::Float64, n::Int) where {UseCustom, IsDiag}
+    i = threadIdx().x + (blockDim().x * (blockIdx().x - 1))
+    @inbounds if i <= n
+        qw_val = if UseCustom
+            startQ = rowPtrQ[i]
+            stopQ = rowPtrQ[i + 1] - 1
+            acc = 0.0
+            @inbounds for k in startQ:stopQ
+                acc += nzValQ[k] * w[colValQ[k]]
+            end
+            Qw[i] = acc
+            acc
+        else
+            Qw[i]
         end
+
+        atyi = ATy[i]
+        c_i = c[i]
+        x_i = x[i]
+        last_x_i = last_x[i]
+        l_i = l[i]
+        u_i = u[i]
+        w_i = w[i]
+
+        tmp = -qw_val + atyi - c_i
+        z_raw = x_i + sigma * tmp
+        x_bar_i = min(max(z_raw, l_i), u_i)
+
+        x_hat_i = 2.0 * x_bar_i - x_i
+        x_new = muladd(Halpern_fact2, x_hat_i, Halpern_fact1 * last_x_i)
+
+        w_bar_i = if IsDiag
+            fact1_i = fact1_vec[i]
+            fact2_i = fact2_vec[i]
+            muladd(fact1_i, w_i, fact2_i * x_hat_i)
+        else
+            muladd(fact1_scalar, w_i, fact2_scalar * x_hat_i)
+        end
+
         x[i] = x_new
         x_hat[i] = x_hat_i
         w_bar[i] = w_bar_i
@@ -231,7 +346,8 @@ end
 #
 # Key optimization: Fuses A*tempv SpMV with y update to reduce memory traffic
 #
-CUDA.@fastmath @inline function unified_update_y_kernel!(::Val{UseCustom}, ::Val{ComputeFull},
+# Full version: computes all intermediate values
+CUDA.@fastmath @inline function unified_update_y_kernel_full!(::Val{UseCustom},
     dy::CuDeviceVector{Float64},
     rowPtrA::CuDeviceVector{Int32},
     colValA::CuDeviceVector{Int32},
@@ -248,7 +364,7 @@ CUDA.@fastmath @inline function unified_update_y_kernel!(::Val{UseCustom}, ::Val
     fact2::Float64,
     Halpern_fact1::Float64,
     Halpern_fact2::Float64,
-    m::Int) where {UseCustom, ComputeFull}
+    m::Int) where {UseCustom}
     i = threadIdx().x + (blockDim().x * (blockIdx().x - 1))
     @inbounds if i <= m
         Ax_val = if UseCustom
@@ -276,11 +392,59 @@ CUDA.@fastmath @inline function unified_update_y_kernel!(::Val{UseCustom}, ::Val
         y_bar_i = fact2 * corr
         y_new = Halpern_fact1 * last_y_i + Halpern_fact2 * (2.0 * y_bar_i - y_i)
 
-        if ComputeFull
-            s[i] = s_proj
-            dy_i = y_bar_i - y_i
-            dy[i] = dy_i
+        s[i] = s_proj
+        dy_i = y_bar_i - y_i
+        dy[i] = dy_i
+        y_bar[i] = y_bar_i
+        y[i] = y_new
+    end
+    return
+end
+
+# Partial version: skips intermediate writes
+CUDA.@fastmath @inline function unified_update_y_kernel_partial!(::Val{UseCustom},
+    dy::CuDeviceVector{Float64},
+    rowPtrA::CuDeviceVector{Int32},
+    colValA::CuDeviceVector{Int32},
+    nzValA::CuDeviceVector{Float64},
+    tempv::CuDeviceVector{Float64},
+    Ax::CuDeviceVector{Float64},
+    y_bar::CuDeviceVector{Float64},
+    y::CuDeviceVector{Float64},
+    last_y::CuDeviceVector{Float64},
+    s::CuDeviceVector{Float64},
+    AL::CuDeviceVector{Float64},
+    AU::CuDeviceVector{Float64},
+    fact1::Float64,
+    fact2::Float64,
+    Halpern_fact1::Float64,
+    Halpern_fact2::Float64,
+    m::Int) where {UseCustom}
+    i = threadIdx().x + (blockDim().x * (blockIdx().x - 1))
+    @inbounds if i <= m
+        Ax_val = if UseCustom
+            startA = rowPtrA[i]
+            stopA = rowPtrA[i + 1] - 1
+            acc = 0.0
+            @inbounds for k in startA:stopA
+                acc += nzValA[k] * tempv[colValA[k]]
+            end
+            acc
+        else
+            Ax[i]
         end
+
+        y_i = y[i]
+        last_y_i = last_y[i]
+        AL_i = AL[i]
+        AU_i = AU[i]
+
+        s_raw = Ax_val - fact1 * y_i
+        s_proj = min(max(s_raw, AL_i), AU_i)
+        corr = s_proj - s_raw
+        y_bar_i = fact2 * corr
+        y_new = Halpern_fact1 * last_y_i + Halpern_fact2 * (2.0 * y_bar_i - y_i)
+
         y_bar[i] = y_bar_i
         y[i] = y_new
     end
@@ -300,7 +464,8 @@ end
 #
 # Key optimization: Fuses AT*y_bar SpMV with w2 update to reduce memory traffic
 #
-CUDA.@fastmath @inline function unified_update_w2_kernel!(::Val{UseCustom}, ::Val{IsDiag}, ::Val{ComputeFull},
+# Full version: computes all intermediate values
+CUDA.@fastmath @inline function unified_update_w2_kernel_full!(::Val{UseCustom}, ::Val{IsDiag},
     dw::CuDeviceVector{Float64},
     ATdy::CuDeviceVector{Float64},
     rowPtrAT::CuDeviceVector{Int32},
@@ -317,7 +482,7 @@ CUDA.@fastmath @inline function unified_update_w2_kernel!(::Val{UseCustom}, ::Va
     fact_vec::CuDeviceVector{Float64},
     Halpern_fact1::Float64,
     Halpern_fact2::Float64,
-    n::Int) where {UseCustom, IsDiag, ComputeFull}
+    n::Int) where {UseCustom, IsDiag}
     i = threadIdx().x + (blockDim().x * (blockIdx().x - 1))
     @inbounds if i <= n
         ATy_bar_val = if UseCustom
@@ -333,7 +498,6 @@ CUDA.@fastmath @inline function unified_update_w2_kernel!(::Val{UseCustom}, ::Va
             ATy_bar[i]
         end
 
-        # Original ternary: fact = IsDiag ? fact_vec[i] : fact_scalar
         fact = if IsDiag
             fact_vec[i]
         else
@@ -352,13 +516,66 @@ CUDA.@fastmath @inline function unified_update_w2_kernel!(::Val{UseCustom}, ::Va
 
         w[i] = w_new
         ATy[i] = ATy_new
-        if ComputeFull
-            dw_i = w_bar_new - w_new
-            ATdy_i = ATy_bar_val - ATy_i
-            dw[i] = dw_i
-            ATdy[i] = ATdy_i
-            w_bar[i] = w_bar_new
+        w_bar[i] = w_bar_new
+        dw_i = w_bar_new - w_i
+        ATdy_i = ATy_bar_val - ATy_i
+        dw[i] = dw_i
+        ATdy[i] = ATdy_i
+    end
+    return
+end
+
+# Partial version: skips intermediate writes
+CUDA.@fastmath @inline function unified_update_w2_kernel_partial!(::Val{UseCustom}, ::Val{IsDiag},
+    dw::CuDeviceVector{Float64},
+    ATdy::CuDeviceVector{Float64},
+    rowPtrAT::CuDeviceVector{Int32},
+    colValAT::CuDeviceVector{Int32},
+    nzValAT::CuDeviceVector{Float64},
+    y_bar::CuDeviceVector{Float64},
+    ATy_bar::CuDeviceVector{Float64},
+    w::CuDeviceVector{Float64},
+    w_bar::CuDeviceVector{Float64},
+    last_w::CuDeviceVector{Float64},
+    last_ATy::CuDeviceVector{Float64},
+    ATy::CuDeviceVector{Float64},
+    fact_scalar::Float64,
+    fact_vec::CuDeviceVector{Float64},
+    Halpern_fact1::Float64,
+    Halpern_fact2::Float64,
+    n::Int) where {UseCustom, IsDiag}
+    i = threadIdx().x + (blockDim().x * (blockIdx().x - 1))
+    @inbounds if i <= n
+        ATy_bar_val = if UseCustom
+            startAT = rowPtrAT[i]
+            stopAT = rowPtrAT[i + 1] - 1
+            acc = 0.0
+            @inbounds for k in startAT:stopAT
+                acc += nzValAT[k] * y_bar[colValAT[k]]
+            end
+            acc
+        else
+            ATy_bar[i]
         end
+
+        fact = if IsDiag
+            fact_vec[i]
+        else
+            fact_scalar
+        end
+
+        w_i = w[i]
+        w_bar_i = w_bar[i]
+        ATy_i = ATy[i]
+        last_w_i = last_w[i]
+        last_ATy_i = last_ATy[i]
+
+        w_bar_new = w_bar_i + fact * (ATy_bar_val - ATy_i)
+        w_new = Halpern_fact1 * last_w_i + Halpern_fact2 * (2.0 * w_bar_new - w_i)
+        ATy_new = Halpern_fact1 * last_ATy_i + Halpern_fact2 * (2.0 * ATy_bar_val - ATy_i)
+
+        w[i] = w_new
+        ATy[i] = ATy_new
     end
     return
 end
@@ -397,12 +614,22 @@ function unified_update_zxw1_gpu!(ws::HPRQP_workspace_gpu, qp::QP_info_gpu,
     # Step 1: Update z, x, w1
     threads, blocks = gpu_launch_config(ws.n)
     if threads > 0
-        @cuda threads = threads blocks = blocks unified_update_zxw1_kernel!(
-            Val(use_custom_spmv_Q), Val(is_diag_Q), Val(compute_full),
-            ws.dx, rowPtrQ, colValQ, nzValQ,
-            ws.w_bar, ws.w, ws.z_bar, ws.x_bar, ws.x_hat, ws.last_x, ws.x, ws.Qw, ws.ATy, ws.c,
-            ws.l, ws.u, ws.sigma, fact1_scalar, fact2_scalar, fact1_vec, fact2_vec,
-            Halpern_fact1, Halpern_fact2, ws.n)
+        # Choose kernel based on compute_full flag - no recompilation overhead
+        if compute_full
+            @cuda threads = threads blocks = blocks unified_update_zxw1_kernel_full!(
+                Val(use_custom_spmv_Q), Val(is_diag_Q),
+                ws.dx, rowPtrQ, colValQ, nzValQ,
+                ws.w_bar, ws.w, ws.z_bar, ws.x_bar, ws.x_hat, ws.last_x, ws.x, ws.Qw, ws.ATy, ws.c,
+                ws.l, ws.u, ws.sigma, fact1_scalar, fact2_scalar, fact1_vec, fact2_vec,
+                Halpern_fact1, Halpern_fact2, ws.n)
+        else
+            @cuda threads = threads blocks = blocks unified_update_zxw1_kernel_partial!(
+                Val(use_custom_spmv_Q), Val(is_diag_Q),
+                ws.dx, rowPtrQ, colValQ, nzValQ,
+                ws.w_bar, ws.w, ws.z_bar, ws.x_bar, ws.x_hat, ws.last_x, ws.x, ws.Qw, ws.ATy, ws.c,
+                ws.l, ws.u, ws.sigma, fact1_scalar, fact2_scalar, fact1_vec, fact2_vec,
+                Halpern_fact1, Halpern_fact2, ws.n)
+        end
     end
     
     # Step 2: Compute tempv for subsequent use in update_y
@@ -438,11 +665,20 @@ function unified_update_y_gpu!(ws::HPRQP_workspace_gpu, Halpern_fact1::Float64,
     if ws.m > 0
         threads_A, blocks_A = gpu_launch_config(ws.m)
         if threads_A > 0
-            @cuda threads = threads_A blocks = blocks_A unified_update_y_kernel!(
-                Val(use_custom_spmv_A), Val(compute_full),
-                ws.dy, ws.A.rowPtr, ws.A.colVal, ws.A.nzVal,
-                ws.tempv, ws.Ax, ws.y_bar, ws.y, ws.last_y, ws.s, ws.AL, ws.AU,
-                fact1, fact2, Halpern_fact1, Halpern_fact2, ws.m)
+            # Choose kernel based on compute_full flag - no recompilation overhead
+            if compute_full
+                @cuda threads = threads_A blocks = blocks_A unified_update_y_kernel_full!(
+                    Val(use_custom_spmv_A),
+                    ws.dy, ws.A.rowPtr, ws.A.colVal, ws.A.nzVal,
+                    ws.tempv, ws.Ax, ws.y_bar, ws.y, ws.last_y, ws.s, ws.AL, ws.AU,
+                    fact1, fact2, Halpern_fact1, Halpern_fact2, ws.m)
+            else
+                @cuda threads = threads_A blocks = blocks_A unified_update_y_kernel_partial!(
+                    Val(use_custom_spmv_A),
+                    ws.dy, ws.A.rowPtr, ws.A.colVal, ws.A.nzVal,
+                    ws.tempv, ws.Ax, ws.y_bar, ws.y, ws.last_y, ws.s, ws.AL, ws.AU,
+                    fact1, fact2, Halpern_fact1, Halpern_fact2, ws.m)
+            end
         end
     end
 end
@@ -468,18 +704,28 @@ function unified_update_w2_gpu!(ws::HPRQP_workspace_gpu, Halpern_fact1::Float64,
     
     threads, blocks = gpu_launch_config(ws.n)
     if threads > 0
-        @cuda threads = threads blocks = blocks unified_update_w2_kernel!(
-            Val(use_custom_spmv_A), Val(is_diag_Q), Val(compute_full),
-            ws.dw, ws.ATdy, ws.AT.rowPtr, ws.AT.colVal, ws.AT.nzVal,
-            ws.y_bar, ws.ATy_bar, ws.w, ws.w_bar, ws.last_w, ws.last_ATy, ws.ATy,
-            fact_scalar, fact_vec, Halpern_fact1, Halpern_fact2, ws.n)
+        # Choose kernel based on compute_full flag - no recompilation overhead
+        if compute_full
+            @cuda threads = threads blocks = blocks unified_update_w2_kernel_full!(
+                Val(use_custom_spmv_A), Val(is_diag_Q),
+                ws.dw, ws.ATdy, ws.AT.rowPtr, ws.AT.colVal, ws.AT.nzVal,
+                ws.y_bar, ws.ATy_bar, ws.w, ws.w_bar, ws.last_w, ws.last_ATy, ws.ATy,
+                fact_scalar, fact_vec, Halpern_fact1, Halpern_fact2, ws.n)
+        else
+            @cuda threads = threads blocks = blocks unified_update_w2_kernel_partial!(
+                Val(use_custom_spmv_A), Val(is_diag_Q),
+                ws.dw, ws.ATdy, ws.AT.rowPtr, ws.AT.colVal, ws.AT.nzVal,
+                ws.y_bar, ws.ATy_bar, ws.w, ws.w_bar, ws.last_w, ws.last_ATy, ws.ATy,
+                fact_scalar, fact_vec, Halpern_fact1, Halpern_fact2, ws.n)
+        end
     end
 end
 
 ## Unified kernels for empty Q case (Q.nzVal has length 0 - linear program)
 
 # Unified update_zx kernel - handles both custom inline AT*y and cuSPARSE
-CUDA.@fastmath @inline function unified_update_zx_kernel!(::Val{UseCustom}, ::Val{ComputeFull},
+# Full version: computes all intermediate values
+CUDA.@fastmath @inline function unified_update_zx_kernel_full!(::Val{UseCustom},
     dx::CuDeviceVector{Float64},
     rowPtrAT::CuDeviceVector{Int32},
     colValAT::CuDeviceVector{Int32},
@@ -497,7 +743,7 @@ CUDA.@fastmath @inline function unified_update_zx_kernel!(::Val{UseCustom}, ::Va
     sigma::Float64,
     Halpern_fact1::Float64,
     Halpern_fact2::Float64,
-    n::Int) where {UseCustom, ComputeFull}
+    n::Int) where {UseCustom}
 
     i = threadIdx().x + (blockDim().x * (blockIdx().x - 1))
     @inbounds if i <= n
@@ -527,11 +773,62 @@ CUDA.@fastmath @inline function unified_update_zx_kernel!(::Val{UseCustom}, ::Va
         z_bar_i = (x_bar_i - z_raw) / sigma
         x_new = Halpern_fact1 * last_x_i + Halpern_fact2 * x_hat_i
 
-        if ComputeFull
-            dx[i] = dx_val
-            x_bar[i] = x_bar_i
-            z_bar[i] = z_bar_i
+        dx[i] = dx_val
+        x_bar[i] = x_bar_i
+        z_bar[i] = z_bar_i
+        x[i] = x_new
+        x_hat[i] = x_hat_i
+    end
+    return
+end
+
+# Partial version: skips intermediate writes
+CUDA.@fastmath @inline function unified_update_zx_kernel_partial!(::Val{UseCustom},
+    dx::CuDeviceVector{Float64},
+    rowPtrAT::CuDeviceVector{Int32},
+    colValAT::CuDeviceVector{Int32},
+    nzValAT::CuDeviceVector{Float64},
+    y::CuDeviceVector{Float64},
+    ATy::CuDeviceVector{Float64},
+    z_bar::CuDeviceVector{Float64},
+    x_bar::CuDeviceVector{Float64},
+    x_hat::CuDeviceVector{Float64},
+    x::CuDeviceVector{Float64},
+    last_x::CuDeviceVector{Float64},
+    c::CuDeviceVector{Float64},
+    l::CuDeviceVector{Float64},
+    u::CuDeviceVector{Float64},
+    sigma::Float64,
+    Halpern_fact1::Float64,
+    Halpern_fact2::Float64,
+    n::Int) where {UseCustom}
+
+    i = threadIdx().x + (blockDim().x * (blockIdx().x - 1))
+    @inbounds if i <= n
+        ATy_val = if UseCustom
+            startAT = rowPtrAT[i]
+            stopAT = rowPtrAT[i + 1] - 1
+            acc = 0.0
+            @inbounds for k in startAT:stopAT
+                acc += nzValAT[k] * y[colValAT[k]]
+            end
+            acc
+        else
+            ATy[i]
         end
+
+        x_i = x[i]
+        last_x_i = last_x[i]
+        l_i = l[i]
+        u_i = u[i]
+        c_i = c[i]
+
+        tmp = ATy_val - c_i
+        z_raw = x_i + sigma * tmp
+        x_bar_i = min(max(z_raw, l_i), u_i)
+        x_hat_i = 2.0 * x_bar_i - x_i
+        x_new = Halpern_fact1 * last_x_i + Halpern_fact2 * x_hat_i
+
         x[i] = x_new
         x_hat[i] = x_hat_i
     end
@@ -550,12 +847,22 @@ function unified_update_zx_gpu!(ws::HPRQP_workspace_gpu, Halpern_fact1::Float64,
 
     threads, blocks = gpu_launch_config(ws.n)
     if threads > 0
-        @cuda threads = threads blocks = blocks unified_update_zx_kernel!(
-            Val(use_custom_spmv_A), Val(compute_full),
-            ws.dx, ws.AT.rowPtr, ws.AT.colVal, ws.AT.nzVal,
-            ws.y, ws.ATy, ws.z_bar, ws.x_bar, ws.x_hat, ws.x, ws.last_x,
-            ws.c, ws.l, ws.u, ws.sigma,
-            Halpern_fact1, Halpern_fact2, ws.n)
+        # Choose kernel based on compute_full flag - no recompilation overhead
+        if compute_full
+            @cuda threads = threads blocks = blocks unified_update_zx_kernel_full!(
+                Val(use_custom_spmv_A),
+                ws.dx, ws.AT.rowPtr, ws.AT.colVal, ws.AT.nzVal,
+                ws.y, ws.ATy, ws.z_bar, ws.x_bar, ws.x_hat, ws.x, ws.last_x,
+                ws.c, ws.l, ws.u, ws.sigma,
+                Halpern_fact1, Halpern_fact2, ws.n)
+        else
+            @cuda threads = threads blocks = blocks unified_update_zx_kernel_partial!(
+                Val(use_custom_spmv_A),
+                ws.dx, ws.AT.rowPtr, ws.AT.colVal, ws.AT.nzVal,
+                ws.y, ws.ATy, ws.z_bar, ws.x_bar, ws.x_hat, ws.x, ws.last_x,
+                ws.c, ws.l, ws.u, ws.sigma,
+                Halpern_fact1, Halpern_fact2, ws.n)
+        end
     end
 end
 
@@ -577,11 +884,20 @@ function unified_update_y_noQ_gpu!(ws::HPRQP_workspace_gpu, Halpern_fact1::Float
         threads_A, blocks_A = gpu_launch_config(ws.m)
         if threads_A > 0
             # Reuse unified_update_y_kernel but pass x_hat instead of tempv
-            @cuda threads = threads_A blocks = blocks_A unified_update_y_kernel!(
-                Val(use_custom_spmv_A),
-                ws.dy, ws.A.rowPtr, ws.A.colVal, ws.A.nzVal,
-                ws.x_hat, ws.Ax, ws.y_bar, ws.y, ws.last_y, ws.s, ws.AL, ws.AU,
-                fact1, fact2, Halpern_fact1, Halpern_fact2, ws.m)
+            # Choose kernel based on compute_full flag - no recompilation overhead
+            if compute_full
+                @cuda threads = threads_A blocks = blocks_A unified_update_y_kernel_full!(
+                    Val(use_custom_spmv_A),
+                    ws.dy, ws.A.rowPtr, ws.A.colVal, ws.A.nzVal,
+                    ws.x_hat, ws.Ax, ws.y_bar, ws.y, ws.last_y, ws.s, ws.AL, ws.AU,
+                    fact1, fact2, Halpern_fact1, Halpern_fact2, ws.m)
+            else
+                @cuda threads = threads_A blocks = blocks_A unified_update_y_kernel_partial!(
+                    Val(use_custom_spmv_A),
+                    ws.dy, ws.A.rowPtr, ws.A.colVal, ws.A.nzVal,
+                    ws.x_hat, ws.Ax, ws.y_bar, ws.y, ws.last_y, ws.s, ws.AL, ws.AU,
+                    fact1, fact2, Halpern_fact1, Halpern_fact2, ws.m)
+            end
         end
     end
 end

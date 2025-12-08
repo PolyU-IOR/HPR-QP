@@ -265,27 +265,27 @@ function update_sigma(params::HPRQP_parameters,
             if ws.m > 0
                 sigma_estimation = golden(a, b, c, d; lo=1e-12, hi=1e12, tol=1e-13)
             else
-                    # No constraints: simplified sigma update
-                    sigma_estimation = sqrt(b / a)
-                end
+                # No constraints: simplified sigma update
+                sigma_estimation = sqrt(b / a)
             end
-            
-            fact = exp(-0.05 * (restart_info.current_gap / restart_info.best_gap))
-            temp_1 = max(min(residuals.err_Rd_org_bar, residuals.err_Rp_org_bar), min(residuals.rel_gap_bar, restart_info.current_gap))
-            sigma_cand = exp(fact * log(sigma_estimation) + (1 - fact) * log(restart_info.best_sigma))
-            if temp_1 > 9e-10
-                κ = 1.0
-            elseif temp_1 > 5e-10
-                ratio_infeas_org = residuals.err_Rd_org_bar / residuals.err_Rp_org_bar
-                κ = clamp(sqrt(ratio_infeas_org), 1e-2, 100.0)
-            else
-                ratio_infeas_org = residuals.err_Rd_org_bar / residuals.err_Rp_org_bar
-                κ = clamp((ratio_infeas_org), 1e-2, 100.0)
-            end
-            ws.sigma = κ * sigma_cand
+        end
 
-            # fact = exp(-restart_info.current_gap / restart_info.weighted_norm)
-            # ws.sigma = exp(fact * log(sigma_estimation) + (1 - fact) * log(ws.sigma))
+        fact = exp(-0.05 * (restart_info.current_gap / restart_info.best_gap))
+        temp_1 = max(min(residuals.err_Rd_org_bar, residuals.err_Rp_org_bar), min(residuals.rel_gap_bar, restart_info.current_gap))
+        sigma_cand = exp(fact * log(sigma_estimation) + (1 - fact) * log(restart_info.best_sigma))
+        if temp_1 > 9e-10
+            κ = 1.0
+        elseif temp_1 > 5e-10
+            ratio_infeas_org = residuals.err_Rd_org_bar / residuals.err_Rp_org_bar
+            κ = clamp(sqrt(ratio_infeas_org), 1e-2, 100.0)
+        else
+            ratio_infeas_org = residuals.err_Rd_org_bar / residuals.err_Rp_org_bar
+            κ = clamp((ratio_infeas_org), 1e-2, 100.0)
+        end
+        ws.sigma = κ * sigma_cand
+
+        # fact = exp(-restart_info.current_gap / restart_info.weighted_norm)
+        # ws.sigma = exp(fact * log(sigma_estimation) + (1 - fact) * log(ws.sigma))
 
         # update Q factors if sigma changes
         if Q_is_diag
@@ -327,16 +327,16 @@ function check_restart(restart_info::HPRQP_restart,
                 restart_info.restart_flag = 1
             end
 
-            if (restart_info.current_gap <= 0.6 * restart_info.last_gap) && (restart_info.current_gap > 1.00 * restart_info.save_gap)
+            if (restart_info.current_gap <= 0.8 * restart_info.last_gap) && (restart_info.current_gap > 1.00 * restart_info.save_gap)
                 restart_info.necessary += 1
                 restart_info.restart_flag = 2
             end
 
-            # if restart_info.current_gap / restart_info.weighted_norm > 1e-1
-            #     fact = 0.5
-            # else
-            fact = 0.2
-            # end
+            if restart_info.current_gap / restart_info.weighted_norm > 1e-1
+                fact = 0.5
+            else
+                fact = 0.2
+            end
 
             if restart_info.inner >= fact * iter
                 restart_info.long += 1
@@ -648,13 +648,13 @@ function main_update!(ws::HPRQP_workspace_gpu,
 
     # Standard sparse matrix Q case
     if length(qp.Q.nzVal) > 0
-            # Standard case with Q matrix - use unified kernels with separate Q and A modes
-            unified_update_zxw1_gpu!(ws, qp, Halpern_fact1, Halpern_fact2;
-                spmv_mode_Q=spmv_mode_Q, spmv_mode_A=spmv_mode_A, is_diag_Q=qp.Q_is_diag, compute_full=compute_full)
-            unified_update_y_gpu!(ws, Halpern_fact1, Halpern_fact2;
-                spmv_mode_Q=spmv_mode_Q, spmv_mode_A=spmv_mode_A, compute_full=compute_full)
-            unified_update_w2_gpu!(ws, Halpern_fact1, Halpern_fact2;
-                spmv_mode_Q=spmv_mode_Q, spmv_mode_A=spmv_mode_A, is_diag_Q=qp.Q_is_diag, compute_full=compute_full)
+        # Standard case with Q matrix - use unified kernels with separate Q and A modes
+        unified_update_zxw1_gpu!(ws, qp, Halpern_fact1, Halpern_fact2;
+            spmv_mode_Q=spmv_mode_Q, spmv_mode_A=spmv_mode_A, is_diag_Q=qp.Q_is_diag, compute_full=compute_full)
+        unified_update_y_gpu!(ws, Halpern_fact1, Halpern_fact2;
+            spmv_mode_Q=spmv_mode_Q, spmv_mode_A=spmv_mode_A, compute_full=compute_full)
+        unified_update_w2_gpu!(ws, Halpern_fact1, Halpern_fact2;
+            spmv_mode_Q=spmv_mode_Q, spmv_mode_A=spmv_mode_A, is_diag_Q=qp.Q_is_diag, compute_full=compute_full)
     else
         # Empty Q case (linear program) - use unified kernels with A mode only
         unified_update_zx_gpu!(ws, Halpern_fact1, Halpern_fact2; spmv_mode_A=spmv_mode_A, compute_full=compute_full)
