@@ -19,7 +19,7 @@
 #
 
 # This function computes the residuals for the HPR-QP algorithm on GPU.
-function compute_residuals_gpu(ws::HPRQP_workspace_gpu,
+function compute_residuals_gpu!(ws::HPRQP_workspace_gpu,
     qp::QP_info_gpu,
     sc::Scaling_info_gpu,
     res::HPRQP_residuals,
@@ -214,7 +214,7 @@ function save_state_to_hdf5(
 end
 
 # This function updates the penalty parameter (sigma) based on the current state of the algorithm.
-function update_sigma(params::HPRQP_parameters,
+function update_sigma_gpu!(params::HPRQP_parameters,
     restart_info::HPRQP_restart,
     ws::HPRQP_workspace_gpu,
     qp::QP_info_gpu,
@@ -358,14 +358,16 @@ end
 function do_restart(restart_info::HPRQP_restart, ws::HPRQP_workspace_gpu, qp::QP_info_gpu)
     if restart_info.restart_flag > 0
         ws.x .= ws.x_bar
-        ws.y .= ws.y_bar
         ws.w .= ws.w_bar
         ws.last_x .= ws.x_bar
-        ws.last_y .= ws.y_bar
         ws.last_w .= ws.w_bar
-        CUDA.CUSPARSE.mv!('N', 1, ws.AT, ws.y_bar, 0, ws.ATy_bar, 'O', CUDA.CUSPARSE.CUSPARSE_SPMV_CSR_ALG2)
-        ws.last_ATy .= ws.ATy_bar
-        ws.ATy .= ws.ATy_bar
+        if ws.m > 0
+            ws.y .= ws.y_bar
+            ws.last_y .= ws.y_bar
+            CUDA.CUSPARSE.mv!('N', 1, ws.AT, ws.y_bar, 0, ws.ATy_bar, 'O', CUDA.CUSPARSE.CUSPARSE_SPMV_CSR_ALG2)
+            ws.last_ATy .= ws.ATy_bar
+            ws.ATy .= ws.ATy_bar
+        end
         restart_info.last_gap = restart_info.current_gap
         restart_info.save_gap = Inf
         restart_info.times += 1
@@ -417,6 +419,588 @@ function collect_results_gpu!(
     results.z = Vector(sc.c_scale * (ws.z_bar .* sc.col_norm))
     return results
 end
+
+# ============================================================================
+# CPU Algorithm Functions
+# ============================================================================
+
+# CPU version of compute residuals
+function compute_residuals_cpu!(ws::HPRQP_workspace_cpu,
+    qp::QP_info_cpu,
+    sc::Scaling_info_cpu,
+    res::HPRQP_residuals,
+    params::HPRQP_parameters,
+    iter::Int)
+
+    ### Objective values
+    Qmap!(ws.x_bar, ws.Qx, qp.Q)
+    res.primal_obj_bar = sc.b_scale * sc.c_scale *
+                         (dot(ws.c, ws.x_bar) + 0.5 * dot(ws.x_bar, ws.Qx)) + qp.obj_constant
+    res.dual_obj_bar = sc.b_scale * sc.c_scale *
+                       (-0.5 * dot(ws.x_bar, ws.Qx) + dot(ws.z_bar, ws.x_bar)) + qp.obj_constant
+    if ws.m > 0
+        res.dual_obj_bar += sc.b_scale * sc.c_scale * dot(ws.y_bar, ws.s)
+    end
+    if params.problem_type == "LASSO" && length(ws.lambda) > 0
+        ws.tempv .= ws.lambda .* ws.x_bar
+        l1_norm = norm(ws.tempv, 1)
+        res.primal_obj_bar += sc.b_scale * sc.c_scale * l1_norm
+        res.dual_obj_bar += sc.b_scale * sc.c_scale * l1_norm
+    end
+    res.rel_gap_bar = abs(res.primal_obj_bar - res.dual_obj_bar) / (1.0 + max(abs(res.primal_obj_bar), abs(res.dual_obj_bar)))
+    compute_Rd_cpu!(ws, sc)
+    res.err_Rd_org_bar = norm(ws.Rd, Inf) / (1.0 + maximum([sc.norm_c_org, norm(ws.ATdy, Inf), norm(ws.Qx, Inf)]))
+    if ws.m > 0
+        compute_Rp_cpu!(ws, sc)
+        res.err_Rp_org_bar = norm(ws.Rp, Inf) / (1.0 + max(sc.norm_b_org, norm(ws.Ax, Inf)))
+    else
+        res.err_Rp_org_bar = 0.0
+    end
+    if iter == 0
+        # Compute bounds violations: max(l - x, 0) for lower, max(x - u, 0) for upper
+        lower_violation = max.(ws.l .- ws.x_bar, 0.0)
+        upper_violation = max.(ws.x_bar .- ws.u, 0.0)
+        ws.dx .= (lower_violation .+ upper_violation) .* (sc.b_scale ./ sc.col_norm)
+        res.err_Rp_org_bar = max(res.err_Rp_org_bar, norm(ws.dx, Inf))
+    end
+    res.KKTx_and_gap_org_bar = max(res.err_Rp_org_bar, res.err_Rd_org_bar, res.rel_gap_bar)
+    if params.auto_save && (iter == 0 || res.KKTx_and_gap_org_bar < max(ws.saved_state.save_err_Rp, ws.saved_state.save_err_Rd, ws.saved_state.save_rel_gap))
+        ws.saved_state.save_x .= ws.x_bar
+        ws.saved_state.save_y .= ws.y_bar
+        ws.saved_state.save_z .= ws.z_bar
+        ws.saved_state.save_w .= ws.w_bar
+        ws.saved_state.save_sigma = ws.sigma
+        ws.saved_state.save_iter = iter
+        ws.saved_state.save_err_Rp = res.err_Rp_org_bar
+        ws.saved_state.save_err_Rd = res.err_Rd_org_bar
+        ws.saved_state.save_primal_obj = res.primal_obj_bar
+        ws.saved_state.save_dual_obj = res.dual_obj_bar
+        ws.saved_state.save_rel_gap = res.rel_gap_bar
+    end
+end
+
+# CPU version of compute M norm
+function compute_M_norm_cpu!(ws::HPRQP_workspace_cpu, qp::QP_info_cpu, Q_is_diag::Bool)
+    M_1 = 0.0
+    M_2 = (1.0 / ws.sigma) * dot(ws.dx, ws.dx)
+    M_3 = 0.0
+    Qmap!(ws.dw, ws.dQw, qp.Q)
+    M_2 -= 2.0 * dot(ws.dQw, ws.dx)
+    if ws.m > 0
+        M_1 = ws.sigma * ws.lambda_max_A * dot(ws.dy, ws.dy)
+        mul!(ws.ATdy, ws.AT, ws.dy)
+        Qmap!(ws.ATdy, ws.QATdy, qp.Q)
+        M_1 -= 2.0 * ws.sigma * dot(ws.dQw, ws.ATdy)
+        M_2 += 2.0 * dot(ws.ATdy, ws.dx)
+        if Q_is_diag
+            ws.ATdy .*= ws.fact_M
+            M_3 = dot(ws.ATdy, ws.QATdy)
+            M_1 += ws.sigma * dot(ws.dQw, ws.dQw)
+        else
+            M_3 = (ws.sigma^2) / (1.0 + ws.sigma * ws.lambda_max_Q) * dot(ws.ATdy, ws.QATdy)
+            M_1 += ws.sigma * ws.lambda_max_Q * dot(ws.dw, ws.dQw)
+        end
+    elseif !Q_is_diag
+        M_1 = ws.sigma * ws.lambda_max_Q * dot(ws.dw, ws.dQw)
+    end
+    M_2 += max(M_1, 0.0)
+    M_norm = max(M_2, 0.0) + max(M_3, 0.0)
+    M_norm < 0 && error("M_norm is negative!")
+    return sqrt(M_norm)
+end
+
+# CPU version of allocate workspace
+function allocate_workspace_cpu(qp::QP_info_cpu, params::HPRQP_parameters,
+    lambda_max_A::Float64, lambda_max_Q::Float64, scaling_info::Scaling_info_cpu)
+    ws = HPRQP_workspace_cpu()
+    m, n = size(qp.A)
+    ws.m = m
+    ws.n = n
+    ws.w = zeros(Float64, n)
+    ws.w_hat = zeros(Float64, n)
+    ws.w_bar = zeros(Float64, n)
+    ws.dw = zeros(Float64, n)
+    ws.x = zeros(Float64, n)
+    ws.x_hat = zeros(Float64, n)
+    ws.x_bar = zeros(Float64, n)
+    ws.dx = zeros(Float64, n)
+    ws.y = zeros(Float64, m)
+    ws.y_hat = zeros(Float64, n)
+    ws.y_bar = zeros(Float64, m)
+    ws.dy = zeros(Float64, m)
+    ws.z_bar = zeros(Float64, n)
+    ws.Q = qp.Q
+    ws.A = qp.A
+    ws.AT = qp.AT
+    ws.AL = qp.AL
+    ws.AU = qp.AU
+    ws.c = qp.c
+    ws.l = qp.l
+    ws.u = qp.u
+    ws.Rp = zeros(Float64, m)
+    ws.Rd = zeros(Float64, n)
+    ws.Ax = zeros(Float64, m)
+    ws.ATy = zeros(Float64, n)
+    ws.ATy_bar = zeros(Float64, n)
+    ws.ATdy = zeros(Float64, n)
+    ws.QATdy = zeros(Float64, n)
+    ws.s = zeros(Float64, m)
+    ws.Qw = zeros(Float64, n)
+    ws.Qw_hat = zeros(Float64, n)
+    ws.Qw_bar = zeros(Float64, n)
+    ws.Qx = zeros(Float64, n)
+    ws.dQw = zeros(Float64, n)
+    ws.last_x = zeros(Float64, n)
+    ws.last_y = zeros(Float64, m)
+    ws.last_Qw = zeros(Float64, n)
+    ws.last_w = zeros(Float64, n)
+    ws.last_ATy = zeros(Float64, n)
+    ws.tempv = zeros(Float64, n)
+    ws.diag_Q = qp.diag_Q
+    ws.fact1 = zeros(Float64, n)
+    ws.fact2 = zeros(Float64, n)
+    ws.fact = zeros(Float64, n)
+    ws.fact_M = zeros(Float64, n)
+    ws.lambda_max_A = lambda_max_A
+    ws.lambda_max_Q = lambda_max_Q
+    if params.sigma == -1
+        norm_b = scaling_info.norm_b
+        norm_c = scaling_info.norm_c
+        if norm_c > 1e-16 && norm_b > 1e-16 && norm_b < 1e16 && norm_c < 1e16
+            ws.sigma = norm_b / norm_c
+        else
+            ws.sigma = 1.0
+        end
+    elseif params.sigma > 0
+        ws.sigma = params.sigma
+    else
+        error("Invalid sigma value: ", params.sigma, ". It should be a positive number or -1 for automatic.")
+    end
+    if qp.Q_is_diag
+        for i in 1:n
+            temp = 1.0 + ws.sigma * ws.diag_Q[i]
+            ws.fact1[i] = 1.0 / temp
+            ws.fact2[i] = (ws.sigma * ws.diag_Q[i]) / temp
+            ws.fact_M[i] = (ws.sigma^2 * ws.diag_Q[i]) / temp
+        end
+    end
+    # For CPU, lambda is scalar in QP_info_cpu but needs to be vector in workspace
+    # Convert scalar to vector filled with that value
+    ws.lambda = fill(qp.lambda, n)
+    ws.to_check = true
+    if params.auto_save
+        ws.saved_state = HPRQP_saved_state_cpu()
+        ws.saved_state.save_x = zeros(Float64, n)
+        ws.saved_state.save_y = zeros(Float64, m)
+        ws.saved_state.save_z = zeros(Float64, n)
+        ws.saved_state.save_w = zeros(Float64, n)
+        ws.saved_state.save_sigma = ws.sigma
+        ws.saved_state.save_iter = 0
+        ws.saved_state.save_err_Rp = Inf
+        ws.saved_state.save_err_Rd = Inf
+        ws.saved_state.save_primal_obj = Inf
+        ws.saved_state.save_dual_obj = Inf
+        ws.saved_state.save_rel_gap = Inf
+    end
+    if params.initial_x !== nothing
+        scaled_x = params.initial_x .* scaling_info.col_norm ./ scaling_info.b_scale
+        ws.x .= scaled_x
+        ws.x_bar .= scaled_x
+        ws.last_x .= scaled_x
+        ws.w .= scaled_x
+        ws.w_bar .= scaled_x
+        ws.last_w .= scaled_x
+    end
+    if params.initial_y !== nothing
+        ws.y .= params.initial_y .* scaling_info.row_norm ./ scaling_info.c_scale
+        ws.y_bar .= ws.y
+        ws.last_y .= ws.y
+        if m > 0
+            mul!(ws.ATy_bar, ws.AT, ws.y_bar)
+            ws.ATy .= ws.ATy_bar
+            ws.last_ATy .= ws.ATy_bar
+        end
+    end
+    return ws
+end
+
+# ============================================================================
+# CPU Main Update Functions
+# ============================================================================
+
+# Main update function for CPU - dispatches to appropriate update based on problem type
+function main_update_cpu!(ws::HPRQP_workspace_cpu, qp::QP_info_cpu, restart_info::HPRQP_restart)
+    Halpern_fact1 = 1.0 / (restart_info.inner + 2.0)
+    Halpern_fact2 = 1.0 - Halpern_fact1
+
+    # Compute fact1 and fact2 scalars for non-diagonal Q or vector for diagonal Q
+    if qp.Q_is_diag
+        # Use precomputed fact1/fact2 vectors for diagonal Q
+        fact1_scalar = 0.0  # Not used for diagonal Q
+        fact2_scalar = 0.0  # Not used for diagonal Q
+    else
+        # Compute scalar factors for non-diagonal Q
+        fact2_scalar = 1.0 / (1.0 + ws.sigma * ws.lambda_max_Q)
+        fact1_scalar = 1.0 - fact2_scalar
+    end
+
+    # Step 1: Update z, x, and initial w_bar (without AT*y_bar correction)
+    if isa(qp.Q, LASSO_Q_operator_cpu)
+        # LASSO-specific update with soft-thresholding
+        update_zxw_LASSO_cpu!(ws, fact1_scalar, fact2_scalar, Halpern_fact1, Halpern_fact2)
+    else
+        # Standard QP update (sparse matrix or QAP operator)
+        update_zxw1_cpu!(ws, fact1_scalar, fact2_scalar, Halpern_fact1, Halpern_fact2, qp.Q_is_diag)
+    end
+
+    # Step 2: Update dual variables y (computes y_bar)
+    update_y_cpu!(ws, Halpern_fact1, Halpern_fact2)
+
+    # Step 3: Complete w update using the new y_bar (adds AT*y_bar correction)
+    update_w2_cpu!(ws, Halpern_fact1, Halpern_fact2, qp.Q_is_diag)
+
+
+end
+
+# ============================================================================
+# CPU Sigma Update
+# ============================================================================
+
+function update_sigma_cpu!(params::HPRQP_parameters,
+    restart_info::HPRQP_restart,
+    ws::HPRQP_workspace_cpu,
+    qp::QP_info_cpu,
+    Q_is_diag::Bool,
+    residuals::HPRQP_residuals,
+)
+    if ~params.sigma_fixed && (restart_info.restart_flag >= 1)
+        sigma_old = ws.sigma
+        ws.dx .= ws.x_bar .- ws.last_x
+        ws.dw .= ws.w_bar .- ws.last_w
+        # Use unified Qmap! function (dispatch handles operator vs sparse matrix)
+        Qmap!(ws.dw, ws.dQw, qp.Q)
+
+        a = 0.0
+        b = dot(ws.dx, ws.dx)
+        c = 0.0
+        d = 0.0
+
+        if ws.m > 0
+            ws.dy .= ws.y_bar .- ws.last_y
+            ws.ATdy .= ws.ATy_bar .- ws.last_ATy
+            # Use unified Qmap! function (dispatch handles operator vs sparse matrix)
+            Qmap!(ws.ATdy, ws.QATdy, qp.Q)
+            a = ws.lambda_max_A * dot(ws.dy, ws.dy) - 2 * dot(ws.dQw, ws.ATdy)
+        end
+
+        if Q_is_diag
+            # if Q_is_diag
+            a += norm(ws.dQw)^2
+        else
+            a += ws.lambda_max_Q * dot(ws.dw, ws.dQw)
+            if ws.m > 0
+                c = dot(ws.ATdy, ws.QATdy)
+                d = ws.lambda_max_Q
+            end
+        end
+        a = max(a, 1e-12)
+        b = max(b, 1e-12)
+        if Q_is_diag
+            if ws.m > 0
+                sigma_estimation = golden_Q_diag_cpu(a, b, ws.diag_Q, ws.ATdy, ws.QATdy, ws.tempv; lo=1e-12, hi=1e12, tol=1e-13)
+            else
+                # No constraints: simplified sigma update for diagonal Q
+                sigma_estimation = sqrt(b / a)
+            end
+        else
+            # min a * x + b / x + c * x^2 / (1 + d * x)
+            if ws.m > 0
+                sigma_estimation = golden(a, b, c, d; lo=1e-12, hi=1e12, tol=1e-13)
+            else
+                # No constraints: simplified sigma update
+                sigma_estimation = sqrt(b / a)
+            end
+        end
+        fact = exp(-0.05 * (restart_info.current_gap / restart_info.best_gap))
+        temp_1 = max(min(residuals.err_Rd_org_bar, residuals.err_Rp_org_bar), min(residuals.rel_gap_bar, restart_info.current_gap))
+        sigma_cand = exp(fact * log(sigma_estimation) + (1 - fact) * log(restart_info.best_sigma))
+        if temp_1 > 9e-10
+            κ = 1.0
+        elseif temp_1 > 5e-10
+            ratio_infeas_org = residuals.err_Rd_org_bar / residuals.err_Rp_org_bar
+            κ = clamp(sqrt(ratio_infeas_org), 1e-2, 100.0)
+        else
+            ratio_infeas_org = residuals.err_Rd_org_bar / residuals.err_Rp_org_bar
+            κ = clamp((ratio_infeas_org), 1e-2, 100.0)
+        end
+        ws.sigma = κ * sigma_cand
+
+        # update Q factors if sigma changes
+        if Q_is_diag
+            if abs(sigma_old - ws.sigma) > 1e-15
+                update_Q_factors_cpu!(
+                    ws.fact2, ws.fact, ws.fact1, ws.fact_M,
+                    ws.diag_Q, ws.sigma
+                )
+            end
+        end
+    end
+end
+
+# ============================================================================
+# CPU Collect Results  
+# ============================================================================
+
+function collect_results_cpu!(ws::HPRQP_workspace_cpu, qp::QP_info_cpu, scaling_info::Scaling_info_cpu, results::HPRQP_results)
+    # Scale and return the solution
+    results.x = scaling_info.b_scale * (ws.x_bar ./ scaling_info.col_norm)
+    results.w = scaling_info.b_scale * (ws.w_bar ./ scaling_info.col_norm)
+    if ws.m > 0
+        results.y = scaling_info.c_scale * (ws.y_bar ./ scaling_info.row_norm)
+    else
+        results.y = Float64[]
+    end
+    results.z = scaling_info.c_scale * (ws.z_bar ./ scaling_info.col_norm)
+end
+
+# ============================================================================
+# CPU Helper Functions (restart, termination, etc.)
+# ============================================================================
+
+# CPU version of do_restart
+function do_restart_cpu!(restart_info::HPRQP_restart, ws::HPRQP_workspace_cpu, qp::QP_info_cpu)
+    if restart_info.restart_flag > 0
+        ws.x .= ws.x_bar
+        ws.w .= ws.w_bar
+        ws.last_x .= ws.x_bar
+        ws.last_w .= ws.w_bar
+
+        # Compute ATy_bar on CPU
+        if ws.m > 0
+            ws.y .= ws.y_bar
+            ws.last_y .= ws.y_bar
+            mul!(ws.ATy_bar, ws.AT, ws.y_bar)
+            ws.last_ATy .= ws.ATy_bar
+            ws.ATy .= ws.ATy_bar
+        end
+
+        restart_info.last_gap = restart_info.current_gap
+        restart_info.save_gap = Inf
+        restart_info.times += 1
+        restart_info.inner = 0
+    end
+end
+
+# CPU version of save_state_to_hdf5
+function save_state_to_hdf5_cpu(
+    filename::String,
+    ws::HPRQP_workspace_cpu,
+    sc::Scaling_info_cpu,
+    residuals::HPRQP_residuals,
+    params::HPRQP_parameters,
+    iter::Int,
+    t_start_alg::Float64,
+)
+    # For CPU, variables are already on CPU - just scale them
+    x_bar = ws.x_bar
+    y_bar = ws.y_bar
+    z_bar = ws.z_bar
+    w_bar = ws.w_bar
+    save_x = ws.saved_state.save_x
+    save_y = ws.saved_state.save_y
+    save_z = ws.saved_state.save_z
+    save_w = ws.saved_state.save_w
+    col_norm = sc.col_norm
+    row_norm = sc.row_norm
+
+    # Scale the variables (same as in collect_results)
+    x_bar_scaled = sc.b_scale * (x_bar ./ col_norm)
+    w_bar_scaled = sc.b_scale * (w_bar ./ col_norm)
+    save_x_scaled = sc.b_scale * (save_x ./ col_norm)
+    save_w_scaled = sc.b_scale * (save_w ./ col_norm)
+
+    if ws.m > 0
+        y_bar_scaled = sc.c_scale * (y_bar ./ row_norm)
+        save_y_scaled = sc.c_scale * (save_y ./ row_norm)
+        z_bar_scaled = sc.c_scale * (z_bar ./ col_norm)
+        save_z_scaled = sc.c_scale * (save_z ./ col_norm)
+    else
+        y_bar_scaled = Float64[]
+        save_y_scaled = Float64[]
+        z_bar_scaled = sc.c_scale * (z_bar ./ col_norm)
+        save_z_scaled = sc.c_scale * (save_z ./ col_norm)
+    end
+
+    # Create or open HDF5 file
+    if isfile(filename)
+        rm(filename, force=true)
+    end
+    h5open(filename, "w") do file
+        # Save current iteration info
+        file["current/iteration"] = iter
+        file["current/time_elapsed"] = time() - t_start_alg
+        file["current/timestamp"] = string(Dates.now())
+
+        # Save current solution (scaled)
+        file["current/x_org"] = x_bar_scaled
+        file["current/w_org"] = w_bar_scaled
+        if ws.m > 0
+            file["current/y_org"] = y_bar_scaled
+        end
+        file["current/z_org"] = z_bar_scaled
+        file["current/sigma"] = ws.sigma
+
+        # Save current residuals
+        file["current/err_Rp"] = residuals.err_Rp_org_bar
+        file["current/err_Rd"] = residuals.err_Rd_org_bar
+        file["current/primal_obj"] = residuals.primal_obj_bar
+        file["current/dual_obj"] = residuals.dual_obj_bar
+        file["current/rel_gap"] = residuals.rel_gap_bar
+        file["current/KKTx_and_gap"] = residuals.KKTx_and_gap_org_bar
+
+        # Save best solution so far (scaled)
+        file["best/x_org"] = save_x_scaled
+        file["best/w_org"] = save_w_scaled
+        if ws.m > 0
+            file["best/y_org"] = save_y_scaled
+        end
+        file["best/z_org"] = save_z_scaled
+        file["best/sigma"] = ws.saved_state.save_sigma
+        file["best/iteration"] = ws.saved_state.save_iter
+
+        # Save best residuals
+        file["best/err_Rp"] = ws.saved_state.save_err_Rp
+        file["best/err_Rd"] = ws.saved_state.save_err_Rd
+        file["best/primal_obj"] = ws.saved_state.save_primal_obj
+        file["best/dual_obj"] = ws.saved_state.save_dual_obj
+        file["best/rel_gap"] = ws.saved_state.save_rel_gap
+        file["best/KKTx_and_gap"] = max(ws.saved_state.save_err_Rp, ws.saved_state.save_err_Rd, ws.saved_state.save_rel_gap)
+    end
+
+    if params.verbose
+        println(@sprintf("State saved to %s at iteration %d", filename, iter))
+    end
+end
+
+# CPU version of handle_termination
+function handle_termination_cpu(status::String, residuals::HPRQP_residuals,
+    ws::HPRQP_workspace_cpu, scaling_info::Scaling_info_cpu,
+    iter::Int, t_start_alg::Float64, power_time::Float64,
+    setup_time::Float64, iter_4::Int, time_4::Float64,
+    iter_6::Int, time_6::Float64, verbose::Bool)
+    # Print termination message
+    if verbose
+        if status == "OPTIMAL"
+            println("The instance is solved, the accuracy is ", residuals.KKTx_and_gap_org_bar)
+        elseif status == "MAX_ITER"
+            println("The maximum number of iterations is reached, the accuracy is ",
+                residuals.KKTx_and_gap_org_bar)
+        elseif status == "TIME_LIMIT"
+            println("The time limit is reached, the accuracy is ", residuals.KKTx_and_gap_org_bar)
+        end
+    end
+
+    # Collect results
+    results = HPRQP_results()
+    results.iter = iter
+    results.time = time() - t_start_alg
+    results.power_time = power_time
+    results.residuals = residuals.KKTx_and_gap_org_bar
+    results.primal_obj = residuals.primal_obj_bar
+    results.gap = residuals.rel_gap_bar
+
+    # Scale and copy results (already on CPU)
+    results.w = scaling_info.b_scale * (ws.w_bar ./ scaling_info.col_norm)
+    results.x = scaling_info.b_scale * (ws.x_bar ./ scaling_info.col_norm)
+    if ws.m > 0
+        results.y = scaling_info.c_scale * (ws.y_bar ./ scaling_info.row_norm)
+    else
+        results.y = Float64[]
+    end
+    results.z = scaling_info.c_scale * (ws.z_bar ./ scaling_info.col_norm)
+
+    results.status = status
+    results.time_4 = time_4 == 0.0 ? results.time : time_4
+    results.iter_4 = iter_4 == 0 ? iter : iter_4
+    results.time_6 = time_6 == 0.0 ? results.time : time_6
+    results.iter_6 = iter_6 == 0 ? iter : iter_6
+
+    # Print solution summary
+    if verbose
+        println()
+        println("="^80)
+        println("SOLUTION SUMMARY")
+        println("="^80)
+        println(@sprintf("Status: %s", status))
+        println(@sprintf("Iterations: %d", iter))
+        println(@sprintf("Time: %.2f seconds", results.time))
+        println(@sprintf("Primal Objective: %.12e", residuals.primal_obj_bar))
+        println(@sprintf("Dual Objective: %.12e", residuals.dual_obj_bar))
+        println(@sprintf("Primal Residual: %.6e", residuals.err_Rp_org_bar))
+        println(@sprintf("Dual Residual: %.6e", residuals.err_Rd_org_bar))
+        println(@sprintf("Relative Gap: %.6e", residuals.rel_gap_bar))
+        println("="^80)
+        println(@sprintf("Total time: %.2fs  (setup = %.2fs, solve = %.2fs)",
+            setup_time + results.time, setup_time, results.time))
+        println("="^80)
+    end
+
+    return results
+end
+
+# CPU version of print_problem_info
+function print_problem_info(qp::QP_info_cpu, params::HPRQP_parameters)
+    if !params.verbose
+        return
+    end
+
+    m, n = size(qp.A)
+
+    println("="^80)
+    println("QP PROBLEM INFORMATION")
+    println("="^80)
+
+    # Determine QP type
+    qp_type = if isa(qp.Q, AbstractQOperatorCPU)
+        get_operator_name(typeof(qp.Q))
+    elseif isa(qp.Q, SparseMatrixCSC)
+        if nnz(qp.Q) > 0
+            "QP (Quadratic Program - Non-empty Q)"
+        else
+            "LP (Linear Program - Empty Q)"
+        end
+    else
+        "Unknown QP Type"
+    end
+    println("Problem Type: $qp_type")
+
+    # Q matrix information
+    if isa(qp.Q, SparseMatrixCSC)
+        q_size = size(qp.Q, 1)
+        q_nnz = nnz(qp.Q)
+        println("Q Matrix: $(q_size)×$(q_size), nnz = $q_nnz")
+        if q_nnz > 0
+            println("Q is Diagonal: $(qp.Q_is_diag)")
+        end
+    elseif isa(qp.Q, AbstractQOperatorCPU)
+        op_name = get_operator_name(typeof(qp.Q))
+        println("Q Operator: $op_name operator (implicit matrix)")
+    end
+
+    # Constraint matrix information
+    if m > 0
+        a_nnz = nnz(qp.A)
+        println("A Matrix: $(m)×$(n), nnz = $a_nnz")
+    else
+        println("A Matrix: No constraints (unconstrained)")
+    end
+
+    println()
+end
+
+# ============================================================================
+# GPU Algorithm Functions  
+# ============================================================================
 
 # This function allocates the workspace for the HPR-QP algorithm on GPU.
 function allocate_workspace_gpu(qp::QP_info_gpu,
@@ -616,7 +1200,7 @@ end
 
 # This function updates the variables in the HPR-QP algorithm, when Q is diagonal, there's no proximal term on w;
 # when the problem is formulated without l≤x≤u, the update is w->x->y.
-function main_update!(ws::HPRQP_workspace_gpu,
+function main_update_gpu!(ws::HPRQP_workspace_gpu,
     qp::QP_info_gpu,
     spmv_mode_Q::String,
     spmv_mode_A::String,
@@ -824,7 +1408,7 @@ function print_problem_info(qp::QP_info_gpu, params::HPRQP_parameters)
 end
 
 # Print solver parameters
-function print_solver_params(params::HPRQP_parameters, qp::QP_info_gpu, spmv_mode_Q::String, spmv_mode_A::String)
+function print_solver_params(params::HPRQP_parameters, qp::Union{QP_info_gpu,QP_info_cpu}, spmv_mode_Q::String="", spmv_mode_A::String="")
     if !params.verbose
         return
     end
@@ -843,8 +1427,10 @@ function print_solver_params(params::HPRQP_parameters, qp::QP_info_gpu, spmv_mod
     println("  Print frequency: ", params.print_frequency == -1 ? "Adaptive" : params.print_frequency)
     println("  Eigenvalue factor: ", params.eig_factor)
     println("  Sigma fixed: ", params.sigma_fixed)
-    println("  SpMV mode Q: ", spmv_mode_Q, params.spmv_mode_Q == "auto" ? " (auto-detected)" : "")
-    println("  SpMV mode A: ", spmv_mode_A, params.spmv_mode_A == "auto" ? " (auto-detected)" : "")
+    if params.use_gpu
+        println("  SpMV mode Q: ", spmv_mode_Q, params.spmv_mode_Q == "auto" ? " (auto-detected)" : "")
+        println("  SpMV mode A: ", spmv_mode_A, params.spmv_mode_A == "auto" ? " (auto-detected)" : "")
+    end
     println("  Scaling options:")
     println("    Ruiz scaling: ", params.use_Ruiz_scaling ? "Enabled" : "Disabled")
     println("    Pock-Chambolle scaling: ", params.use_Pock_Chambolle_scaling ? "Enabled" : "Disabled")
@@ -911,8 +1497,8 @@ function estimate_eigenvalues(qp::QP_info_gpu, params::HPRQP_parameters)
     # Estimate lambda_max_Q based on Q type
     # Compute largest eigenvalue of Q using power iteration or direct computation
     if isa(qp.Q, AbstractQOperator)
-        # Use the unified power_iteration_Q interface for all operators
-        lambda_max_Q = power_iteration_Q(qp.Q) * params.eig_factor
+        # Use power_iteration_Q_gpu for all operators
+        lambda_max_Q = power_iteration_Q_gpu(qp.Q) * params.eig_factor
     elseif isa(qp.Q, CuSparseMatrixCSR)
         if length(qp.Q.nzVal) > 0
             if !qp.Q_is_diag
@@ -974,6 +1560,27 @@ function check_tolerance_milestones!(residuals::HPRQP_residuals,
     end
 end
 
+# ==================== Helper Function for CPU/GPU Dispatch ====================
+
+# Helper function to select GPU or CPU function implementations
+function setup_solver_functions(use_gpu::Bool)
+    if use_gpu
+        return (
+            compute_residuals_gpu!,
+            update_sigma_gpu!,
+            collect_results_gpu!,
+            main_update_gpu!,
+        )
+    else
+        return (
+            compute_residuals_cpu!,
+            update_sigma_cpu!,
+            collect_results_cpu!,
+            main_update_cpu!,
+        )
+    end
+end
+
 # ==================== Public API Functions ====================
 
 """
@@ -1006,8 +1613,10 @@ result = optimize(model, params)
 See also: [`build_from_mps`](@ref), [`build_from_QAbc`](@ref)
 """
 function optimize(model::QP_info_cpu, params::HPRQP_parameters)
-    # Setup: GPU device
-    CUDA.device!(params.device_number)
+    # Setup: GPU device (only if using GPU)
+    if params.use_gpu
+        CUDA.device!(params.device_number)
+    end
 
     # Handle warmup if requested
     if params.warm_up
@@ -1055,18 +1664,6 @@ function optimize(model::QP_info_cpu, params::HPRQP_parameters)
     end
 
     return results
-end
-
-# Helper function: Initialize solver state with workspace, residuals, and restart info
-function initialize_solver_state(qp::QP_info_gpu, params::HPRQP_parameters,
-    lambda_max_A::Float64, lambda_max_Q::Float64,
-    scaling_info_gpu::Scaling_info_gpu)
-    residuals = HPRQP_residuals()
-    restart_info = initialize_restart()
-    ws = allocate_workspace_gpu(qp, params, lambda_max_A, lambda_max_Q, scaling_info_gpu)
-    # Initialize best_sigma with the initial sigma value
-    restart_info.best_sigma = ws.sigma
-    return ws, residuals, restart_info
 end
 
 # Helper function: Benchmark A operations only
@@ -1253,22 +1850,6 @@ function determine_spmv_mode(qp::QP_info_gpu, params::HPRQP_parameters, ws::HPRQ
     return (spmv_mode_Q, spmv_mode_A)
 end
 
-# Helper function: Setup iteration loop variables and Q factors
-function setup_iteration_loop!(qp::QP_info_gpu, ws::HPRQP_workspace_gpu)
-    # Initialize tracking variables for milestones
-    iter_4, time_4 = 0, 0.0
-    iter_6, time_6 = 0, 0.0
-    first_4, first_6 = true, true
-
-    # Update Q factors for diagonal Q
-    if isa(qp.Q, CuSparseMatrixCSR) && qp.Q_is_diag
-        update_Q_factors_gpu!(ws.fact2, ws.fact, ws.fact1, ws.fact_M,
-            ws.diag_Q, ws.sigma)
-    end
-
-    return iter_4, time_4, iter_6, time_6, first_4, first_6
-end
-
 # Helper function: Determine if iteration should print
 function should_print(iter::Int, params::HPRQP_parameters, t_start_alg::Float64)
     if params.print_frequency == -1
@@ -1288,6 +1869,20 @@ end
 # Helper function: Print iteration log
 function print_iteration_log(iter::Int, residuals::HPRQP_residuals,
     ws::HPRQP_workspace_gpu, t_start_alg::Float64)
+    println(@sprintf("%5.0f    %3.2e    %3.2e    %+7.6e    %+7.6e    %3.2e    %3.2e    %6.2f",
+        iter,
+        residuals.err_Rp_org_bar,
+        residuals.err_Rd_org_bar,
+        residuals.primal_obj_bar,
+        residuals.dual_obj_bar,
+        residuals.rel_gap_bar,
+        ws.sigma,
+        time() - t_start_alg))
+end
+
+# CPU version of print_iteration_log
+function print_iteration_log(iter::Int, residuals::HPRQP_residuals,
+    ws::HPRQP_workspace_cpu, t_start_alg::Float64)
     println(@sprintf("%5.0f    %3.2e    %3.2e    %+7.6e    %+7.6e    %3.2e    %3.2e    %6.2f",
         iter,
         residuals.err_Rp_org_bar,
@@ -1380,8 +1975,8 @@ end
 function perform_iteration_step!(ws::HPRQP_workspace_gpu, qp::QP_info_gpu,
     params::HPRQP_parameters, restart_info::HPRQP_restart,
     spmv_mode_Q::String, spmv_mode_A::String, iter::Int, check_iter::Int)
-    # Main update - now handles both operator and sparse matrix Q within main_update!
-    main_update!(ws, qp, spmv_mode_Q, spmv_mode_A, restart_info)
+    # Main update - now handles both operator and sparse matrix Q within main_update_gpu!
+    main_update_gpu!(ws, qp, spmv_mode_Q, spmv_mode_A, restart_info)
 
     # Compute M norm for restart decision
     if restart_info.restart_flag > 0
@@ -1395,53 +1990,101 @@ function perform_iteration_step!(ws::HPRQP_workspace_gpu, qp::QP_info_gpu,
     restart_info.inner += 1
 end
 
-# This function is the main solver function for the HPR-QP algorithm on GPU.
-# It handles GPU transfer, scaling on GPU, and optimization.
+# This function is the main solver function for the HPR-QP algorithm.
+# It handles GPU transfer/CPU setup, scaling, and optimization.
 function solve(model::QP_info_cpu, params::HPRQP_parameters)
     setup_start = time()
 
-    # Step 1: Transfer to GPU
-    qp, transfer_time = transfer_to_gpu(model, params)
-
-    # Step 2: Scaling on GPU
-    scaling_info_gpu, scaling_time = scale_on_gpu!(qp, params)
+    # Setup: GPU transfer and scaling
+    if params.use_gpu
+        qp, transfer_time = transfer_to_gpu(model, params)
+        scaling_info, _ = scale_on_gpu!(qp, params)
+    else
+        qp = deepcopy(model)  # Work on a copy to avoid modifying original
+        scaling_info, _ = scale_on_cpu!(qp, params)
+    end
 
     setup_time = time() - setup_start
-
-    # Step 3: Estimate eigenvalues (needed for workspace allocation)
     t_start_alg = time()
-    lambda_max_A, lambda_max_Q, power_time = estimate_eigenvalues(qp, params)
 
-    # Step 4: Initialize solver state (needed for determine_spmv_mode)
-    ws, residuals, restart_info = initialize_solver_state(qp, params, lambda_max_A,
-        lambda_max_Q, scaling_info_gpu)
+    # Get problem dimensions
+    m, n = size(qp.A)
 
-    # Step 5: Determine SPMV mode (before printing so we can show the actual mode)
-    spmv_mode_Q, spmv_mode_A = determine_spmv_mode(qp, params, ws)
+    # Estimate eigenvalues
+    if params.use_gpu
+        lambda_max_A, lambda_max_Q, power_time = estimate_eigenvalues(qp, params)
+    else
+        # CPU eigenvalue estimation - use scaled qp, not original model
+        power_time_start = time()
+        lambda_max_A = m > 0 ? power_iteration_A_cpu(qp.A, qp.AT, 5000, 1e-4) * params.eig_factor : 0.0
+        lambda_max_Q = if isa(qp.Q, AbstractQOperatorCPU)
+            power_iteration_Q_cpu(qp.Q, 5000, 1e-4) * params.eig_factor
+        elseif isa(qp.Q, SparseMatrixCSC)
+            if length(qp.Q.nzval) > 0
+                if !qp.Q_is_diag
+                    power_iteration_Q_cpu(qp.Q, 5000, 1e-4) * params.eig_factor
+                else
+                    maximum(qp.Q.nzval)
+                end
+            else
+                0.0
+            end
+        else
+            0.0
+        end
+        power_time = time() - power_time_start
+    end
 
-    # Step 6: Print problem information
+    # Initialize workspace and solver state
+    residuals = HPRQP_residuals()
+    restart_info = initialize_restart()
+    spmv_mode_Q, spmv_mode_A = "", ""
+    if params.use_gpu
+        ws = allocate_workspace_gpu(qp, params, lambda_max_A, lambda_max_Q, scaling_info)
+        spmv_mode_Q, spmv_mode_A = determine_spmv_mode(qp, params, ws)
+    else
+        ws = allocate_workspace_cpu(qp, params, lambda_max_A, lambda_max_Q, scaling_info)
+    end
+    # Initialize best_sigma with the initial sigma value
+    restart_info.best_sigma = ws.sigma
     print_problem_info(qp, params)
     print_solver_params(params, qp, spmv_mode_Q, spmv_mode_A)
 
-    # Step 7: Setup iteration loop
-    iter_4, time_4, iter_6, time_6, first_4, first_6 = setup_iteration_loop!(qp, ws)
+    # Setup iteration tracking
+    iter_4, time_4 = 0, 0.0
+    iter_6, time_6 = 0, 0.0
+    first_4, first_6 = true, true
+
+    # Update Q factors for diagonal Q
+    if qp.Q_is_diag
+        if isa(qp.Q, CuSparseMatrixCSR)
+            update_Q_factors_gpu!(ws.fact2, ws.fact, ws.fact1, ws.fact_M,
+                ws.diag_Q, ws.sigma)
+        else
+            update_Q_factors_cpu!(ws.fact2, ws.fact, ws.fact1, ws.fact_M,
+                ws.diag_Q, ws.sigma)
+        end
+    end
 
     if params.verbose
-        println("HPRQP SOLVER starts...")
+        println("HPRQP SOLVER starts", params.use_gpu ? "..." : " (CPU mode)...")
         println(" iter     errRp        errRd         p_obj           d_obj          gap        sigma       time")
     end
 
     check_iter = params.check_iter
 
+    # Select solver functions based on CPU/GPU
+    compute_residuals!, update_sigma!, collect_results!, main_update! = setup_solver_functions(params.use_gpu)
+
     # Main iteration loop
     for iter = 0:params.max_iter
         # Determine if we should print at this iteration
-        print_yes = should_print(iter, params, t_start_alg)
+        print_yes = should_print(iter, params, t_start_alg, params.max_iter)
 
         # Compute residuals if needed
         if rem(iter, check_iter) == 0 || print_yes
             residuals.is_updated = true
-            compute_residuals_gpu(ws, qp, scaling_info_gpu, residuals, params, iter)
+            compute_residuals!(ws, qp, scaling_info, residuals, params, iter)
         else
             residuals.is_updated = false
         end
@@ -1451,12 +2094,15 @@ function solve(model::QP_info_cpu, params::HPRQP_parameters)
 
         # Check and perform restart if needed
         check_restart(restart_info, iter, check_iter, ws.sigma)
-
-        # Update sigma parameter
-        update_sigma(params, restart_info, ws, qp, qp.Q_is_diag, residuals)
+        # Update sigma parameter (dispatches to GPU or CPU version)
+        update_sigma!(params, restart_info, ws, qp, qp.Q_is_diag, residuals)
 
         # Perform restart
-        do_restart(restart_info, ws, qp)
+        if params.use_gpu
+            do_restart(restart_info, ws, qp)
+        else
+            do_restart_cpu!(restart_info, ws, qp)
+        end
 
         # Print iteration log
         if (print_yes || (status != "CONTINUE")) && params.verbose
@@ -1466,7 +2112,11 @@ function solve(model::QP_info_cpu, params::HPRQP_parameters)
         # Save to HDF5 if auto_save is enabled
         if (print_yes || (status != "CONTINUE")) && params.auto_save
             try
-                save_state_to_hdf5(params.save_filename, ws, scaling_info_gpu, residuals, params, iter, t_start_alg)
+                if params.use_gpu
+                    save_state_to_hdf5(params.save_filename, ws, scaling_info, residuals, params, iter, t_start_alg)
+                else
+                    save_state_to_hdf5_cpu(params.save_filename, ws, scaling_info, residuals, params, iter, t_start_alg)
+                end
             catch e
                 if params.verbose
                     println("Warning: Failed to save to HDF5 file: ", e)
@@ -1481,9 +2131,15 @@ function solve(model::QP_info_cpu, params::HPRQP_parameters)
 
         # Handle termination
         if status != "CONTINUE"
-            return handle_termination(status, residuals, ws, scaling_info_gpu,
-                iter, t_start_alg, power_time, setup_time,
-                iter_4, time_4, iter_6, time_6, params.verbose)
+            if params.use_gpu
+                return handle_termination(status, residuals, ws, scaling_info,
+                    iter, t_start_alg, power_time, setup_time,
+                    iter_4, time_4, iter_6, time_6, params.verbose)
+            else
+                return handle_termination_cpu(status, residuals, ws, scaling_info,
+                    iter, t_start_alg, power_time, setup_time,
+                    iter_4, time_4, iter_6, time_6, params.verbose)
+            end
         end
 
         next_iter = iter + 1
@@ -1493,8 +2149,21 @@ function solve(model::QP_info_cpu, params::HPRQP_parameters)
         elseif params.print_frequency > 0
             ws.to_check = ws.to_check || (rem(next_iter, params.print_frequency) == 0)
         end
+        # Perform main iteration step (dispatches to GPU or CPU)
+        if params.use_gpu
+            perform_iteration_step!(ws, qp, params, restart_info, spmv_mode_Q, spmv_mode_A, iter, check_iter)
+        else
+            main_update!(ws, qp, restart_info)
+            # Compute M norm for restart decision
+            if restart_info.restart_flag > 0
+                restart_info.last_gap = compute_M_norm_cpu!(ws, qp, qp.Q_is_diag)
+            end
 
-        # Perform main iteration step
-        perform_iteration_step!(ws, qp, params, restart_info, spmv_mode_Q, spmv_mode_A, iter, check_iter)
+            if rem(iter + 1, check_iter) == 0
+                restart_info.current_gap = compute_M_norm_cpu!(ws, qp, qp.Q_is_diag)
+            end
+
+            restart_info.inner += 1
+        end
     end
 end

@@ -18,10 +18,22 @@ function to_gpu(Q::SparseMatrixCSC{Float64,Int})
 end
 
 get_operator_name(::Type{CuSparseMatrixCSR{Float64,Int32}}) = "SparseMatrix"
+get_problem_size(Q::CuSparseMatrixCSR{Float64,Int32}) = size(Q, 1)
+get_problem_size(Q::SparseMatrixCSC{Float64,Int}) = size(Q, 1)
+get_problem_size(Q::SparseMatrixCSC{Float64,Int32}) = size(Q, 1)
 
-# Q operator mapping for sparse matrix Q (standard case)
+# Q operator mapping for sparse matrix Q (GPU)
 @inline function Qmap!(x::CuVector{Float64}, Qx::CuVector{Float64}, Q::CuSparseMatrixCSR{Float64,Int32})
     CUDA.CUSPARSE.mv!('N', 1, Q, x, 0, Qx, 'O', CUDA.CUSPARSE.CUSPARSE_SPMV_CSR_ALG2)
+end
+
+# Q operator mapping for sparse matrix Q (CPU)
+@inline function Qmap!(x::Vector{Float64}, Qx::Vector{Float64}, Q::SparseMatrixCSC{Float64,Int32})
+    mul!(Qx, Q, x)
+end
+
+@inline function Qmap!(x::Vector{Float64}, Qx::Vector{Float64}, Q::SparseMatrixCSC{Float64,Int})
+    mul!(Qx, Q, x)
 end
 
 # ============================================================================

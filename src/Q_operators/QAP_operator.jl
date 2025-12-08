@@ -45,7 +45,7 @@ function to_gpu(Q_cpu::QAP_Q_operator_cpu)
     )
 end
 
-# Q operator mapping for QAP problem: Q(X) = 2*(AXB - SX - XT)
+# Q operator mapping for QAP problem: Q(X) = 2*(AXB - SX - XT) - GPU version
 # where X is n×n reshaped from vector x of length n²
 @inline function Qmap!(x::CuVector{Float64}, Qx::CuVector{Float64}, Q::QAP_Q_operator_gpu)
     n = Q.n
@@ -53,6 +53,20 @@ end
     QX = reshape(Qx, n, n)
     TMP = reshape(Q.temp, n, n)
     mul!(TMP, Q.A, X)
+    mul!(QX, TMP, Q.B, 2.0, 0.0)
+    mul!(QX, Q.S, X, -2.0, 1.0)
+    mul!(QX, X, Q.T, -2.0, 1.0)
+end
+
+# Q operator mapping for QAP problem: Q(X) = 2*(AXB - SX - XT) - CPU version
+# where X is n×n reshaped from vector x of length n²
+@inline function Qmap!(x::Vector{Float64}, Qx::Vector{Float64}, Q::QAP_Q_operator_cpu)
+    n = Q.n
+    X = reshape(x, n, n)
+    QX = reshape(Qx, n, n)
+    # TMP = A * X
+    TMP = Q.A * X
+    # QX = 2*(TMP * B - S*X - X*T)
     mul!(QX, TMP, Q.B, 2.0, 0.0)
     mul!(QX, Q.S, X, -2.0, 1.0)
     mul!(QX, X, Q.T, -2.0, 1.0)

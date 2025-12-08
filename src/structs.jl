@@ -192,7 +192,9 @@ mutable struct HPRQP_parameters
     save_filename::String
     # verbose output
     verbose::Bool
-    HPRQP_parameters() = new(1e-6, -1, typemax(Int32), false, 3600.0, 1.05, 100, false, "auto", "auto", -1, 0, true, false, false, true, "QP", 0.0, nothing, nothing, false, "hprqp_autosave.h5", true)
+    # use GPU or CPU
+    use_gpu::Bool
+    HPRQP_parameters() = new(1e-6, -1, typemax(Int32), false, 3600.0, 1.05, 100, false, "auto", "auto", -1, 0, true, false, false, true, "QP", 0.0, nothing, nothing, false, "hprqp_autosave.h5", true, true)
 end
 
 # This struct stores the residuals and other metrics during the HPR-QP algorithm.
@@ -283,7 +285,46 @@ end
 # Note: Operator-specific CUSPARSE structures are defined in their respective operator files
 # e.g., CUSPARSE_spmv_LASSO_A and CUSPARSE_spmv_LASSO_AT are in Q_operators/LASSO_operator.jl
 
-# This struct stores the best-so-far state for auto-save feature
+# This struct stores the best-so-far state for auto-save feature (CPU version)
+mutable struct HPRQP_saved_state_cpu
+    # Best x found so far (CPU)
+    save_x::Vector{Float64}
+    
+    # Best y found so far (CPU)
+    save_y::Vector{Float64}
+    
+    # Best z found so far (CPU)
+    save_z::Vector{Float64}
+    
+    # Best w found so far (CPU)
+    save_w::Vector{Float64}
+    
+    # Best sigma value
+    save_sigma::Float64
+    
+    # Iteration when best state was saved
+    save_iter::Int
+    
+    # Primal residual at best state
+    save_err_Rp::Float64
+    
+    # Dual residual at best state
+    save_err_Rd::Float64
+    
+    # Primal objective at best state
+    save_primal_obj::Float64
+    
+    # Dual objective at best state
+    save_dual_obj::Float64
+    
+    # Relative gap at best state
+    save_rel_gap::Float64
+    
+    # Default constructor
+    HPRQP_saved_state_cpu() = new()
+end
+
+# This struct stores the best-so-far state for auto-save feature (GPU version)
 mutable struct HPRQP_saved_state_gpu
     # Best x found so far (GPU)
     save_x::CuVector{Float64}
@@ -383,6 +424,65 @@ mutable struct HPRQP_workspace_gpu
     # Saved state for auto_save feature
     saved_state::HPRQP_saved_state_gpu
     HPRQP_workspace_gpu() = new()
+end
+
+# This struct stores the workspace for the HPR-QP algorithm on the CPU.
+mutable struct HPRQP_workspace_cpu
+    w::Vector{Float64}
+    w_hat::Vector{Float64}
+    w_bar::Vector{Float64}
+    dw::Vector{Float64}
+    x::Vector{Float64}
+    x_hat::Vector{Float64}
+    x_bar::Vector{Float64}
+    dx::Vector{Float64}
+    y::Vector{Float64}
+    y_hat::Vector{Float64}
+    y_bar::Vector{Float64}
+    dy::Vector{Float64}
+    z_bar::Vector{Float64}
+    Q::QTypeCPU  # Can be sparse matrix or CPU Q operator
+    A::SparseMatrixCSC{Float64,Int32}
+    AT::SparseMatrixCSC{Float64,Int32}
+    AL::Vector{Float64}
+    AU::Vector{Float64}
+    c::Vector{Float64}
+    l::Vector{Float64}
+    u::Vector{Float64}
+    Rp::Vector{Float64}
+    Rd::Vector{Float64}
+    m::Int
+    n::Int
+    sigma::Float64
+    lambda_max_A::Float64
+    lambda_max_Q::Float64
+    Ax::Vector{Float64}
+    ATy::Vector{Float64}
+    ATy_bar::Vector{Float64}
+    ATdy::Vector{Float64}
+    QATdy::Vector{Float64}
+    s::Vector{Float64}
+    Qw::Vector{Float64}
+    Qw_hat::Vector{Float64}
+    Qw_bar::Vector{Float64}
+    Qx::Vector{Float64}
+    dQw::Vector{Float64}
+    last_x::Vector{Float64}
+    last_y::Vector{Float64}
+    last_Qw::Vector{Float64}
+    last_w::Vector{Float64}
+    last_ATy::Vector{Float64}
+    tempv::Vector{Float64}
+    diag_Q::Vector{Float64}
+    fact1::Vector{Float64}
+    fact2::Vector{Float64}
+    fact::Vector{Float64}
+    fact_M::Vector{Float64}
+    lambda::Vector{Float64}  # Regularization parameter for LASSO
+    to_check::Bool
+    # Saved state for auto_save feature
+    saved_state::HPRQP_saved_state_cpu
+    HPRQP_workspace_cpu() = new()
 end
 
 # This struct stores the restart information for the HPR-QP algorithm.

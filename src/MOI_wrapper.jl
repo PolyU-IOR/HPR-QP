@@ -172,6 +172,8 @@ function MOI.set(model::Optimizer, param::MOI.RawOptimizerAttribute, value)
         model.params.use_l2_scaling = Bool(value)
     elseif name == "use_Pock_Chambolle_scaling"
         model.params.use_Pock_Chambolle_scaling = Bool(value)
+    elseif name == "use_gpu"
+        model.params.use_gpu = Bool(value)
     elseif name == "initial_x"
         model.params.initial_x = value === nothing ? nothing : Vector{Float64}(value)
     elseif name == "initial_y"

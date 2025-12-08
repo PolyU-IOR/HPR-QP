@@ -49,6 +49,8 @@ end
 # Note: lambda is stored in QP_info_cpu.lambda, not here
 struct LASSO_Q_operator_cpu <: AbstractQOperatorCPU
     A::SparseMatrixCSC{Float64,Int}
+    AT::SparseMatrixCSC{Float64,Int}
+    temp::Vector{Float64}  # Temporary storage for A*x
 end
 
 # GPU version: stores problem data on GPU
@@ -65,6 +67,7 @@ end
 # Interface implementations for LASSO
 get_temp_size(Q::LASSO_Q_operator_cpu) = size(Q.A, 1)  # m rows
 get_operator_name(::Type{LASSO_Q_operator_gpu}) = "LASSO"
+get_operator_name(::Type{LASSO_Q_operator_cpu}) = "LASSO"
 get_problem_size(Q::LASSO_Q_operator_cpu) = size(Q.A, 2)  # n columns
 get_problem_size(Q::LASSO_Q_operator_gpu) = size(Q.A, 2)  # n columns
 
@@ -73,13 +76,13 @@ function to_gpu(Q_cpu::LASSO_Q_operator_cpu)
     return LASSO_Q_operator_gpu(
         CuSparseMatrixCSR(Q_cpu.A),
         CuSparseMatrixCSR(Q_cpu.A'),
-        CUDA.zeros(Float64, m),
+        CuVector(Q_cpu.temp),  # Transfer preallocated temp to GPU
         nothing,  # spmv_A will be initialized by prepare_operator_spmv!
         nothing   # spmv_AT will be initialized by prepare_operator_spmv!
     )
 end
 
-# Q operator mapping for LASSO problem: Q(x) = A'*(A*x)
+# Q operator mapping for LASSO problem: Q(x) = A'*(A*x) - GPU version
 @inline function Qmap!(x::CuVector{Float64}, Qx::CuVector{Float64}, Q::LASSO_Q_operator_gpu)
     # Use preprocessed CUSPARSE if available, otherwise fallback to standard
     if Q.spmv_A !== nothing
@@ -103,6 +106,14 @@ end
     else
         CUDA.CUSPARSE.mv!('N', 1, Q.AT, Q.temp, 0, Qx, 'O', CUDA.CUSPARSE.CUSPARSE_SPMV_CSR_ALG2)
     end
+end
+
+# Q operator mapping for LASSO problem: Q(x) = A'*(A*x) - CPU version
+@inline function Qmap!(x::Vector{Float64}, Qx::Vector{Float64}, Q::LASSO_Q_operator_cpu)
+    # Q.temp = A * x
+    mul!(Q.temp, Q.A, x)
+    # Qx = A' * Q.temp
+    mul!(Qx, Q.AT, Q.temp)
 end
 
 # Enable CUSPARSE preprocessing for LASSO operator
