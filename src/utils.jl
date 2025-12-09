@@ -1173,7 +1173,7 @@ function build_from_ABST(A::Matrix{Float64}, B::Matrix{Float64},
     A_constraint = sparse(vcat(kron(ee', Id), kron(Id, ee')))
 
     # Create the CPU operator struct (will be transferred to GPU via to_gpu interface)
-    Q_cpu = QAP_Q_operator_cpu(A, B, S, T, n)
+    Q_cpu = QAP_Q_operator_cpu(A, B, S, T, n, zeros(Float64, n^2))
 
     # Create QP_info_cpu with Q operator stored directly in Q field
     # Use to_gpu(qp.Q) to transfer to GPU
@@ -1386,24 +1386,10 @@ function run_dataset(data_path::String, result_path::String, params::HPRQP_param
         powerlist = []
     end
 
-    warm_up_done = false
     for i = 1:length(files)
         file = files[i]
         if occursin(".mps", file) && !(file in namelist)
             FILE_NAME = joinpath(data_path, file)
-            if params.warm_up && !warm_up_done
-                max_iter = params.max_iter
-                params.max_iter = 200
-                warm_up_done = true
-                println("warm up starts: ---------------------------------------------------------------------------------------------------------- ")
-                t_start_all = time()
-                model = build_from_mps(FILE_NAME, verbose=false)
-                results = optimize(model, params)
-                params.max_iter = max_iter
-                all_time = time() - t_start_all
-                println("warm up time: ", all_time)
-                println("warm up ends ----------------------------------------------------------------------------------------------------------")
-            end
             println(@sprintf("solving the problem %d", i), @sprintf(": %s", file))
 
             redirect_stdout(io) do

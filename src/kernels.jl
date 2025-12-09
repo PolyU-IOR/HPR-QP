@@ -445,7 +445,6 @@ CUDA.@fastmath @inline function unified_update_y_kernel_partial!(::Val{UseCustom
         y_bar_i = fact2 * corr
         y_new = Halpern_fact1 * last_y_i + Halpern_fact2 * (2.0 * y_bar_i - y_i)
 
-        y_bar[i] = y_bar_i
         y[i] = y_new
     end
     return
@@ -1672,6 +1671,172 @@ function update_zxw_LASSO_cpu!(ws::HPRQP_workspace_cpu,
         end
     end
 end
+
+# ============================================================================
+# CPU Functions for noQ case (empty Q matrix - linear program)
+# ============================================================================
+
+# CPU version of unified_update_zx - for noQ case (empty Q)
+# Updates z and x variables without Q matrix operations
+function unified_update_zx_cpu!(ws::HPRQP_workspace_cpu,
+    Halpern_fact1::Float64,
+    Halpern_fact2::Float64)
+    
+    # Compute AT*y
+    mul!(ws.ATy, ws.AT, ws.y)
+    
+    x = ws.x
+    x_bar = ws.x_bar
+    x_hat = ws.x_hat
+    z_bar = ws.z_bar
+    dx = ws.dx
+    last_x = ws.last_x
+    ATy = ws.ATy
+    c = ws.c
+    l = ws.l
+    u = ws.u
+    sigma = ws.sigma
+    
+    if ws.to_check
+        @simd for i in eachindex(x)
+            @inbounds begin
+                x_i = x[i]
+                last_x_i = last_x[i]
+                ATy_i = ATy[i]
+                c_i = c[i]
+                l_i = l[i]
+                u_i = u[i]
+                
+                # Compute z_raw = x + sigma * (AT*y - c)
+                tmp = ATy_i - c_i
+                z_raw = x_i + sigma * tmp
+                
+                # Project onto bounds [l, u]
+                x_bar_i = min(max(z_raw, l_i), u_i)
+                
+                # Compute x_hat = 2*x_bar - x (for Peaceman-Rachford)
+                x_hat_i = 2.0 * x_bar_i - x_i
+                
+                # Compute z_bar (dual variable for bounds)
+                z_bar_i = (x_bar_i - z_raw) / sigma
+                
+                # Halpern averaging: x_new = alpha*last_x + (1-alpha)*x_hat
+                x_new = muladd(Halpern_fact2, x_hat_i, Halpern_fact1 * last_x_i)
+                
+                # Store results
+                dx[i] = x_bar_i - x_i
+                x_bar[i] = x_bar_i
+                z_bar[i] = z_bar_i
+                x[i] = x_new
+                x_hat[i] = x_hat_i
+            end
+        end
+    else
+        @simd for i in eachindex(x)
+            @inbounds begin
+                x_i = x[i]
+                last_x_i = last_x[i]
+                ATy_i = ATy[i]
+                c_i = c[i]
+                l_i = l[i]
+                u_i = u[i]
+                
+                tmp = ATy_i - c_i
+                z_raw = x_i + sigma * tmp
+                x_bar_i = min(max(z_raw, l_i), u_i)
+                x_hat_i = 2.0 * x_bar_i - x_i
+                x_new = muladd(Halpern_fact2, x_hat_i, Halpern_fact1 * last_x_i)
+                
+                x[i] = x_new
+                x_hat[i] = x_hat_i
+            end
+        end
+    end
+end
+
+# CPU version of unified_update_y_noQ - for noQ case (empty Q)
+# Updates y variable using x_hat directly (no tempv needed since Q is empty)
+function unified_update_y_noQ_cpu!(ws::HPRQP_workspace_cpu,
+    Halpern_fact1::Float64,
+    Halpern_fact2::Float64)
+    
+    if ws.m == 0
+        return
+    end
+    
+    # Compute A*x_hat (no Q corrections needed for noQ case)
+    mul!(ws.Ax, ws.A, ws.x_hat)
+    
+    fact1 = ws.lambda_max_A * ws.sigma
+    fact2 = 1.0 / fact1
+    
+    y = ws.y
+    y_bar = ws.y_bar
+    dy = ws.dy
+    last_y = ws.last_y
+    s = ws.s
+    Ax = ws.Ax
+    AL = ws.AL
+    AU = ws.AU
+    
+    if ws.to_check
+        @simd for i in eachindex(y)
+            @inbounds begin
+                y_i = y[i]
+                last_y_i = last_y[i]
+                Ax_i = Ax[i]
+                AL_i = AL[i]
+                AU_i = AU[i]
+                
+                # Compute s_raw = Ax - fact1*y
+                s_raw = Ax_i - fact1 * y_i
+                
+                # Project onto constraint bounds [AL, AU]
+                s_proj = min(max(s_raw, AL_i), AU_i)
+                
+                # Compute correction
+                corr = s_proj - s_raw
+                
+                # Compute y_bar
+                y_bar_i = fact2 * corr
+                
+                # Compute y_hat = 2*y_bar - y
+                y_hat_i = 2.0 * y_bar_i - y_i
+                
+                # Halpern averaging: y_new = alpha*last_y + (1-alpha)*y_hat
+                y_new = muladd(Halpern_fact2, y_hat_i, Halpern_fact1 * last_y_i)
+                
+                # Store results
+                s[i] = s_proj
+                dy[i] = y_bar_i - y_i
+                y_bar[i] = y_bar_i
+                y[i] = y_new
+            end
+        end
+    else
+        @simd for i in eachindex(y)
+            @inbounds begin
+                y_i = y[i]
+                last_y_i = last_y[i]
+                Ax_i = Ax[i]
+                AL_i = AL[i]
+                AU_i = AU[i]
+                
+                s_raw = Ax_i - fact1 * y_i
+                s_proj = min(max(s_raw, AL_i), AU_i)
+                corr = s_proj - s_raw
+                y_bar_i = fact2 * corr
+                y_hat_i = 2.0 * y_bar_i - y_i
+                y_new = muladd(Halpern_fact2, y_hat_i, Halpern_fact1 * last_y_i)
+                y[i] = y_new
+            end
+        end
+    end
+end
+
+# ============================================================================
+# CPU Functions with Q matrix
+# ============================================================================
 
 # CPU version of update_y
 function update_y_cpu!(ws::HPRQP_workspace_cpu,

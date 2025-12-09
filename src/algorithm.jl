@@ -633,33 +633,39 @@ function main_update_cpu!(ws::HPRQP_workspace_cpu, qp::QP_info_cpu, restart_info
     Halpern_fact1 = 1.0 / (restart_info.inner + 2.0)
     Halpern_fact2 = 1.0 - Halpern_fact1
 
-    # Compute fact1 and fact2 scalars for non-diagonal Q or vector for diagonal Q
-    if qp.Q_is_diag
-        # Use precomputed fact1/fact2 vectors for diagonal Q
-        fact1_scalar = 0.0  # Not used for diagonal Q
-        fact2_scalar = 0.0  # Not used for diagonal Q
-    else
-        # Compute scalar factors for non-diagonal Q
+    # Check if Q is empty (noQ case - linear program)
+    is_noQ = isa(qp.Q, SparseMatrixCSC) && length(qp.Q.nzval) == 0
+    
+    if is_noQ
+        # Empty Q case (linear program) - use unified noQ kernels
+        unified_update_zx_cpu!(ws, Halpern_fact1, Halpern_fact2)
+        unified_update_y_noQ_cpu!(ws, Halpern_fact1, Halpern_fact2)
+    elseif isa(qp.Q, LASSO_Q_operator_cpu)
+        # LASSO-specific update with soft-thresholding
+        # Compute fact scalars for LASSO
         fact2_scalar = 1.0 / (1.0 + ws.sigma * ws.lambda_max_Q)
         fact1_scalar = 1.0 - fact2_scalar
-    end
-
-    # Step 1: Update z, x, and initial w_bar (without AT*y_bar correction)
-    if isa(qp.Q, LASSO_Q_operator_cpu)
-        # LASSO-specific update with soft-thresholding
         update_zxw_LASSO_cpu!(ws, fact1_scalar, fact2_scalar, Halpern_fact1, Halpern_fact2)
     else
         # Standard QP update (sparse matrix or QAP operator)
+        # Compute fact1 and fact2 scalars for non-diagonal Q or vector for diagonal Q
+        if qp.Q_is_diag
+            # Use precomputed fact1/fact2 vectors for diagonal Q
+            fact1_scalar = 0.0  # Not used for diagonal Q
+            fact2_scalar = 0.0  # Not used for diagonal Q
+        else
+            # Compute scalar factors for non-diagonal Q
+            fact2_scalar = 1.0 / (1.0 + ws.sigma * ws.lambda_max_Q)
+            fact1_scalar = 1.0 - fact2_scalar
+        end
+        
+        # Step 1: Update z, x, and first w_bar (without AT*y_bar correction)
         update_zxw1_cpu!(ws, fact1_scalar, fact2_scalar, Halpern_fact1, Halpern_fact2, qp.Q_is_diag)
+        # Step 2: Update dual variables y (computes y_bar)
+        update_y_cpu!(ws, Halpern_fact1, Halpern_fact2)
+        # Step 3: Complete w update using the new y_bar (adds AT*y_bar correction)
+        update_w2_cpu!(ws, Halpern_fact1, Halpern_fact2, qp.Q_is_diag)
     end
-
-    # Step 2: Update dual variables y (computes y_bar)
-    update_y_cpu!(ws, Halpern_fact1, Halpern_fact2)
-
-    # Step 3: Complete w update using the new y_bar (adds AT*y_bar correction)
-    update_w2_cpu!(ws, Halpern_fact1, Halpern_fact2, qp.Q_is_diag)
-
-
 end
 
 # ============================================================================
@@ -2151,6 +2157,7 @@ function solve(model::QP_info_cpu, params::HPRQP_parameters)
         elseif params.print_frequency > 0
             ws.to_check = ws.to_check || (rem(next_iter, params.print_frequency) == 0)
         end
+        ws.to_check = true
         # Perform main iteration step (dispatches to GPU or CPU)
         if params.use_gpu
             perform_iteration_step!(ws, qp, params, restart_info, spmv_mode_Q, spmv_mode_A, iter, check_iter)
