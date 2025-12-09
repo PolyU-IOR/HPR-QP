@@ -15,6 +15,7 @@ struct QAP_Q_operator_cpu <: AbstractQOperatorCPU
     S::Matrix{Float64}
     T::Matrix{Float64}
     n::Int
+    temp::Vector{Float64}  # Temporary storage for intermediate computation
 end
 
 # GPU version: stores problem data on GPU
@@ -31,6 +32,7 @@ end
 # Interface implementations for QAP
 get_temp_size(Q::QAP_Q_operator_cpu) = Q.n^2
 get_operator_name(::Type{QAP_Q_operator_gpu}) = "QAP"
+get_operator_name(::Type{QAP_Q_operator_cpu}) = "QAP"
 get_problem_size(Q::QAP_Q_operator_cpu) = Q.n^2
 get_problem_size(Q::QAP_Q_operator_gpu) = Q.n^2
 
@@ -64,8 +66,9 @@ end
     n = Q.n
     X = reshape(x, n, n)
     QX = reshape(Qx, n, n)
+    TMP = reshape(Q.temp, n, n)
     # TMP = A * X
-    TMP = Q.A * X
+    mul!(TMP, Q.A, X)
     # QX = 2*(TMP * B - S*X - X*T)
     mul!(QX, TMP, Q.B, 2.0, 0.0)
     mul!(QX, Q.S, X, -2.0, 1.0)
