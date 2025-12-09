@@ -620,6 +620,26 @@ function allocate_workspace_cpu(qp::QP_info_cpu, params::HPRQP_parameters,
             ws.ATy .= ws.ATy_bar
             ws.last_ATy .= ws.ATy_bar
         end
+
+        # Compute z_bar from Rd = 0: z = Qx + c - A^T y
+        # Use the Qmap! function which works for both sparse matrices and Q operators
+        if isa(qp.Q, SparseMatrixCSC)
+            mul!(ws.Qx, qp.Q, ws.x_bar)
+        else
+            # For Q operators (QAP, LASSO, etc.), Qmap! is defined in their respective files
+            Qmap!(ws.x_bar, ws.Qx, qp.Q)
+        end
+        # Then z_bar = Qx + c - ATy
+        ws.z_bar .= ws.Qx .+ ws.c .- ws.ATy_bar
+
+        # Compute s for dual objective: s = proj_{[AL,AU]}(Ax - lambda_max_A * sigma * y)
+        if m > 0
+            # Compute Ax
+            mul!(ws.Ax, ws.A, ws.x_bar)
+            # s = proj_{[AL,AU]}(Ax - lambda_max_A * sigma * y)
+            fact1 = ws.lambda_max_A * ws.sigma
+            ws.s .= min.(max.(ws.Ax .- fact1 .* ws.y, ws.AL), ws.AU)
+        end
     end
     return ws
 end
@@ -1174,6 +1194,27 @@ function allocate_workspace_gpu(qp::QP_info_gpu,
             end
             ws.ATy .= ws.ATy_bar
             ws.last_ATy .= ws.ATy_bar
+        end
+
+        # Compute z_bar from Rd = 0: z = Qx + c - A^T y
+        # First compute Qx_bar
+        Qmap!(ws.x_bar, ws.Qx, qp.Q)
+        # Then z_bar = Qx + c - ATy
+        ws.z_bar .= ws.Qx .+ ws.c .- ws.ATy_bar
+
+        # Compute s for dual objective: s = proj_{[AL,AU]}(Ax - lambda_max_A * sigma * y)
+        if m > 0
+            # Compute Ax
+            if ws.spmv_A !== nothing
+                CUDA.CUSPARSE.cusparseSpMV(ws.spmv_A.handle, ws.spmv_A.operator, ws.spmv_A.alpha,
+                    ws.spmv_A.desc_A, ws.spmv_A.desc_x_bar, ws.spmv_A.beta, ws.spmv_A.desc_Ax,
+                    ws.spmv_A.compute_type, ws.spmv_A.alg, ws.spmv_A.buf)
+            else
+                CUDA.CUSPARSE.mv!('N', 1, ws.A, ws.x_bar, 0, ws.Ax, 'O', CUDA.CUSPARSE.CUSPARSE_SPMV_CSR_ALG2)
+            end
+            # s = proj_{[AL,AU]}(Ax - lambda_max_A * sigma * y)
+            fact1 = ws.lambda_max_A * ws.sigma
+            ws.s .= min.(max.(ws.Ax .- fact1 .* ws.y, ws.AL), ws.AU)
         end
     end
 
