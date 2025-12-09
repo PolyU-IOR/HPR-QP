@@ -1419,7 +1419,7 @@ function print_solver_params(params::HPRQP_parameters, qp::Union{QP_info_gpu,QP_
     println("="^80)
     println("SOLVER PARAMETERS:")
     println("  Problem size: m = ", m, ", n = ", n)
-    println("  Device: GPU (device $(params.device_number))")
+    println("  Device: ", params.use_gpu ? "GPU (device $(params.device_number))" : "CPU")
     println("  Stop tolerance: ", params.stoptol)
     println("  Max iterations: ", params.max_iter)
     println("  Time limit: ", params.time_limit, " seconds")
@@ -1613,11 +1613,6 @@ result = optimize(model, params)
 See also: [`build_from_mps`](@ref), [`build_from_QAbc`](@ref)
 """
 function optimize(model::QP_info_cpu, params::HPRQP_parameters)
-    # Setup: GPU device (only if using GPU)
-    if params.use_gpu
-        CUDA.device!(params.device_number)
-    end
-
     # Handle warmup if requested
     if params.warm_up
         if params.verbose
@@ -1994,6 +1989,13 @@ end
 # It handles GPU transfer/CPU setup, scaling, and optimization.
 function solve(model::QP_info_cpu, params::HPRQP_parameters)
     setup_start = time()
+
+    # Validate GPU parameters before attempting GPU operations
+    validate_gpu_parameters!(params)
+    # Setup: GPU device (only if using GPU)
+    if params.use_gpu
+        CUDA.device!(params.device_number)
+    end
 
     # Setup: GPU transfer and scaling
     if params.use_gpu

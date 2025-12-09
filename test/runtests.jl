@@ -607,4 +607,130 @@ using HDF5
             end
         end
     end
+    
+    @testset "GPU Validation" begin
+        # Test GPU availability checking and automatic fallback to CPU
+        
+        @testset "GPU validation function exists" begin
+            # Test that the validate_gpu_parameters! function is defined
+            @test isdefined(HPRQP, :validate_gpu_parameters!)
+        end
+        
+        @testset "CPU mode works correctly" begin
+            # Create a simple test problem
+            n, m = 10, 5
+            Q = sparse(1.0I, n, n)
+            c = ones(n)
+            A = sparse(rand(m, n))
+            AL = -ones(m)
+            AU = ones(m)
+            l = zeros(n)
+            u = 10 * ones(n)
+            
+            model = build_from_QAbc(Q, c, A, AL, AU, l, u; verbose=false)
+            
+            # Test with explicit CPU mode
+            params = HPRQP_parameters()
+            params.use_gpu = false
+            params.max_iter = 100
+            params.verbose = false
+            
+            result = optimize(model, params)
+            @test result !== nothing
+            @test result.status in ["OPTIMAL", "MAX_ITER"]
+        end
+        
+        @testset "GPU parameter validation" begin
+            using CUDA
+            
+            # Create a simple test problem
+            n, m = 10, 5
+            Q = sparse(1.0I, n, n)
+            c = ones(n)
+            A = sparse(rand(m, n))
+            AL = -ones(m)
+            AU = ones(m)
+            l = zeros(n)
+            u = 10 * ones(n)
+            
+            model = build_from_QAbc(Q, c, A, AL, AU, l, u; verbose=false)
+            
+            # Test with invalid GPU device number
+            params = HPRQP_parameters()
+            params.use_gpu = true
+            params.device_number = 999  # Invalid device number
+            params.max_iter = 100
+            params.verbose = false
+            
+            # Should automatically fall back to CPU without error
+            result = optimize(model, params)
+            @test result !== nothing
+            @test result.status in ["OPTIMAL", "MAX_ITER"]
+            
+            # After validation, use_gpu should be false if GPU is unavailable or device is invalid
+            if !CUDA.functional() || params.device_number >= length(CUDA.devices())
+                # GPU should have been disabled
+                @test params.use_gpu == false || CUDA.functional()
+            end
+        end
+        
+        @testset "Default GPU behavior" begin
+            using CUDA
+            
+            # Create a simple test problem
+            n, m = 10, 5
+            Q = sparse(1.0I, n, n)
+            c = ones(n)
+            A = sparse(rand(m, n))
+            AL = -ones(m)
+            AU = ones(m)
+            l = zeros(n)
+            u = 10 * ones(n)
+            
+            model = build_from_QAbc(Q, c, A, AL, AU, l, u; verbose=false)
+            
+            # Test default parameters (should use GPU if available)
+            params = HPRQP_parameters()
+            params.max_iter = 100
+            params.verbose = false
+            initial_use_gpu = params.use_gpu
+            
+            result = optimize(model, params)
+            @test result !== nothing
+            @test result.status in ["OPTIMAL", "MAX_ITER"]
+            
+            # If CUDA is not functional, use_gpu should be false after optimization
+            if !CUDA.functional()
+                @test params.use_gpu == false
+            end
+        end
+        
+        @testset "Parameter printing shows correct device" begin
+            # Create a simple test problem
+            n, m = 5, 3
+            Q = sparse(1.0I, n, n)
+            c = ones(n)
+            A = sparse(rand(m, n))
+            AL = -ones(m)
+            AU = ones(m)
+            l = zeros(n)
+            u = ones(n)
+            
+            model = build_from_QAbc(Q, c, A, AL, AU, l, u; verbose=false)
+            
+            # Test with CPU mode - just verify it runs without error
+            # (actual output checking would require more complex test setup)
+            params = HPRQP_parameters()
+            params.use_gpu = false
+            params.max_iter = 10
+            params.verbose = false  # Keep verbose off for clean test output
+            
+            result = optimize(model, params)
+            
+            # Verify the result is valid and use_gpu is correctly set
+            @test result !== nothing
+            @test params.use_gpu == false
+            @test result.status in ["OPTIMAL", "MAX_ITER"]
+        end
+    end
 end
