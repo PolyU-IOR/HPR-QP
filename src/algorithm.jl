@@ -218,7 +218,6 @@ function update_sigma_gpu!(params::HPRQP_parameters,
     restart_info::HPRQP_restart,
     ws::HPRQP_workspace_gpu,
     qp::QP_info_gpu,
-    Q_is_diag::Bool,
     residuals::HPRQP_residuals,
 )
     if ~params.sigma_fixed && (restart_info.restart_flag >= 1)
@@ -241,8 +240,8 @@ function update_sigma_gpu!(params::HPRQP_parameters,
             a = ws.lambda_max_A * CUDA.dot(ws.dy, ws.dy) - 2 * CUDA.dot(ws.dQw, ws.ATdy)
         end
 
-        if Q_is_diag
-            # if Q_is_diag
+        if ws.Q_is_diag
+            # if ws.Q_is_diag
             a += CUDA.norm(ws.dQw)^2
         else
             a += ws.lambda_max_Q * CUDA.dot(ws.dw, ws.dQw)
@@ -253,7 +252,7 @@ function update_sigma_gpu!(params::HPRQP_parameters,
         end
         a = max(a, 1e-12)
         b = max(b, 1e-12)
-        if Q_is_diag
+        if ws.Q_is_diag
             if ws.m > 0
                 sigma_estimation = golden_Q_diag(a, b, ws.diag_Q, ws.ATdy, ws.QATdy, ws.tempv; lo=1e-12, hi=1e12, tol=1e-13)
             else
@@ -288,7 +287,7 @@ function update_sigma_gpu!(params::HPRQP_parameters,
         # ws.sigma = exp(fact * log(sigma_estimation) + (1 - fact) * log(ws.sigma))
 
         # update Q factors if sigma changes
-        if Q_is_diag
+        if ws.Q_is_diag
             if abs(sigma_old - ws.sigma) > 1e-15
                 update_Q_factors_gpu!(
                     ws.fact2, ws.fact, ws.fact1, ws.fact_M,
@@ -480,7 +479,7 @@ function compute_residuals_cpu!(ws::HPRQP_workspace_cpu,
 end
 
 # CPU version of compute M norm
-function compute_M_norm_cpu!(ws::HPRQP_workspace_cpu, qp::QP_info_cpu, Q_is_diag::Bool)
+function compute_M_norm_cpu!(ws::HPRQP_workspace_cpu, qp::QP_info_cpu)
     M_1 = 0.0
     M_2 = (1.0 / ws.sigma) * dot(ws.dx, ws.dx)
     M_3 = 0.0
@@ -492,7 +491,7 @@ function compute_M_norm_cpu!(ws::HPRQP_workspace_cpu, qp::QP_info_cpu, Q_is_diag
         Qmap!(ws.ATdy, ws.QATdy, qp.Q)
         M_1 -= 2.0 * ws.sigma * dot(ws.dQw, ws.ATdy)
         M_2 += 2.0 * dot(ws.ATdy, ws.dx)
-        if Q_is_diag
+        if ws.Q_is_diag
             ws.ATdy .*= ws.fact_M
             M_3 = dot(ws.ATdy, ws.QATdy)
             M_1 += ws.sigma * dot(ws.dQw, ws.dQw)
@@ -500,7 +499,7 @@ function compute_M_norm_cpu!(ws::HPRQP_workspace_cpu, qp::QP_info_cpu, Q_is_diag
             M_3 = (ws.sigma^2) / (1.0 + ws.sigma * ws.lambda_max_Q) * dot(ws.ATdy, ws.QATdy)
             M_1 += ws.sigma * ws.lambda_max_Q * dot(ws.dw, ws.dQw)
         end
-    elseif !Q_is_diag
+    elseif !ws.Q_is_diag
         M_1 = ws.sigma * ws.lambda_max_Q * dot(ws.dw, ws.dQw)
     end
     M_2 += max(M_1, 0.0)
@@ -511,7 +510,8 @@ end
 
 # CPU version of allocate workspace
 function allocate_workspace_cpu(qp::QP_info_cpu, params::HPRQP_parameters,
-    lambda_max_A::Float64, lambda_max_Q::Float64, scaling_info::Scaling_info_cpu)
+    lambda_max_A::Float64, lambda_max_Q::Float64, scaling_info::Scaling_info_cpu,
+    diag_Q::Vector{Float64}, Q_is_diag::Bool)
     ws = HPRQP_workspace_cpu()
     m, n = size(qp.A)
     ws.m = m
@@ -556,7 +556,8 @@ function allocate_workspace_cpu(qp::QP_info_cpu, params::HPRQP_parameters,
     ws.last_w = zeros(Float64, n)
     ws.last_ATy = zeros(Float64, n)
     ws.tempv = zeros(Float64, n)
-    ws.diag_Q = qp.diag_Q
+    ws.Q_is_diag = Q_is_diag
+    ws.diag_Q = diag_Q
     ws.fact1 = zeros(Float64, n)
     ws.fact2 = zeros(Float64, n)
     ws.fact = zeros(Float64, n)
@@ -576,7 +577,7 @@ function allocate_workspace_cpu(qp::QP_info_cpu, params::HPRQP_parameters,
     else
         error("Invalid sigma value: ", params.sigma, ". It should be a positive number or -1 for automatic.")
     end
-    if qp.Q_is_diag
+    if ws.Q_is_diag
         for i in 1:n
             temp = 1.0 + ws.sigma * ws.diag_Q[i]
             ws.fact1[i] = 1.0 / temp
@@ -669,7 +670,7 @@ function main_update_cpu!(ws::HPRQP_workspace_cpu, qp::QP_info_cpu, restart_info
     else
         # Standard QP update (sparse matrix or QAP operator)
         # Compute fact1 and fact2 scalars for non-diagonal Q or vector for diagonal Q
-        if qp.Q_is_diag
+        if ws.Q_is_diag
             # Use precomputed fact1/fact2 vectors for diagonal Q
             fact1_scalar = 0.0  # Not used for diagonal Q
             fact2_scalar = 0.0  # Not used for diagonal Q
@@ -680,11 +681,11 @@ function main_update_cpu!(ws::HPRQP_workspace_cpu, qp::QP_info_cpu, restart_info
         end
         
         # Step 1: Update z, x, and first w_bar (without AT*y_bar correction)
-        update_zxw1_cpu!(ws, fact1_scalar, fact2_scalar, Halpern_fact1, Halpern_fact2, qp.Q_is_diag)
+        update_zxw1_cpu!(ws, fact1_scalar, fact2_scalar, Halpern_fact1, Halpern_fact2, ws.Q_is_diag)
         # Step 2: Update dual variables y (computes y_bar)
         update_y_cpu!(ws, Halpern_fact1, Halpern_fact2)
         # Step 3: Complete w update using the new y_bar (adds AT*y_bar correction)
-        update_w2_cpu!(ws, Halpern_fact1, Halpern_fact2, qp.Q_is_diag)
+        update_w2_cpu!(ws, Halpern_fact1, Halpern_fact2, ws.Q_is_diag)
     end
 end
 
@@ -696,7 +697,6 @@ function update_sigma_cpu!(params::HPRQP_parameters,
     restart_info::HPRQP_restart,
     ws::HPRQP_workspace_cpu,
     qp::QP_info_cpu,
-    Q_is_diag::Bool,
     residuals::HPRQP_residuals,
 )
     if ~params.sigma_fixed && (restart_info.restart_flag >= 1)
@@ -719,8 +719,8 @@ function update_sigma_cpu!(params::HPRQP_parameters,
             a = ws.lambda_max_A * dot(ws.dy, ws.dy) - 2 * dot(ws.dQw, ws.ATdy)
         end
 
-        if Q_is_diag
-            # if Q_is_diag
+        if ws.Q_is_diag
+            # if ws.Q_is_diag
             a += norm(ws.dQw)^2
         else
             a += ws.lambda_max_Q * dot(ws.dw, ws.dQw)
@@ -731,7 +731,7 @@ function update_sigma_cpu!(params::HPRQP_parameters,
         end
         a = max(a, 1e-12)
         b = max(b, 1e-12)
-        if Q_is_diag
+        if ws.Q_is_diag
             if ws.m > 0
                 sigma_estimation = golden_Q_diag_cpu(a, b, ws.diag_Q, ws.ATdy, ws.QATdy, ws.tempv; lo=1e-12, hi=1e12, tol=1e-13)
             else
@@ -1006,7 +1006,7 @@ function print_problem_info(qp::QP_info_cpu, params::HPRQP_parameters)
         q_nnz = nnz(qp.Q)
         println("Q Matrix: $(q_size)×$(q_size), nnz = $q_nnz")
         if q_nnz > 0
-            println("Q is Diagonal: $(qp.Q_is_diag)")
+            println("Q is Diagonal: $(ws.Q_is_diag)")
         end
     elseif isa(qp.Q, AbstractQOperatorCPU)
         op_name = get_operator_name(typeof(qp.Q))
@@ -1034,6 +1034,8 @@ function allocate_workspace_gpu(qp::QP_info_gpu,
     lambda_max_A::Float64,
     lambda_max_Q::Float64,
     scaling_info::Scaling_info_gpu,
+    diag_Q::Vector{Float64},
+    Q_is_diag::Bool,
 )
     ws = HPRQP_workspace_gpu()
     m, n = size(qp.A)
@@ -1055,7 +1057,8 @@ function allocate_workspace_gpu(qp::QP_info_gpu,
     # println("initial sigma = ", ws.sigma)
     ws.lambda_max_A = lambda_max_A
     ws.lambda_max_Q = lambda_max_Q
-    ws.diag_Q = qp.diag_Q
+    ws.Q_is_diag = Q_is_diag
+    ws.diag_Q = CuVector(diag_Q)
     ws.w = CUDA.zeros(Float64, n)
     ws.w_hat = CUDA.zeros(Float64, n)
     ws.w_bar = CUDA.zeros(Float64, n)
@@ -1281,11 +1284,11 @@ function main_update_gpu!(ws::HPRQP_workspace_gpu,
     if length(qp.Q.nzVal) > 0
         # Standard case with Q matrix - use unified kernels with separate Q and A modes
         unified_update_zxw1_gpu!(ws, qp, Halpern_fact1, Halpern_fact2;
-            spmv_mode_Q=spmv_mode_Q, spmv_mode_A=spmv_mode_A, is_diag_Q=qp.Q_is_diag, compute_full=compute_full)
+            spmv_mode_Q=spmv_mode_Q, spmv_mode_A=spmv_mode_A, is_diag_Q=ws.Q_is_diag, compute_full=compute_full)
         unified_update_y_gpu!(ws, Halpern_fact1, Halpern_fact2;
             spmv_mode_Q=spmv_mode_Q, spmv_mode_A=spmv_mode_A, compute_full=compute_full)
         unified_update_w2_gpu!(ws, Halpern_fact1, Halpern_fact2;
-            spmv_mode_Q=spmv_mode_Q, spmv_mode_A=spmv_mode_A, is_diag_Q=qp.Q_is_diag, compute_full=compute_full)
+            spmv_mode_Q=spmv_mode_Q, spmv_mode_A=spmv_mode_A, is_diag_Q=ws.Q_is_diag, compute_full=compute_full)
     else
         # Empty Q case (linear program) - use unified kernels with A mode only
         unified_update_zx_gpu!(ws, Halpern_fact1, Halpern_fact2; spmv_mode_A=spmv_mode_A, compute_full=compute_full)
@@ -1294,7 +1297,7 @@ function main_update_gpu!(ws::HPRQP_workspace_gpu,
 end
 
 # This function computes the M norm for the HPR-QP algorithm on GPU.
-function compute_M_norm_gpu!(ws::HPRQP_workspace_gpu, qp::QP_info_gpu, Q_is_diag::Bool)
+function compute_M_norm_gpu!(ws::HPRQP_workspace_gpu, qp::QP_info_gpu)
     # Initialize M terms
     M_1 = 0.0
     M_2 = 1 / ws.sigma * CUDA.dot(ws.dx, ws.dx)
@@ -1312,7 +1315,7 @@ function compute_M_norm_gpu!(ws::HPRQP_workspace_gpu, qp::QP_info_gpu, Q_is_diag
         M_1 -= 2 * ws.sigma * CUDA.dot(ws.dQw, ws.ATdy)
         M_2 += 2 * CUDA.dot(ws.ATdy, ws.dx)
 
-        if Q_is_diag
+        if ws.Q_is_diag
             ws.ATdy .*= ws.fact_M
             M_3 = CUDA.dot(ws.ATdy, ws.QATdy) # sGS term
             M_1 += ws.sigma * CUDA.dot(ws.dQw, ws.dQw)
@@ -1322,7 +1325,7 @@ function compute_M_norm_gpu!(ws::HPRQP_workspace_gpu, qp::QP_info_gpu, Q_is_diag
         end
     else
         # No constraints case: only add Q-related term to M_1
-        if !Q_is_diag
+        if !ws.Q_is_diag
             M_1 = ws.sigma * ws.lambda_max_Q * CUDA.dot(ws.dw, ws.dQw)
         end
     end
@@ -1371,8 +1374,6 @@ function transfer_to_gpu(model::QP_info_cpu, params::HPRQP_parameters)
         CuVector(model.l),
         CuVector(model.u),
         model.obj_constant,
-        CuVector(model.diag_Q),
-        model.Q_is_diag,
         lambda_gpu,
     )
 
@@ -1392,7 +1393,7 @@ function scale_on_gpu!(qp::QP_info_gpu, params::HPRQP_parameters)
     end
     t_start = time()
 
-    scaling_info_gpu = scaling_gpu!(qp, params)
+    scaling_info_gpu, diag_Q, Q_is_diag = scaling_gpu!(qp, params)
     CUDA.synchronize()
 
     scaling_time = time() - t_start
@@ -1400,7 +1401,7 @@ function scale_on_gpu!(qp::QP_info_gpu, params::HPRQP_parameters)
         println(@sprintf("GPU SCALING time: %.2f seconds", scaling_time))
     end
 
-    return scaling_info_gpu, scaling_time
+    return scaling_info_gpu, scaling_time, diag_Q, Q_is_diag
 end
 
 # Print QP problem information
@@ -1436,7 +1437,7 @@ function print_problem_info(qp::QP_info_gpu, params::HPRQP_parameters)
         q_nnz = length(qp.Q.nzVal)
         println("Q Matrix: $(q_size)×$(q_size), nnz = $q_nnz")
         if q_nnz > 0
-            println("Q is Diagonal: $(qp.Q_is_diag)")
+            println("Q is Diagonal: $(ws.Q_is_diag)")
         end
     elseif isa(qp.Q, AbstractQOperator)
         op_name = get_operator_name(typeof(qp.Q))
@@ -1525,7 +1526,7 @@ function print_solver_params(params::HPRQP_parameters, qp::Union{QP_info_gpu,QP_
 end
 
 # Estimate maximum eigenvalues using power iteration
-function estimate_eigenvalues(qp::QP_info_gpu, params::HPRQP_parameters)
+function estimate_eigenvalues(qp::QP_info_gpu, params::HPRQP_parameters, Q_is_diag::Bool)
     if params.verbose
         println("ESTIMATING MAXIMUM EIGENVALUES ...")
     end
@@ -1548,7 +1549,7 @@ function estimate_eigenvalues(qp::QP_info_gpu, params::HPRQP_parameters)
         lambda_max_Q = power_iteration_Q_gpu(qp.Q) * params.eig_factor
     elseif isa(qp.Q, CuSparseMatrixCSR)
         if length(qp.Q.nzVal) > 0
-            if !qp.Q_is_diag
+            if !Q_is_diag
                 lambda_max_Q = power_iteration_Q_gpu(qp.Q) * params.eig_factor
             else
                 lambda_max_Q = maximum(qp.Q.nzVal)
@@ -2022,11 +2023,11 @@ function perform_iteration_step!(ws::HPRQP_workspace_gpu, qp::QP_info_gpu,
 
     # Compute M norm for restart decision
     if restart_info.restart_flag > 0
-        restart_info.last_gap = compute_M_norm_gpu!(ws, qp, qp.Q_is_diag)
+        restart_info.last_gap = compute_M_norm_gpu!(ws, qp)
     end
 
     if rem(iter + 1, check_iter) == 0
-        restart_info.current_gap = compute_M_norm_gpu!(ws, qp, qp.Q_is_diag)
+        restart_info.current_gap = compute_M_norm_gpu!(ws, qp)
     end
 
     restart_info.inner += 1
@@ -2045,12 +2046,13 @@ function solve(model::QP_info_cpu, params::HPRQP_parameters)
     end
 
     # Setup: GPU transfer and scaling
+    diag_Q, Q_is_diag = nothing, false
     if params.use_gpu
         qp, transfer_time = transfer_to_gpu(model, params)
-        scaling_info, _ = scale_on_gpu!(qp, params)
+        scaling_info, _, diag_Q, Q_is_diag = scale_on_gpu!(qp, params)
     else
         qp = deepcopy(model)  # Work on a copy to avoid modifying original
-        scaling_info, _ = scale_on_cpu!(qp, params)
+        scaling_info, _, diag_Q, Q_is_diag = scale_on_cpu!(qp, params)
     end
 
     setup_time = time() - setup_start
@@ -2061,7 +2063,7 @@ function solve(model::QP_info_cpu, params::HPRQP_parameters)
 
     # Estimate eigenvalues
     if params.use_gpu
-        lambda_max_A, lambda_max_Q, power_time = estimate_eigenvalues(qp, params)
+        lambda_max_A, lambda_max_Q, power_time = estimate_eigenvalues(qp, params, Q_is_diag)
     else
         # CPU eigenvalue estimation - use scaled qp, not original model
         power_time_start = time()
@@ -2070,7 +2072,7 @@ function solve(model::QP_info_cpu, params::HPRQP_parameters)
             power_iteration_Q_cpu(qp.Q, 5000, 1e-4) * params.eig_factor
         elseif isa(qp.Q, SparseMatrixCSC)
             if length(qp.Q.nzval) > 0
-                if !qp.Q_is_diag
+                if !Q_is_diag
                     power_iteration_Q_cpu(qp.Q, 5000, 1e-4) * params.eig_factor
                 else
                     maximum(qp.Q.nzval)
@@ -2089,10 +2091,10 @@ function solve(model::QP_info_cpu, params::HPRQP_parameters)
     restart_info = initialize_restart()
     spmv_mode_Q, spmv_mode_A = "", ""
     if params.use_gpu
-        ws = allocate_workspace_gpu(qp, params, lambda_max_A, lambda_max_Q, scaling_info)
+        ws = allocate_workspace_gpu(qp, params, lambda_max_A, lambda_max_Q, scaling_info, diag_Q, Q_is_diag)
         spmv_mode_Q, spmv_mode_A = determine_spmv_mode(qp, params, ws)
     else
-        ws = allocate_workspace_cpu(qp, params, lambda_max_A, lambda_max_Q, scaling_info)
+        ws = allocate_workspace_cpu(qp, params, lambda_max_A, lambda_max_Q, scaling_info, diag_Q, Q_is_diag)
     end
     # Initialize best_sigma with the initial sigma value
     restart_info.best_sigma = ws.sigma
@@ -2105,7 +2107,7 @@ function solve(model::QP_info_cpu, params::HPRQP_parameters)
     first_4, first_6 = true, true
 
     # Update Q factors for diagonal Q
-    if qp.Q_is_diag
+    if ws.Q_is_diag
         if isa(qp.Q, CuSparseMatrixCSR)
             update_Q_factors_gpu!(ws.fact2, ws.fact, ws.fact1, ws.fact_M,
                 ws.diag_Q, ws.sigma)
@@ -2144,7 +2146,7 @@ function solve(model::QP_info_cpu, params::HPRQP_parameters)
         # Check and perform restart if needed
         check_restart(restart_info, iter, check_iter, ws.sigma)
         # Update sigma parameter (dispatches to GPU or CPU version)
-        update_sigma!(params, restart_info, ws, qp, qp.Q_is_diag, residuals)
+        update_sigma!(params, restart_info, ws, qp, residuals)
 
         # Perform restart
         if params.use_gpu
@@ -2206,11 +2208,11 @@ function solve(model::QP_info_cpu, params::HPRQP_parameters)
             main_update!(ws, qp, restart_info)
             # Compute M norm for restart decision
             if restart_info.restart_flag > 0
-                restart_info.last_gap = compute_M_norm_cpu!(ws, qp, qp.Q_is_diag)
+                restart_info.last_gap = compute_M_norm_cpu!(ws, qp)
             end
 
             if rem(iter + 1, check_iter) == 0
-                restart_info.current_gap = compute_M_norm_cpu!(ws, qp, qp.Q_is_diag)
+                restart_info.current_gap = compute_M_norm_cpu!(ws, qp)
             end
 
             restart_info.inner += 1

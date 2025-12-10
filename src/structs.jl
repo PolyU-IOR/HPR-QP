@@ -64,8 +64,6 @@ mutable struct QP_info_cpu
     l::Vector{Float64}
     u::Vector{Float64}
     obj_constant::Float64
-    diag_Q::Vector{Float64}
-    Q_is_diag::Bool
     lambda::Float64  # Regularization parameter for LASSO (0.0 for other problems)
 end
 
@@ -81,8 +79,6 @@ mutable struct QP_info_gpu
     l::CuVector{Float64}
     u::CuVector{Float64}
     obj_constant::Float64
-    diag_Q::CuVector{Float64}
-    Q_is_diag::Bool
     lambda::CuVector{Float64}  # Regularization parameter for LASSO problems
 end
 
@@ -410,6 +406,7 @@ mutable struct HPRQP_workspace_gpu
     last_w::CuVector{Float64}
     last_ATy::CuVector{Float64}
     tempv::CuVector{Float64}
+    Q_is_diag::Bool
     diag_Q::CuVector{Float64}
     fact1::CuVector{Float64}
     fact2::CuVector{Float64}
@@ -473,6 +470,7 @@ mutable struct HPRQP_workspace_cpu
     last_w::Vector{Float64}
     last_ATy::Vector{Float64}
     tempv::Vector{Float64}
+    Q_is_diag::Bool
     diag_Q::Vector{Float64}
     fact1::Vector{Float64}
     fact2::Vector{Float64}

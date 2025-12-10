@@ -181,152 +181,10 @@ function qp_formulation(Q::SparseMatrixCSC,
     @assert length(AL) == size(A, 1)
 
 
-    standard_qp = QP_info_cpu(Q, c, A, A', AL, AU, l, u, c0, [], false, 0.0)
+    standard_qp = QP_info_cpu(Q, c, A, A', AL, AU, l, u, c0, 0.0)
 
     # Return the modified qp
     return standard_qp
-end
-
-# Scale the QP problem according to the Ruiz scaling method, Pock-Chambolle scaling, or L2 scaling.
-function scaling!(qp::QP_info_cpu, params::HPRQP_parameters)
-    m, n = size(qp.A)
-    row_norm = ones(m)
-    col_norm = ones(n)
-
-    # Preallocate temporary arrays
-    temp_norm_A_row = zeros(m)
-    temp_norm_A_col = zeros(n)
-    temp_norm_Q = zeros(n)
-    DR = spdiagm(temp_norm_A_row)
-    DC = spdiagm(temp_norm_A_col)
-
-    AL_nInf = copy(qp.AL)
-    AU_nInf = copy(qp.AU)
-    AL_nInf[qp.AL.==-Inf] .= 0.0
-    AU_nInf[qp.AU.==Inf] .= 0.0
-    scaling_info = Scaling_info_cpu(copy(qp.l), copy(qp.u), row_norm, col_norm, 1, 1, 1, 1, norm(max.(abs.(AL_nInf), abs.(AU_nInf)), Inf), norm(qp.c, Inf))
-
-    if params.use_Ruiz_scaling
-        for _ in 1:10
-            temp_norm_Q .= maximum(abs, qp.Q, dims=1)[1, :]
-
-            temp_norm_A_col .= maximum(abs, qp.A, dims=1)[1, :]
-            temp_norm_A_col .= sqrt.(max.(temp_norm_A_col, temp_norm_Q))
-            temp_norm_A_col[iszero.(temp_norm_A_col)] .= 1.0
-
-            temp_norm_A_row .= sqrt.(maximum(abs, qp.A, dims=2)[:, 1])
-            temp_norm_A_row[iszero.(temp_norm_A_row)] .= 1.0
-
-            row_norm .*= temp_norm_A_row
-            col_norm .*= temp_norm_A_col
-
-
-            DR .= spdiagm(1.0 ./ temp_norm_A_row)
-            DC .= spdiagm(1.0 ./ temp_norm_A_col)
-
-            qp.Q .= DC * qp.Q * DC
-            qp.c ./= temp_norm_A_col
-            qp.A .= DR * qp.A * DC
-
-            qp.AL ./= temp_norm_A_row
-            qp.AU ./= temp_norm_A_row
-            qp.l .*= temp_norm_A_col
-            qp.u .*= temp_norm_A_col
-        end
-    end
-
-    if params.use_bc_scaling
-        b_scale = 1 + norm(max.(abs.(AL_nInf), abs.(AU_nInf)))
-        c_scale = 1 + norm(qp.c)
-        println("b_scale: ", b_scale)
-        println("c_scale: ", c_scale)
-        qp.Q .*= b_scale / c_scale
-        qp.AL ./= b_scale
-        qp.AU ./= b_scale
-        qp.c ./= c_scale
-        qp.l ./= b_scale
-        qp.u ./= b_scale
-        scaling_info.b_scale = b_scale
-        scaling_info.c_scale = c_scale
-    else
-        scaling_info.b_scale = 1.0
-        scaling_info.c_scale = 1.0
-    end
-
-    if params.use_l2_scaling
-        # compute the l2 norm of the rows and columns of A
-        temp_norm_Q .= sum(t -> t^2, qp.Q, dims=1)[1, :]
-        temp_norm_A_col .= sum(t -> t^2, qp.A, dims=1)[1, :]
-        temp_norm_A_col .= sqrt.(temp_norm_A_col .+ temp_norm_Q)
-        temp_norm_A_col[iszero.(temp_norm_A_col)] .= 1.0
-
-        temp_norm_A_row .= sqrt.(sum(t -> t^2, qp.A, dims=2)[:, 1])
-        temp_norm_A_row[iszero.(temp_norm_A_row)] .= 1.0
-
-        row_norm .*= temp_norm_A_row
-        col_norm .*= temp_norm_A_col
-
-        DR .= spdiagm(1.0 ./ temp_norm_A_row)
-        DC .= spdiagm(1.0 ./ temp_norm_A_col)
-
-        qp.Q .= DC * qp.Q * DC
-        qp.c ./= temp_norm_A_col
-        qp.A .= DR * qp.A * DC
-        qp.x0 .*= temp_norm_A_col
-        qp.y0 .*= temp_norm_A_row
-
-        qp.AL ./= temp_norm_A_row
-        qp.AU ./= temp_norm_A_row
-        qp.l .*= temp_norm_A_col
-        qp.u .*= temp_norm_A_col
-    end
-
-    if params.use_Pock_Chambolle_scaling
-        temp_norm_Q .= sum(abs, qp.Q, dims=1)[1, :]
-        temp_norm_A_col .= sum(abs, qp.A, dims=1)[1, :]
-        temp_norm_A_col .= sqrt.(temp_norm_A_col .+ temp_norm_Q)
-        temp_norm_A_col[iszero.(temp_norm_A_col)] .= 1.0
-
-        temp_norm_A_row .= sqrt.(sum(abs, qp.A, dims=2)[:, 1])
-        temp_norm_A_row[iszero.(temp_norm_A_row)] .= 1.0
-
-        row_norm .*= temp_norm_A_row
-        col_norm .*= temp_norm_A_col
-
-        DR .= spdiagm(1.0 ./ temp_norm_A_row)
-        DC .= spdiagm(1.0 ./ temp_norm_A_col)
-
-        qp.Q .= DC * qp.Q * DC
-        qp.c ./= temp_norm_A_col
-        qp.A .= DR * qp.A * DC
-
-        qp.AL ./= temp_norm_A_row
-        qp.AU ./= temp_norm_A_row
-        qp.l .*= temp_norm_A_col
-        qp.u .*= temp_norm_A_col
-    end
-
-    temp_norm_Q .= sum(abs, qp.Q, dims=1)[1, :]
-
-    # the diagonal matrix of the Q matrix
-    diag_Q = diag(qp.Q)
-    Q_is_diag = (sum(temp_norm_Q .== diag_Q) == length(temp_norm_Q))
-    qp.Q_is_diag = Q_is_diag
-    qp.diag_Q = diag_Q
-
-
-    AL_nInf = copy(qp.AL)
-    AU_nInf = copy(qp.AU)
-    AL_nInf[qp.AL.==-Inf] .= 0.0
-    AU_nInf[qp.AU.==Inf] .= 0.0
-    scaling_info.norm_b = norm(max.(abs.(AL_nInf), abs.(AU_nInf)))
-    scaling_info.norm_c = norm(qp.c)
-    qp.AT = qp.A'
-    # eliminate the numerical error cause the asymmetry of Q
-    qp.Q = (qp.Q + transpose(qp.Q)) / 2
-    scaling_info.row_norm = row_norm
-    scaling_info.col_norm = col_norm
-    return scaling_info
 end
 
 # CPU-based scaling function for the QP problem (similar to GPU version)
@@ -362,7 +220,11 @@ function scaling_cpu!(qp::QP_info_cpu, params::HPRQP_parameters)
         scaling_info.norm_b = m > 0 ? norm(max.(abs.(AL_nInf), abs.(AU_nInf))) : 0.0
         scaling_info.norm_c = norm(qp.c)
 
-        return scaling_info
+        # For operator-based problems, Q is not a diagonal matrix
+        diag_Q = zeros(Float64, n)
+        Q_is_diag = false
+
+        return scaling_info, diag_Q, Q_is_diag
     end
 
     # For sparse Q, proceed with normal scaling
@@ -511,13 +373,11 @@ function scaling_cpu!(qp::QP_info_cpu, params::HPRQP_parameters)
 
     # Update diagonal of Q if Q is sparse
     # Extract diagonal from Q matrix
-    diag_Q_cpu = diag(qp.Q)
-    qp.diag_Q = diag_Q_cpu
+    diag_Q_cpu = Vector(diag(qp.Q))
 
     # Check if Q is diagonal
     temp_norm_Q = vec(sum(abs, qp.Q, dims=1))
     Q_is_diag = (sum(temp_norm_Q .== abs.(diag_Q_cpu)) == length(temp_norm_Q))
-    qp.Q_is_diag = Q_is_diag
 
     # Symmetrize Q to eliminate numerical errors
     qp.Q = (qp.Q + transpose(qp.Q)) / 2
@@ -533,7 +393,7 @@ function scaling_cpu!(qp::QP_info_cpu, params::HPRQP_parameters)
     scaling_info.row_norm = row_norm
     scaling_info.col_norm = col_norm
 
-    return scaling_info
+    return scaling_info, diag_Q_cpu, Q_is_diag
 end
 
 # Wrapper function for CPU scaling (similar to scale_on_gpu for consistency)
@@ -543,7 +403,7 @@ function scale_on_cpu!(qp::QP_info_cpu, params::HPRQP_parameters)
     end
     t_start = time()
 
-    scaling_info_cpu = scaling_cpu!(qp, params)
+    scaling_info_cpu, diag_Q, Q_is_diag = scaling_cpu!(qp, params)
     CUDA.synchronize()
 
     scaling_time = time() - t_start
@@ -551,7 +411,7 @@ function scale_on_cpu!(qp::QP_info_cpu, params::HPRQP_parameters)
         println(@sprintf("CPU SCALING time: %.2f seconds", scaling_time))
     end
 
-    return scaling_info_cpu, scaling_time
+    return scaling_info_cpu, scaling_time, diag_Q, Q_is_diag
 end
 
 # GPU-based scaling function for the QP problem
@@ -586,7 +446,11 @@ function scaling_gpu!(qp::QP_info_gpu, params::HPRQP_parameters)
         scaling_info.norm_b = m > 0 ? CUDA.norm(max.(abs.(AL_nInf), abs.(AU_nInf))) : 0.0
         scaling_info.norm_c = CUDA.norm(qp.c)
 
-        return scaling_info
+        # For operator-based problems, Q is not a diagonal matrix
+        diag_Q = zeros(Float64, n)
+        Q_is_diag = false
+
+        return scaling_info, diag_Q, Q_is_diag
     end
 
     # For sparse Q, proceed with normal scaling
@@ -840,13 +704,11 @@ function scaling_gpu!(qp::QP_info_gpu, params::HPRQP_parameters)
     diag_Q = CUDA.zeros(Float64, n)
     # This is a simple approach - extract diagonal elements
     Q_cpu = SparseMatrixCSC(qp.Q)
-    diag_Q_cpu = diag(Q_cpu)
-    qp.diag_Q = CuVector(diag_Q_cpu)
+    diag_Q_cpu = Vector(diag(Q_cpu))
 
     # Check if Q is diagonal
     temp_norm_Q = sum(abs, Q_cpu, dims=1)[1, :]
     Q_is_diag = (sum(temp_norm_Q .== abs.(diag_Q_cpu)) == length(temp_norm_Q))
-    qp.Q_is_diag = Q_is_diag
 
     # Symmetrize Q to eliminate numerical errors
     Q_cpu = (Q_cpu + transpose(Q_cpu)) / 2
@@ -864,7 +726,7 @@ function scaling_gpu!(qp::QP_info_gpu, params::HPRQP_parameters)
     scaling_info.row_norm = row_norm
     scaling_info.col_norm = col_norm
 
-    return scaling_info
+    return scaling_info, diag_Q_cpu, Q_is_diag
 end
 
 function mean(x::Vector{Float64})
@@ -1187,8 +1049,6 @@ function build_from_ABST(A::Matrix{Float64}, B::Matrix{Float64},
         zeros(Float64, n^2),  # l (lower bounds = 0)
         fill(Inf, n^2),  # u (upper bounds = Inf)
         0.0,  # obj_constant
-        Float64[],  # diag_Q (empty for operator)
-        false,  # Q_is_diag
         0.0,  # lambda (not used for QAP)
     )
 
@@ -1276,8 +1136,6 @@ function build_from_Ab_lambda(A::SparseMatrixCSC{Float64}, b::Vector{Float64},
         -Inf * ones(Float64, n),  # l (lower bounds = -Inf, no box constraints)
         Inf * ones(Float64, n),  # u (upper bounds = Inf, no box constraints)
         obj_constant,  # obj_constant = 0.5 * ||b||²
-        Float64[],  # diag_Q (empty for operator)
-        false,  # Q_is_diag
         lambda,  # lambda for LASSO regularization
     )
 
@@ -1455,61 +1313,6 @@ function run_dataset(data_path::String, result_path::String, params::HPRQP_param
     end
 
     close(io)
-end
-
-# ==================== QAP and LASSO Support Functions ====================
-
-# Scaling function for operator-based QP problems (QAP/LASSO)
-function scaling!(qp::QP_info_gpu, params::HPRQP_parameters)
-    m, n = size(qp.A)
-    row_norm = ones(m)
-    col_norm = ones(n)
-
-    AL_nInf = Array(qp.AL)
-    AU_nInf = Array(qp.AU)
-    AL_nInf[AL_nInf.==-Inf] .= 0.0
-    AU_nInf[AU_nInf.==Inf] .= 0.0
-    c_arr = Array(qp.c)
-    l_arr = Array(qp.l)
-
-    scaling_info = Scaling_info_gpu(CuVector(copy(l_arr)), CuVector(copy(l_arr)),
-        CuVector(row_norm), CuVector(col_norm),
-        1.0, 1.0, 1.0, 1.0,
-        norm(max.(abs.(AL_nInf), abs.(AU_nInf)), Inf),
-        norm(c_arr, Inf))
-
-    if params.use_bc_scaling
-        b_norm = norm(min.(AL_nInf, AU_nInf))
-        c_norm = norm(c_arr)
-        b_scale = max(1.0, b_norm, c_norm)
-        c_scale = b_scale
-
-        qp.AL ./= b_scale
-        qp.AU ./= b_scale
-        qp.c ./= c_scale
-        if length(qp.lambda) > 0
-            qp.lambda ./= c_scale
-        end
-        qp.l ./= b_scale
-        qp.u ./= b_scale
-        scaling_info.b_scale = b_scale
-        scaling_info.c_scale = c_scale
-    else
-        scaling_info.b_scale = 1.0
-        scaling_info.c_scale = 1.0
-    end
-
-    AL_nInf = Array(qp.AL)
-    AU_nInf = Array(qp.AU)
-    AL_nInf[AL_nInf.==-Inf] .= 0.0
-    AU_nInf[AU_nInf.==Inf] .= 0.0
-    c_arr = Array(qp.c)
-    scaling_info.norm_b = norm(max.(abs.(AL_nInf), abs.(AU_nInf)))
-    scaling_info.norm_c = norm(c_arr)
-    scaling_info.row_norm = CuVector(row_norm)
-    scaling_info.col_norm = CuVector(col_norm)
-
-    return scaling_info
 end
 
 # ============================================================================
