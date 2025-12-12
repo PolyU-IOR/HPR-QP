@@ -17,6 +17,7 @@ using Dates
 import MathOptInterface as MOI
 
 include("structs.jl")
+include("unified_operations.jl")
 include("utils.jl")
 include("kernels.jl")
 include("algorithm.jl")

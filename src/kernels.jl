@@ -10,6 +10,152 @@
 ##       # Your implementation: Qx .= Q * x
 ##   end
 
+# ============================================================================
+# Unified Kernel Wrapper Functions (CPU and GPU)
+# ============================================================================
+# These functions dispatch based on workspace type, following the Q operator pattern.
+# GPU versions call CUDA kernels, CPU versions use optimized loops.
+# ============================================================================
+
+"""
+    compute_Rd!(ws, sc)
+
+Compute dual residual Rd = (Qx + c - A'y - z) * scale.
+Unified function that dispatches based on workspace type.
+"""
+function compute_Rd!(ws::HPRQP_workspace, sc::HPRQP_scaling)
+    # Compute A'y if constraints exist
+    if ws.m > 0
+        unified_mul!(ws.ATdy, ws.AT, ws.y_bar)
+    end
+    # Compute scaled residual (device-specific implementation via dispatch)
+    _compute_Rd_impl!(ws, sc)
+end
+
+# GPU implementation using kernel
+function _compute_Rd_impl!(ws::HPRQP_workspace_gpu, sc::Scaling_info_gpu)
+    threads, blocks = gpu_launch_config(ws.n)
+    if threads > 0
+        @cuda threads = threads blocks = blocks compute_Rd_kernel!(ws.ATdy, ws.z_bar, ws.c, ws.Qx, ws.Rd, sc.col_norm, sc.c_scale, ws.n)
+    end
+end
+
+# CPU implementation using loop
+function _compute_Rd_impl!(ws::HPRQP_workspace_cpu, sc::Scaling_info_cpu)
+    Rd = ws.Rd
+    ATdy = ws.ATdy
+    z_bar = ws.z_bar
+    Qx = ws.Qx
+    c = ws.c
+    col_norm = sc.col_norm
+
+    @simd for i in eachindex(Rd)
+        @inbounds begin
+            scale_fact = col_norm[i] * sc.c_scale
+            Rd[i] = (Qx[i] + c[i] - ATdy[i] - z_bar[i]) * scale_fact
+            Qx[i] *= scale_fact
+            ATdy[i] *= scale_fact
+        end
+    end
+end
+
+"""
+    compute_Rp!(ws, sc)
+
+Compute primal residual Rp = proj(Ax, [AL, AU]) - Ax and scale Ax.
+Unified function that dispatches based on workspace type.
+"""
+function compute_Rp!(ws::HPRQP_workspace, sc::HPRQP_scaling)
+    # Compute Ax = A * x_bar
+    unified_mul!(ws.Ax, ws.A, ws.x_bar)
+    # Compute residual and scale (device-specific implementation via dispatch)
+    _compute_Rp_impl!(ws, sc)
+end
+
+# GPU implementation using kernel
+function _compute_Rp_impl!(ws::HPRQP_workspace_gpu, sc::Scaling_info_gpu)
+    threads, blocks = gpu_launch_config(ws.m)
+    if threads > 0
+        @cuda threads = threads blocks = blocks compute_Rp_kernel!(ws.Rp, ws.AL, ws.AU, ws.Ax, sc.row_norm, sc.b_scale, ws.m)
+    end
+end
+
+# CPU implementation using loop
+function _compute_Rp_impl!(ws::HPRQP_workspace_cpu, sc::Scaling_info_cpu)
+    AL = ws.AL
+    AU = ws.AU
+    Ax = ws.Ax
+    Rp = ws.Rp
+    row_norm = sc.row_norm
+    b_scale = sc.b_scale
+
+    @simd for i in eachindex(Rp)
+        @inbounds begin
+            ax_i = Ax[i]
+            AL_i = AL[i]
+            AU_i = AU[i]
+            # Project onto [AL_i, AU_i]
+            ax_proj = min(max(ax_i, AL_i), AU_i)
+            # Correction: ax_proj - ax_i
+            corr = ax_proj - ax_i
+            scale_fact = row_norm[i] * b_scale
+            Rp[i] = corr * scale_fact
+            Ax[i] = ax_i * scale_fact
+        end
+    end
+end
+
+# ============================================================================
+# GPU Kernel Definitions and Launch Configurations
+# ============================================================================
+#
+# This section contains CUDA kernels that execute on the GPU. These kernels
+# MUST remain GPU-specific and should NOT be unified with CPU implementations.
+#
+# The kernels are organized into the following categories:
+#
+# 1. LASSO Update Kernels (lines ~125-265)
+#    - update_zxw_LASSO_kernel_full!/partial!: LASSO-specific updates with L1 soft-thresholding
+#    - update_zxw_LASSO_gpu!: Wrapper function to launch LASSO kernels
+#
+# 2. Unified Standard QP Kernels (lines ~270-690)
+#    - unified_update_zxw1_kernel_full!/partial!: Standard QP variable updates
+#    - compute_tempv_unified_kernel!: Compute temporary vectors for updates
+#    - unified_update_y_kernel_full!/partial!: Dual variable y updates
+#    - unified_update_w2_kernel_full!/partial!: Dual variable w updates
+#    - Wrapper functions: unified_update_zxw1_gpu!, unified_update_y_gpu!, unified_update_w2_gpu!
+#
+# 3. LP-Specific Kernels (lines ~690-1000)
+#    - unified_update_zx_gpu!: Update for problems with empty Q (LP problems)
+#    - unified_update_y_noQ_gpu!: Dual updates for LP problems
+#
+# 4. Golden Section Search and Factor Updates (lines ~1000-1160)
+#    - golden_Q_diag: GPU version of golden section search for sigma tuning
+#    - update_Q_factors_kernel!/gpu!: Update scaling factors for diagonal Q
+#
+# 5. Scaling and Utility Kernels (lines ~1240-1570)
+#    - compute_Rd_kernel!/compute_Rp_kernel!: Residual computation kernels
+#    - axpby_gpu!: GPU vector operation (y = a*x + b*y)
+#    - compute_row/col_max/sum kernels: CSR matrix statistics
+#    - scale_* kernels: Various scaling operations on CSR matrices and vectors
+#
+# Key Design Principles:
+# - Each kernel is optimized for GPU parallelism with minimal thread divergence
+# - Kernels use CUDA.@fastmath for performance where numerical stability permits
+# - Full vs Partial kernel variants control which intermediate values are stored
+# - Custom vs cuSPARSE SpMV modes allow flexible performance tuning
+# - Val{} type parameters enable compile-time specialization without runtime overhead
+#
+# These kernels are called from wrapper functions that handle:
+# - Thread/block configuration via gpu_launch_config()
+# - Device memory management
+# - Kernel parameter setup
+# - Integration with the overall solver algorithm
+#
+# NOTE: Do NOT attempt to unify these with CPU implementations. The CPU versions
+# use fundamentally different execution models (vectorized loops vs parallel kernels).
+# ============================================================================
+
 ## LASSO-specific update kernel with soft-thresholding
 const DEFAULT_KERNEL_THREADS = 256
 
@@ -143,7 +289,8 @@ end
 
 # Wrapper function for LASSO update
 function update_zxw_LASSO_gpu!(ws::HPRQP_workspace_gpu, qp::QP_info_gpu,
-    Halpern_fact1::Float64, Halpern_fact2::Float64; compute_full::Bool=true)
+    Halpern_fact1::Float64, Halpern_fact2::Float64)
+    # LASSO operator handles preprocessing internally via Q.spmv_A and Q.spmv_AT
     Qmap!(ws.w, ws.Qw, qp.Q)
     fact2 = 1.0 / (1.0 + ws.sigma * ws.lambda_max_Q)
     fact1 = 1.0 - fact2
@@ -151,7 +298,7 @@ function update_zxw_LASSO_gpu!(ws::HPRQP_workspace_gpu, qp::QP_info_gpu,
     threads == 0 && return
 
     # Choose kernel based on compute_full flag - no recompilation overhead
-    if compute_full
+    if ws.to_check
         @cuda threads = threads blocks = blocks update_zxw_LASSO_kernel_full!(ws.last_w,
             ws.lambda, ws.dw, ws.dx, ws.w_bar, ws.w, ws.z_bar, ws.x_bar, ws.x_hat,
             ws.last_x, ws.x, ws.Qw, ws.ATy, ws.c, ws.tempv, ws.sigma, fact1, fact2,
@@ -172,7 +319,7 @@ end
 #   - true:  Compute Q*w inline (better for small problems, avoids cuSPARSE overhead)
 #   - false: Use pre-computed Qw from cuSPARSE (better for large problems)
 #
-# Q Matrix Structure (is_diag_Q):
+# Q Matrix Structure (Q_is_diag):
 #   - true:  Q is diagonal, use element-wise fact1_vec[i] and fact2_vec[i]
 #   - false: Q is general, use scalar fact1_scalar and fact2_scalar
 #
@@ -457,7 +604,7 @@ end
 #   - true:  Compute AT*y_bar inline (better for small problems)
 #   - false: Use pre-computed ATy_bar from cuSPARSE (better for large problems)
 #
-# Q Matrix Structure (is_diag_Q):
+# Q Matrix Structure (Q_is_diag):
 #   - true:  Q is diagonal, use element-wise fact_vec[i]
 #   - false: Q is general, use scalar fact_scalar
 #
@@ -582,11 +729,9 @@ end
 # Unified wrapper that handles all cases: regular/diagonal Q, custom/cuSPARSE SpMV
 # Unified wrapper for update_zxw1 that handles both custom and cuSPARSE SpMV, and regular/diagonal Q
 function unified_update_zxw1_gpu!(ws::HPRQP_workspace_gpu, qp::QP_info_gpu,
-    Halpern_fact1::Float64, Halpern_fact2::Float64;
-    spmv_mode_Q::String="CUSPARSE", spmv_mode_A::String="CUSPARSE",
-    is_diag_Q::Bool=false, compute_full::Bool=true)
+    Halpern_fact1::Float64, Halpern_fact2::Float64)
     # Determine whether to use custom inline SpMV for Q operations
-    use_custom_spmv_Q = (spmv_mode_Q == "customized")
+    use_custom_spmv_Q = (ws.spmv_mode_Q == "customized")
 
     # Prepare scalar factors for regular Q
     fact2_scalar = 1.0 / (1.0 + ws.sigma * ws.lambda_max_Q)
@@ -607,23 +752,28 @@ function unified_update_zxw1_gpu!(ws::HPRQP_workspace_gpu, qp::QP_info_gpu,
 
     # Use Qmap! for Q*w (works for both sparse matrices and operators)
     if !use_custom_spmv_Q
-        Qmap!(ws.w, ws.Qw, qp.Q)
+        # Pass ws.spmv_Q for sparse matrix Q, operators handle their own preprocessing
+        if isa(qp.Q, CuSparseMatrixCSR{Float64,Int32})
+            Qmap!(ws.w, ws.Qw, qp.Q, ws.spmv_Q)
+        else
+            Qmap!(ws.w, ws.Qw, qp.Q)
+        end
     end
 
     # Step 1: Update z, x, w1
     threads, blocks = gpu_launch_config(ws.n)
     if threads > 0
-        # Choose kernel based on compute_full flag - no recompilation overhead
-        if compute_full
+        # Choose kernel based on to_check flag - no recompilation overhead
+        if ws.to_check
             @cuda threads = threads blocks = blocks unified_update_zxw1_kernel_full!(
-                Val(use_custom_spmv_Q), Val(is_diag_Q),
+                Val(use_custom_spmv_Q), Val(ws.Q_is_diag),
                 ws.dx, rowPtrQ, colValQ, nzValQ,
                 ws.w_bar, ws.w, ws.z_bar, ws.x_bar, ws.x_hat, ws.last_x, ws.x, ws.Qw, ws.ATy, ws.c,
                 ws.l, ws.u, ws.sigma, fact1_scalar, fact2_scalar, fact1_vec, fact2_vec,
                 Halpern_fact1, Halpern_fact2, ws.n)
         else
             @cuda threads = threads blocks = blocks unified_update_zxw1_kernel_partial!(
-                Val(use_custom_spmv_Q), Val(is_diag_Q),
+                Val(use_custom_spmv_Q), Val(ws.Q_is_diag),
                 ws.dx, rowPtrQ, colValQ, nzValQ,
                 ws.w_bar, ws.w, ws.z_bar, ws.x_bar, ws.x_hat, ws.last_x, ws.x, ws.Qw, ws.ATy, ws.c,
                 ws.l, ws.u, ws.sigma, fact1_scalar, fact2_scalar, fact1_vec, fact2_vec,
@@ -634,7 +784,12 @@ function unified_update_zxw1_gpu!(ws::HPRQP_workspace_gpu, qp::QP_info_gpu,
     # Step 2: Compute tempv for subsequent use in update_y
     # Use Qmap! for Q*w_bar (works for both sparse matrices and operators)
     if !use_custom_spmv_Q
-        Qmap!(ws.w_bar, ws.Qw_bar, qp.Q)
+        # Pass ws.spmv_Q for sparse matrix Q, operators handle their own preprocessing
+        if isa(qp.Q, CuSparseMatrixCSR{Float64,Int32})
+            Qmap!(ws.w_bar, ws.Qw_bar, qp.Q, ws.spmv_Q)
+        else
+            Qmap!(ws.w_bar, ws.Qw_bar, qp.Q)
+        end
     end
 
     if threads > 0
@@ -648,24 +803,32 @@ end
 # Unified wrapper for update_y that handles both custom and cuSPARSE SpMV
 # Unified wrapper for update_y that handles both custom and cuSPARSE SpMV
 function unified_update_y_gpu!(ws::HPRQP_workspace_gpu, Halpern_fact1::Float64,
-    Halpern_fact2::Float64; spmv_mode_Q::String="CUSPARSE",
-    spmv_mode_A::String="CUSPARSE", compute_full::Bool=true)
+    Halpern_fact2::Float64)
     # Determine whether to use custom inline SpMV for A operations
-    use_custom_spmv_A = (spmv_mode_A == "customized")
+    use_custom_spmv_A = (ws.spmv_mode_A == "customized")
 
     fact1 = ws.lambda_max_A * ws.sigma
     fact2 = 1.0 / fact1
 
     # Only compute A*tempv via cuSPARSE if not using custom SpMV for A
     if !use_custom_spmv_A
-        CUDA.CUSPARSE.mv!('N', 1, ws.A, ws.tempv, 0, ws.Ax, 'O', CUDA.CUSPARSE.CUSPARSE_SPMV_CSR_ALG2)
+        # Use preprocessed CUSPARSE if available
+        if ws.spmv_A !== nothing
+            desc_tempv = CUDA.CUSPARSE.CuDenseVectorDescriptor(ws.tempv)
+            desc_Ax = CUDA.CUSPARSE.CuDenseVectorDescriptor(ws.Ax)
+            CUDA.CUSPARSE.cusparseSpMV(ws.spmv_A.handle, ws.spmv_A.operator, ws.spmv_A.alpha,
+                ws.spmv_A.desc_A, desc_tempv, ws.spmv_A.beta, desc_Ax,
+                ws.spmv_A.compute_type, ws.spmv_A.alg, ws.spmv_A.buf)
+        else
+            CUDA.CUSPARSE.mv!('N', 1, ws.A, ws.tempv, 0, ws.Ax, 'O', CUDA.CUSPARSE.CUSPARSE_SPMV_CSR_ALG2)
+        end
     end
 
     if ws.m > 0
         threads_A, blocks_A = gpu_launch_config(ws.m)
         if threads_A > 0
-            # Choose kernel based on compute_full flag - no recompilation overhead
-            if compute_full
+            # Choose kernel based on to_check flag - no recompilation overhead
+            if ws.to_check
                 @cuda threads = threads_A blocks = blocks_A unified_update_y_kernel_full!(
                     Val(use_custom_spmv_A),
                     ws.dy, ws.A.rowPtr, ws.A.colVal, ws.A.nzVal,
@@ -685,10 +848,9 @@ end
 # Unified wrapper for update_w2 that handles both custom and cuSPARSE SpMV, and regular/diagonal Q
 # Unified wrapper for update_w2 that handles both custom and cuSPARSE SpMV, and regular/diagonal Q
 function unified_update_w2_gpu!(ws::HPRQP_workspace_gpu, Halpern_fact1::Float64,
-    Halpern_fact2::Float64; spmv_mode_Q::String="CUSPARSE",
-    spmv_mode_A::String="CUSPARSE", is_diag_Q::Bool=false, compute_full::Bool=true)
+    Halpern_fact2::Float64)
     # Determine whether to use custom inline SpMV for A operations
-    use_custom_spmv_A = (spmv_mode_A == "customized")
+    use_custom_spmv_A = (ws.spmv_mode_A == "customized")
 
     # Prepare scalar factor for regular Q
     fact_scalar = ws.sigma / (1.0 + ws.sigma * ws.lambda_max_Q)
@@ -698,21 +860,30 @@ function unified_update_w2_gpu!(ws::HPRQP_workspace_gpu, Halpern_fact1::Float64,
 
     # Only compute AT*y_bar via cuSPARSE if not using custom SpMV for A
     if !use_custom_spmv_A
-        CUDA.CUSPARSE.mv!('N', 1, ws.AT, ws.y_bar, 0, ws.ATy_bar, 'O', CUDA.CUSPARSE.CUSPARSE_SPMV_CSR_ALG2)
+        # Use preprocessed CUSPARSE if available
+        if ws.spmv_AT !== nothing
+            desc_y_bar = CUDA.CUSPARSE.CuDenseVectorDescriptor(ws.y_bar)
+            desc_ATy_bar = CUDA.CUSPARSE.CuDenseVectorDescriptor(ws.ATy_bar)
+            CUDA.CUSPARSE.cusparseSpMV(ws.spmv_AT.handle, ws.spmv_AT.operator, ws.spmv_AT.alpha,
+                ws.spmv_AT.desc_AT, desc_y_bar, ws.spmv_AT.beta, desc_ATy_bar,
+                ws.spmv_AT.compute_type, ws.spmv_AT.alg, ws.spmv_AT.buf)
+        else
+            CUDA.CUSPARSE.mv!('N', 1, ws.AT, ws.y_bar, 0, ws.ATy_bar, 'O', CUDA.CUSPARSE.CUSPARSE_SPMV_CSR_ALG2)
+        end
     end
 
     threads, blocks = gpu_launch_config(ws.n)
     if threads > 0
-        # Choose kernel based on compute_full flag - no recompilation overhead
-        if compute_full
+        # Choose kernel based on to_check flag - no recompilation overhead
+        if ws.to_check
             @cuda threads = threads blocks = blocks unified_update_w2_kernel_full!(
-                Val(use_custom_spmv_A), Val(is_diag_Q),
+                Val(use_custom_spmv_A), Val(ws.Q_is_diag),
                 ws.dw, ws.ATdy, ws.AT.rowPtr, ws.AT.colVal, ws.AT.nzVal,
                 ws.y_bar, ws.ATy_bar, ws.w, ws.w_bar, ws.last_w, ws.last_ATy, ws.ATy,
                 fact_scalar, fact_vec, Halpern_fact1, Halpern_fact2, ws.n)
         else
             @cuda threads = threads blocks = blocks unified_update_w2_kernel_partial!(
-                Val(use_custom_spmv_A), Val(is_diag_Q),
+                Val(use_custom_spmv_A), Val(ws.Q_is_diag),
                 ws.dw, ws.ATdy, ws.AT.rowPtr, ws.AT.colVal, ws.AT.nzVal,
                 ws.y_bar, ws.ATy_bar, ws.w, ws.w_bar, ws.last_w, ws.last_ATy, ws.ATy,
                 fact_scalar, fact_vec, Halpern_fact1, Halpern_fact2, ws.n)
@@ -835,19 +1006,27 @@ CUDA.@fastmath @inline function unified_update_zx_kernel_partial!(::Val{UseCusto
 end
 
 # Unified wrapper for update_zx
-function unified_update_zx_gpu!(ws::HPRQP_workspace_gpu, Halpern_fact1::Float64, Halpern_fact2::Float64;
-    spmv_mode_A::String="CUSPARSE", compute_full::Bool=true)
-    use_custom_spmv_A = (spmv_mode_A == "customized")
+function unified_update_zx_gpu!(ws::HPRQP_workspace_gpu, Halpern_fact1::Float64, Halpern_fact2::Float64)
+    use_custom_spmv_A = (ws.spmv_mode_A == "customized")
 
     # Only compute AT*y via cuSPARSE if not using custom SpMV for A
     if !use_custom_spmv_A
-        CUDA.CUSPARSE.mv!('N', 1, ws.AT, ws.y, 0, ws.ATy, 'O', CUDA.CUSPARSE.CUSPARSE_SPMV_CSR_ALG2)
+        # Use preprocessed CUSPARSE if available
+        if ws.spmv_AT !== nothing
+            desc_y = CUDA.CUSPARSE.CuDenseVectorDescriptor(ws.y)
+            desc_ATy = CUDA.CUSPARSE.CuDenseVectorDescriptor(ws.ATy)
+            CUDA.CUSPARSE.cusparseSpMV(ws.spmv_AT.handle, ws.spmv_AT.operator, ws.spmv_AT.alpha,
+                ws.spmv_AT.desc_AT, desc_y, ws.spmv_AT.beta, desc_ATy,
+                ws.spmv_AT.compute_type, ws.spmv_AT.alg, ws.spmv_AT.buf)
+        else
+            CUDA.CUSPARSE.mv!('N', 1, ws.AT, ws.y, 0, ws.ATy, 'O', CUDA.CUSPARSE.CUSPARSE_SPMV_CSR_ALG2)
+        end
     end
 
     threads, blocks = gpu_launch_config(ws.n)
     if threads > 0
-        # Choose kernel based on compute_full flag - no recompilation overhead
-        if compute_full
+        # Choose kernel based on to_check flag - no recompilation overhead
+        if ws.to_check
             @cuda threads = threads blocks = blocks unified_update_zx_kernel_full!(
                 Val(use_custom_spmv_A),
                 ws.dx, ws.AT.rowPtr, ws.AT.colVal, ws.AT.nzVal,
@@ -866,25 +1045,33 @@ function unified_update_zx_gpu!(ws::HPRQP_workspace_gpu, Halpern_fact1::Float64,
 end
 
 # Unified update_y_noQ - uses x_hat directly instead of tempv
-function unified_update_y_noQ_gpu!(ws::HPRQP_workspace_gpu, Halpern_fact1::Float64, Halpern_fact2::Float64;
-    spmv_mode_A::String="CUSPARSE", compute_full::Bool=true)
+function unified_update_y_noQ_gpu!(ws::HPRQP_workspace_gpu, Halpern_fact1::Float64, Halpern_fact2::Float64)
     # Determine whether to use custom inline SpMV for A operations
-    use_custom_spmv_A = (spmv_mode_A == "customized")
+    use_custom_spmv_A = (ws.spmv_mode_A == "customized")
 
     fact1 = ws.lambda_max_A * ws.sigma
     fact2 = 1.0 / fact1
 
     # Only compute A*x_hat via cuSPARSE if not using custom SpMV for A
     if !use_custom_spmv_A
-        CUDA.CUSPARSE.mv!('N', 1, ws.A, ws.x_hat, 0, ws.Ax, 'O', CUDA.CUSPARSE.CUSPARSE_SPMV_CSR_ALG2)
+        # Use preprocessed CUSPARSE if available
+        if ws.spmv_A !== nothing
+            desc_x_hat = CUDA.CUSPARSE.CuDenseVectorDescriptor(ws.x_hat)
+            desc_Ax = CUDA.CUSPARSE.CuDenseVectorDescriptor(ws.Ax)
+            CUDA.CUSPARSE.cusparseSpMV(ws.spmv_A.handle, ws.spmv_A.operator, ws.spmv_A.alpha,
+                ws.spmv_A.desc_A, desc_x_hat, ws.spmv_A.beta, desc_Ax,
+                ws.spmv_A.compute_type, ws.spmv_A.alg, ws.spmv_A.buf)
+        else
+            CUDA.CUSPARSE.mv!('N', 1, ws.A, ws.x_hat, 0, ws.Ax, 'O', CUDA.CUSPARSE.CUSPARSE_SPMV_CSR_ALG2)
+        end
     end
 
     if ws.m > 0
         threads_A, blocks_A = gpu_launch_config(ws.m)
         if threads_A > 0
             # Reuse unified_update_y_kernel but pass x_hat instead of tempv
-            # Choose kernel based on compute_full flag - no recompilation overhead
-            if compute_full
+            # Choose kernel based on to_check flag - no recompilation overhead
+            if ws.to_check
                 @cuda threads = threads_A blocks = blocks_A unified_update_y_kernel_full!(
                     Val(use_custom_spmv_A),
                     ws.dy, ws.A.rowPtr, ws.A.colVal, ws.A.nzVal,
@@ -1145,13 +1332,8 @@ CUDA.@fastmath @inline function compute_Rd_kernel!(ATy::CuDeviceVector{Float64},
 end
 
 function compute_Rd_gpu!(ws::HPRQP_workspace_gpu, sc::Scaling_info_gpu)
-    if ws.m > 0
-        CUDA.CUSPARSE.mv!('N', 1, ws.AT, ws.y_bar, 0, ws.ATdy, 'O', CUDA.CUSPARSE.CUSPARSE_SPMV_CSR_ALG2)
-    end
-    threads, blocks = gpu_launch_config(ws.n)
-    if threads > 0
-        @cuda threads = threads blocks = blocks compute_Rd_kernel!(ws.ATdy, ws.z_bar, ws.c, ws.Qx, ws.Rd, sc.col_norm, sc.c_scale, ws.n)
-    end
+    # Call unified version
+    compute_Rd!(ws, sc)
 end
 
 CUDA.@fastmath @inline function compute_Rp_kernel!(Rp::CuDeviceVector{Float64},
@@ -1177,11 +1359,8 @@ CUDA.@fastmath @inline function compute_Rp_kernel!(Rp::CuDeviceVector{Float64},
 end
 
 function compute_Rp_gpu!(ws::HPRQP_workspace_gpu, sc::Scaling_info_gpu)
-    CUDA.CUSPARSE.mv!('N', 1, ws.A, ws.x_bar, 0, ws.Ax, 'O', CUDA.CUSPARSE.CUSPARSE_SPMV_CSR_ALG2)
-    threads, blocks = gpu_launch_config(ws.m)
-    if threads > 0
-        @cuda threads = threads blocks = blocks compute_Rp_kernel!(ws.Rp, ws.AL, ws.AU, ws.Ax, sc.row_norm, sc.b_scale, ws.m)
-    end
+    # Call unified version
+    compute_Rp!(ws, sc)
 end
 
 CUDA.@fastmath @inline function compute_err_lu_kernel!(dx::CuDeviceVector{Float64},
@@ -1394,6 +1573,60 @@ function compute_col_sum_abs_with_Q_kernel!(A_rowPtr::CuDeviceVector{Int32},
     return
 end
 
+# Kernel to check if a CSR matrix is diagonal
+# For each row i, check if it has exactly one non-zero at column i
+function check_diagonal_kernel!(rowPtr::CuDeviceVector{Int32},
+    colVal::CuDeviceVector{Int32},
+    is_diag::CuDeviceVector{Bool},
+    n::Int)
+    i = threadIdx().x + (blockDim().x * (blockIdx().x - 1))
+    if i <= n
+        @inbounds begin
+            start_idx = rowPtr[i]
+            end_idx = rowPtr[i+1] - 1
+            nnz_in_row = end_idx - start_idx + 1
+            
+            # Check: exactly one non-zero AND it's at column index i
+            if nnz_in_row == 1
+                col_idx = colVal[start_idx]
+                is_diag[i] = (col_idx == i)
+            elseif nnz_in_row == 0
+                # Empty row is considered diagonal (zero on diagonal)
+                is_diag[i] = true
+            else
+                # More than one non-zero: not diagonal
+                is_diag[i] = false
+            end
+        end
+    end
+    return
+end
+
+# Kernel to extract diagonal elements from CSR matrix
+function extract_diagonal_csr_kernel!(rowPtr::CuDeviceVector{Int32},
+    colVal::CuDeviceVector{Int32},
+    nzVal::CuDeviceVector{Float64},
+    diag::CuDeviceVector{Float64},
+    n::Int)
+    i = threadIdx().x + (blockDim().x * (blockIdx().x - 1))
+    if i <= n
+        @inbounds begin
+            start_idx = rowPtr[i]
+            end_idx = rowPtr[i+1] - 1
+            
+            # Search for diagonal element in this row
+            diag[i] = 0.0
+            for k in start_idx:end_idx
+                if colVal[k] == i
+                    diag[i] = nzVal[k]
+                    break
+                end
+            end
+        end
+    end
+    return
+end
+
 # Kernel to scale rows of CSR matrix by 1.0 / row_scale
 function scale_rows_csr_kernel!(rowPtr::CuDeviceVector{Int32},
     nzVal::CuDeviceVector{Float64},
@@ -1477,9 +1710,70 @@ function scale_vector_scalar_mul_kernel!(v::CuDeviceVector{Float64},
     return
 end
 
-# ==========================================================================
-# CPU Kernels for HPR-QP
-# ==========================================================================
+# ============================================================================
+# CPU Loop-Based Update Functions
+# ============================================================================
+#
+# This section contains CPU implementations that mirror the GPU kernel logic.
+# These functions MUST remain separate from GPU kernels due to fundamentally
+# different execution models.
+#
+# GPU Kernels vs CPU Loops:
+# - GPU: Massively parallel execution across thousands of threads
+# - CPU: Vectorized serial/SIMD loops optimized for cache locality
+#
+# The CPU functions are organized to match GPU kernel categories:
+#
+# 1. Standard QP Updates (lines ~1576-1770)
+#    - update_zxw1_cpu!: CPU version of unified_update_zxw1_kernel
+#      Mirrors GPU logic but uses @simd loops instead of parallel threads
+#      Computes z, x, w updates with box projection for standard QP
+#
+# 2. LASSO Updates (lines ~1671-1765)
+#    - update_zxw_LASSO_cpu!: CPU version of update_zxw_LASSO_kernel
+#      Implements L1 soft-thresholding for LASSO problems
+#      Uses @simd loops for vectorization
+#
+# 3. Unified LP Updates (lines ~1766-1930)
+#    - unified_update_zx_cpu!: CPU version for problems with empty Q (LP)
+#    - unified_update_y_noQ_cpu!: CPU dual updates for LP problems
+#      These mirror the GPU LP kernels but use CPU-optimized loops
+#
+# 4. Standard Update Subroutines (lines ~1928-2090)
+#    - update_y_cpu!: CPU version of unified_update_y_kernel
+#      Dual variable y updates with projection
+#    - update_w2_cpu!: CPU version of unified_update_w2_kernel
+#      Dual variable w updates with AT*y_bar computation
+#
+# Key CPU Optimization Techniques:
+# - @simd macro: Enables SIMD vectorization for compatible loops
+# - @inbounds: Removes bounds checking for performance (use carefully)
+# - @fastmath: Relaxes floating-point semantics for speed (use where safe)
+# - Loop fusion: Combines multiple operations in single pass
+# - Cache-friendly memory access patterns
+#
+# Relationship to GPU Kernels:
+# - Algorithmic logic is identical to GPU kernels
+# - Implementation differs to exploit CPU architecture:
+#   * Sequential iteration vs parallel GPU threads
+#   * CPU SIMD vs GPU warps
+#   * Cache hierarchy vs GPU shared memory
+# - Both produce bit-identical numerical results (within floating-point tolerance)
+#
+# Design Rationale:
+# - Keeping separate implementations allows architecture-specific optimization
+# - CPU code can use standard Julia broadcasting and SIMD
+# - GPU code uses CUDA-specific features (shared memory, warp primitives)
+# - Attempting to unify would sacrifice performance on both platforms
+#
+# Calling Convention:
+# - These functions are called through device-agnostic wrappers in algorithm.jl
+# - Dispatch on workspace type (HPRQP_workspace_cpu) selects CPU versions
+# - Parameters and semantics match GPU versions for consistency
+#
+# NOTE: When modifying algorithmic logic, changes must be synchronized between
+# GPU kernels and CPU loops to maintain numerical equivalence.
+# ============================================================================
 
 # CPU version of update_zxw for standard QP (non-LASSO)
 function update_zxw1_cpu!(ws::HPRQP_workspace_cpu,
@@ -1835,10 +2129,27 @@ function unified_update_y_noQ_cpu!(ws::HPRQP_workspace_cpu,
 end
 
 # ============================================================================
-# CPU Functions with Q matrix
+# CPU Update Functions with Q Matrix (Standard QP Updates)
+# ============================================================================
+#
+# These functions handle updates for problems with non-empty Q matrices.
+# They mirror the GPU unified_update_y and unified_update_w2 kernels.
+#
+# - update_y_cpu!: Computes dual variable y updates with A*tempv computation
+#   where tempv = x_hat + sigma*(Qw - Qw_bar). Mirrors unified_update_y_kernel.
+#
+# - update_w2_cpu!: Computes dual variable w updates with AT*y_bar computation.
+#   Mirrors unified_update_w2_kernel.
+#
+# Both functions use:
+# - @simd loops for vectorization
+# - Broadcasting for vector operations (.= syntax)
+# - mul! for efficient matrix-vector products
+# - Conditional execution based on ws.to_check flag
 # ============================================================================
 
-# CPU version of update_y
+# CPU version of update_y with Q matrix
+# Mirrors unified_update_y_kernel - computes y updates for standard QP
 function update_y_cpu!(ws::HPRQP_workspace_cpu,
     Halpern_fact1::Float64,
     Halpern_fact2::Float64)
@@ -1902,6 +2213,7 @@ function update_y_cpu!(ws::HPRQP_workspace_cpu,
 end
 
 # CPU version of update_w2 - completes the w update using y_bar
+# Mirrors unified_update_w2_kernel - computes AT*y_bar and updates w
 function update_w2_cpu!(ws::HPRQP_workspace_cpu,
     Halpern_fact1::Float64,
     Halpern_fact2::Float64,
@@ -1988,51 +2300,12 @@ end
 
 # CPU version of compute_Rd
 function compute_Rd_cpu!(ws::HPRQP_workspace_cpu, sc::Scaling_info_cpu)
-    # Compute ATy
-    mul!(ws.ATdy, ws.AT, ws.y_bar)
-    Rd = ws.Rd
-    ATdy = ws.ATdy
-    z_bar = ws.z_bar
-    Qx = ws.Qx
-    c = ws.c
-    col_norm = sc.col_norm
-
-    @simd for i in eachindex(Rd)
-        @inbounds begin
-            scale_fact = col_norm[i] * sc.c_scale
-            Rd[i] = (Qx[i] + c[i] - ATdy[i] - z_bar[i]) * scale_fact
-            Qx[i] *= scale_fact
-            ATdy[i] *= scale_fact
-        end
-    end
+    # Call unified version
+    compute_Rd!(ws, sc)
 end
 
 # CPU version of compute_Rp
 function compute_Rp_cpu!(ws::HPRQP_workspace_cpu, sc::Scaling_info_cpu)
-    # Compute Ax = A * x_bar
-    mul!(ws.Ax, ws.A, ws.x_bar)
-
-    # Compute Rp and scale Ax in-place
-    AL = ws.AL
-    AU = ws.AU
-    Ax = ws.Ax
-    Rp = ws.Rp
-    row_norm = sc.row_norm
-    b_scale = sc.b_scale
-
-    @simd for i in eachindex(Rp)
-        @inbounds begin
-            ax_i = Ax[i]
-            AL_i = AL[i]
-            AU_i = AU[i]
-            # Project onto [AL_i, AU_i]
-            ax_proj = min(max(ax_i, AL_i), AU_i)
-            # Correction: ax_proj - ax_i
-            # Equivalent to: (ax_i < AL_i) ? (AL_i - ax_i) : ((ax_i > AU_i) ? (AU_i - ax_i) : 0.0)
-            corr = ax_proj - ax_i
-            scale_fact = row_norm[i] * b_scale
-            Rp[i] = corr * scale_fact
-            Ax[i] = ax_i * scale_fact
-        end
-    end
+    # Call unified version
+    compute_Rp!(ws, sc)
 end

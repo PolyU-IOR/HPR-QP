@@ -11,6 +11,35 @@ const SCALAR_SETS = Union{
     MOI.Interval{Float64},
 }
 
+# ============================================================================
+# MOI Cache Definition for JuMP Integration
+# ============================================================================
+
+MOI.Utilities.@product_of_sets(
+    QPSets,
+    MOI.EqualTo{T},
+    MOI.LessThan{T},
+    MOI.GreaterThan{T},
+    MOI.Interval{T},
+)
+
+# Define the cache type with MatrixOfConstraints for QP (similar to HPRLP)
+const OptimizerCache = MOI.Utilities.GenericModel{
+    Float64,
+    MOI.Utilities.ObjectiveContainer{Float64},
+    MOI.Utilities.VariablesContainer{Float64},
+    MOI.Utilities.MatrixOfConstraints{
+        Float64,
+        MOI.Utilities.MutableSparseMatrixCSC{
+            Float64,
+            Int,
+            MOI.Utilities.OneBasedIndexing,
+        },
+        MOI.Utilities.Hyperrectangle{Float64},
+        QPSets{Float64},
+    },
+}
+
 """
     Optimizer()
 

@@ -120,7 +120,7 @@ end
 supports_cusparse_preprocessing(Q::LASSO_Q_operator_gpu) = true
 
 # Prepare CUSPARSE preprocessing for LASSO operator's internal A and AT matrices
-function prepare_operator_spmv!(Q::LASSO_Q_operator_gpu, x::CuVector{Float64}, Qx::CuVector{Float64})
+function prepare_spmv_Q!(Q::LASSO_Q_operator_gpu, x::CuVector{Float64}, Qx::CuVector{Float64})
     # Create descriptors
     desc_A = CUDA.CUSPARSE.CuSparseMatrixDescriptor(Q.A, 'O')
     desc_AT = CUDA.CUSPARSE.CuSparseMatrixDescriptor(Q.AT, 'O')

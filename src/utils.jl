@@ -19,7 +19,7 @@ function validate_gpu_parameters!(params::HPRQP_parameters)
             params.use_gpu = false
             return
         end
-        
+
         # Check if device_number is valid
         num_devices = length(CUDA.devices())
         if params.device_number < 0 || params.device_number >= num_devices
@@ -188,83 +188,302 @@ function qp_formulation(Q::SparseMatrixCSC,
 end
 
 # CPU-based scaling function for the QP problem (similar to GPU version)
-function scaling_cpu!(qp::QP_info_cpu, params::HPRQP_parameters)
+# ============================================================================
+# Unified Scaling Functions
+# ============================================================================
+#
+# The scaling! function is unified to work with both CPU and GPU data.
+# Device-specific operations are handled through helper functions that dispatch
+# based on matrix/vector types (SparseMatrixCSC vs CuSparseMatrixCSR).
+#
+# Matrix Scaling Operations:
+# --------------------------
+# - Ruiz scaling: Equilibration using row/column max norms
+# - Pock-Chambolle scaling: Equilibration using row/column sum norms  
+# - b/c scaling: Objective/constraint balancing (currently disabled)
+#
+# For sparse Q matrices, scaling is applied. For Q operators (LASSO, QAP),
+# scaling is skipped as these operators handle their own normalization.
+#
+# ============================================================================
+
+# Helper: Compute row-wise max for Ruiz scaling (CPU version)
+function _compute_row_max_abs!(temp_col_norm::Vector{Float64},
+    temp_norm_Q::Vector{Float64},
+    A::SparseMatrixCSC, Q::SparseMatrixCSC)
+    temp_col_norm .= vec(maximum(abs, A, dims=1))
+    temp_norm_Q .= vec(maximum(abs, Q, dims=1))
+    temp_col_norm .= sqrt.(max.(temp_col_norm, temp_norm_Q))
+    temp_col_norm[iszero.(temp_col_norm)] .= 1.0
+    return
+end
+
+# Helper: Compute row-wise max for Ruiz scaling (GPU version)
+function _compute_row_max_abs!(temp_col_norm::CuVector{Float64},
+    temp_norm_Q::CuVector{Float64},
+    A::CuSparseMatrixCSR, Q::CuSparseMatrixCSR)
+    AT_rowPtr = A.rowPtr  # For column-wise access we'd normally use AT
+    AT_nzVal = A.nzVal
+    Q_rowPtr = Q.rowPtr
+    Q_nzVal = Q.nzVal
+    n = length(temp_col_norm)
+
+    # Note: For true GPU version, this should use AT not A
+    # Assuming we have AT available through workspace
+    @cuda threads = 256 blocks = ceil(Int, n / 256) compute_row_max_abs_with_Q_kernel!(
+        AT_rowPtr, AT_nzVal, Q_rowPtr, Q_nzVal, temp_col_norm, n
+    )
+    CUDA.synchronize()
+    return
+end
+
+# Helper: Compute row-wise sum for Pock-Chambolle scaling (CPU version)
+function _compute_row_sum_abs!(temp_col_norm::Vector{Float64},
+    temp_norm_Q::Vector{Float64},
+    A::SparseMatrixCSC, Q::SparseMatrixCSC)
+    temp_col_norm .= vec(sum(abs, A, dims=1))
+    temp_norm_Q .= vec(sum(abs, Q, dims=1))
+    temp_col_norm .= sqrt.(temp_col_norm .+ temp_norm_Q)
+    temp_col_norm[iszero.(temp_col_norm)] .= 1.0
+    return
+end
+
+# Helper: Compute row-wise sum for Pock-Chambolle scaling (GPU version)
+function _compute_row_sum_abs!(temp_col_norm::CuVector{Float64},
+    temp_norm_Q::CuVector{Float64},
+    A::CuSparseMatrixCSR, Q::CuSparseMatrixCSR)
+    AT_rowPtr = A.rowPtr
+    AT_nzVal = A.nzVal
+    Q_rowPtr = Q.rowPtr
+    Q_nzVal = Q.nzVal
+    n = length(temp_col_norm)
+
+    @cuda threads = 256 blocks = ceil(Int, n / 256) compute_col_sum_abs_with_Q_kernel!(
+        AT_rowPtr, AT_nzVal, Q_rowPtr, Q_nzVal, temp_col_norm, n
+    )
+    CUDA.synchronize()
+    return
+end
+
+# Helper: Scale matrix Q by diagonal matrices (CPU version)
+function _scale_Q_matrix!(Q::SparseMatrixCSC, temp_col_norm::Vector{Float64})
+    DC = spdiagm(1.0 ./ temp_col_norm)
+    return DC * Q * DC
+end
+
+# Helper: Scale matrix Q by diagonal matrices (GPU version)
+function _scale_Q_matrix!(Q::CuSparseMatrixCSR, temp_col_norm::CuVector{Float64})
+    Q_rowPtr = Q.rowPtr
+    Q_colVal = Q.colVal
+    Q_nzVal = Q.nzVal
+    n = length(temp_col_norm)
+
+    # Scale rows
+    @cuda threads = 256 blocks = ceil(Int, n / 256) scale_rows_csr_kernel!(
+        Q_rowPtr, Q_nzVal, temp_col_norm, n
+    )
+    CUDA.synchronize()
+
+    # Scale columns
+    @cuda threads = 256 blocks = ceil(Int, n / 256) scale_csr_cols_kernel!(
+        Q_rowPtr, Q_colVal, Q_nzVal, temp_col_norm, n
+    )
+    CUDA.synchronize()
+
+    return Q  # Modified in-place
+end
+
+# Helper: Scale matrix A by row and column diagonal matrices (CPU version)
+function _scale_A_matrix!(A::SparseMatrixCSC, temp_row_norm::Vector{Float64}, temp_col_norm::Vector{Float64})
+    DR = spdiagm(1.0 ./ temp_row_norm)
+    DC = spdiagm(1.0 ./ temp_col_norm)
+    return DR * A * DC
+end
+
+# Helper: Scale matrix A by row and column diagonal matrices (GPU version)
+function _scale_A_matrix!(A::CuSparseMatrixCSR, temp_row_norm::CuVector{Float64}, temp_col_norm::CuVector{Float64})
+    A_rowPtr = A.rowPtr
+    A_colVal = A.colVal
+    A_nzVal = A.nzVal
+    m = length(temp_row_norm)
+
+    # Scale rows
+    @cuda threads = 256 blocks = ceil(Int, m / 256) scale_rows_csr_kernel!(
+        A_rowPtr, A_nzVal, temp_row_norm, m
+    )
+    CUDA.synchronize()
+
+    # Scale columns
+    @cuda threads = 256 blocks = ceil(Int, m / 256) scale_csr_cols_kernel!(
+        A_rowPtr, A_colVal, A_nzVal, temp_col_norm, m
+    )
+    CUDA.synchronize()
+
+    return A  # Modified in-place
+end
+
+"""
+    scaling!(qp::HPRQP_QP_info, params::HPRQP_parameters)
+
+Unified scaling function that works for both CPU and GPU QP problems.
+
+This function applies various scaling strategies to improve numerical conditioning:
+- Ruiz scaling: Row/column equilibration using max norms
+- Pock-Chambolle scaling: Row/column equilibration using sum norms
+- b/c scaling: Objective/constraint balancing (currently disabled)
+
+For Q operators (LASSO, QAP), scaling is skipped as these handle their own normalization.
+
+# Arguments
+- `qp::HPRQP_QP_info`: QP problem data (either QP_info_cpu or QP_info_gpu)
+- `params::HPRQP_parameters`: Solver parameters controlling scaling options
+
+# Returns
+- `scaling_info`: Scaling information (Scaling_info_cpu or Scaling_info_gpu)
+- `diag_Q`: Diagonal elements of Q matrix (Vector or extracted from GPU)
+- `Q_is_diag`: Boolean indicating if Q is diagonal
+
+# Device-Specific Behavior
+- CPU: Uses SparseArrays operations directly
+- GPU: Uses CUDA kernels for parallel scaling operations
+"""
+function scaling!(qp::HPRQP_QP_info, params::HPRQP_parameters)
+    device_name = isa(qp, QP_info_gpu) ? "GPU" : "CPU"
+
+    if params.verbose
+        println("SCALING QP ON $(device_name) ...")
+    end
+    t_start = time()
+
+    # Perform scaling
     m, n = size(qp.A)
 
-    # Check if Q is a sparse matrix (not an operator)
-    # If Q is an operator (QAP/LASSO), we skip ALL scaling
-    Q_is_operator = isa(qp.Q, AbstractQOperatorCPU)
+    # Check if Q is an operator (not a sparse matrix)
+    Q_is_operator = isa(qp.Q, Union{AbstractQOperator,AbstractQOperatorCPU})
 
     if Q_is_operator
         if params.verbose
             println("Q is an operator - skipping ALL scaling")
         end
         # Return minimal scaling info with no scaling applied
-        row_norm = ones(Float64, m)
-        col_norm = ones(Float64, n)
+        row_norm = unified_ones_like(qp.AL)
+        if m > 0
+            row_norm = unified_ones_like(qp.AL)
+        else
+            row_norm = isa(qp, QP_info_gpu) ? CuVector{Float64}(undef, 0) : Vector{Float64}(undef, 0)
+        end
+        col_norm = unified_ones_like(qp.c)
 
         AL_nInf = copy(qp.AL)
         AU_nInf = copy(qp.AU)
         AL_nInf[qp.AL.==-Inf] .= 0.0
         AU_nInf[qp.AU.==Inf] .= 0.0
-        norm_b_org = m > 0 ? norm(max.(abs.(AL_nInf), abs.(AU_nInf)), Inf) : 0.0
-        norm_c_org = norm(qp.c, Inf)
+        norm_b_org = m > 0 ? unified_norm(max.(abs.(AL_nInf), abs.(AU_nInf)), Inf) : 0.0
+        norm_c_org = unified_norm(qp.c, Inf)
 
-        scaling_info = Scaling_info_cpu(
-            copy(qp.l), copy(qp.u),
-            row_norm, col_norm,
-            1.0, 1.0, 1.0, 1.0,
-            norm_b_org, norm_c_org
-        )
+        # Create appropriate scaling info type
+        if isa(qp, QP_info_gpu)
+            scaling_info = Scaling_info_gpu(
+                copy(qp.l), copy(qp.u),
+                row_norm, col_norm,
+                1.0, 1.0, 1.0, 1.0,
+                norm_b_org, norm_c_org
+            )
+        else
+            scaling_info = Scaling_info_cpu(
+                copy(qp.l), copy(qp.u),
+                row_norm, col_norm,
+                1.0, 1.0, 1.0, 1.0,
+                norm_b_org, norm_c_org
+            )
+        end
 
-        scaling_info.norm_b = m > 0 ? norm(max.(abs.(AL_nInf), abs.(AU_nInf))) : 0.0
-        scaling_info.norm_c = norm(qp.c)
+        scaling_info.norm_b = m > 0 ? unified_norm(max.(abs.(AL_nInf), abs.(AU_nInf))) : 0.0
+        scaling_info.norm_c = unified_norm(qp.c)
 
-        # For operator-based problems, Q is not a diagonal matrix
-        diag_Q = zeros(Float64, n)
-        Q_is_diag = false
 
-        return scaling_info, diag_Q, Q_is_diag
+        return scaling_info
     end
 
     # For sparse Q, proceed with normal scaling
     # Initialize scaling vectors
-    row_norm = ones(Float64, m)
-    col_norm = ones(Float64, n)
+    if isa(qp, QP_info_gpu)
+        row_norm = CUDA.ones(Float64, m)
+        col_norm = CUDA.ones(Float64, n)
+    else
+        row_norm = ones(Float64, m)
+        col_norm = ones(Float64, n)
+    end
 
     # Compute original norms for scaling info
     AL_nInf = copy(qp.AL)
     AU_nInf = copy(qp.AU)
     AL_nInf[qp.AL.==-Inf] .= 0.0
     AU_nInf[qp.AU.==Inf] .= 0.0
-    norm_b_org = norm(max.(abs.(AL_nInf), abs.(AU_nInf)), Inf)
-    norm_c_org = norm(qp.c, Inf)
+    norm_b_org = unified_norm(max.(abs.(AL_nInf), abs.(AU_nInf)), Inf)
+    norm_c_org = unified_norm(qp.c, Inf)
 
     # Initialize scaling info
-    scaling_info = Scaling_info_cpu(
-        copy(qp.l), copy(qp.u),
-        row_norm, col_norm,
-        1.0, 1.0, 1.0, 1.0,
-        norm_b_org, norm_c_org
-    )
+    if isa(qp, QP_info_gpu)
+        scaling_info = Scaling_info_gpu(
+            copy(qp.l), copy(qp.u),
+            row_norm, col_norm,
+            1.0, 1.0, 1.0, 1.0,
+            norm_b_org, norm_c_org
+        )
+    else
+        scaling_info = Scaling_info_cpu(
+            copy(qp.l), copy(qp.u),
+            row_norm, col_norm,
+            1.0, 1.0, 1.0, 1.0,
+            norm_b_org, norm_c_org
+        )
+    end
 
     # Temporary vectors for scaling
-    temp_row_norm = ones(Float64, m)
-    temp_col_norm = ones(Float64, n)
+    if isa(qp, QP_info_gpu)
+        temp_row_norm = CUDA.ones(Float64, m)
+        temp_col_norm = CUDA.ones(Float64, n)
+    else
+        temp_row_norm = ones(Float64, m)
+        temp_col_norm = ones(Float64, n)
+    end
 
     # Ruiz scaling
     if params.use_Ruiz_scaling
         for _ in 1:10
             # Compute column-wise max of |Q| and |A| combined
-            temp_col_norm .= vec(maximum(abs, qp.A, dims=1))
-            temp_norm_Q = vec(maximum(abs, qp.Q, dims=1))
-            temp_col_norm .= sqrt.(max.(temp_col_norm, temp_norm_Q))
-            temp_col_norm[iszero.(temp_col_norm)] .= 1.0
+            if isa(qp, QP_info_gpu)
+                # GPU version: uses kernels
+                AT_rowPtr = qp.AT.rowPtr
+                AT_nzVal = qp.AT.nzVal
+                Q_rowPtr = qp.Q.rowPtr
+                Q_nzVal = qp.Q.nzVal
+                @cuda threads = 256 blocks = ceil(Int, n / 256) compute_row_max_abs_with_Q_kernel!(
+                    AT_rowPtr, AT_nzVal, Q_rowPtr, Q_nzVal, temp_col_norm, n
+                )
+                CUDA.synchronize()
+            else
+                # CPU version: uses direct operations
+                temp_col_norm .= vec(maximum(abs, qp.A, dims=1))
+                temp_norm_Q = vec(maximum(abs, qp.Q, dims=1))
+                temp_col_norm .= sqrt.(max.(temp_col_norm, temp_norm_Q))
+                temp_col_norm[iszero.(temp_col_norm)] .= 1.0
+            end
 
             # Compute row-wise max of |A|
             if m > 0
-                temp_row_norm .= sqrt.(vec(maximum(abs, qp.A, dims=2)))
-                temp_row_norm[iszero.(temp_row_norm)] .= 1.0
+                if isa(qp, QP_info_gpu)
+                    A_rowPtr = qp.A.rowPtr
+                    A_nzVal = qp.A.nzVal
+                    @cuda threads = 256 blocks = ceil(Int, m / 256) compute_row_max_abs_kernel!(
+                        A_rowPtr, A_nzVal, temp_row_norm, m
+                    )
+                    CUDA.synchronize()
+                else
+                    temp_row_norm .= sqrt.(vec(maximum(abs, qp.A, dims=2)))
+                    temp_row_norm[iszero.(temp_row_norm)] .= 1.0
+                end
             end
 
             # Update cumulative norms
@@ -272,42 +491,125 @@ function scaling_cpu!(qp::QP_info_cpu, params::HPRQP_parameters)
             col_norm .*= temp_col_norm
 
             # Scale Q: Q = DC * Q * DC
-            DC = spdiagm(1.0 ./ temp_col_norm)
-            qp.Q = DC * qp.Q * DC
+            if isa(qp, QP_info_gpu)
+                Q_rowPtr = qp.Q.rowPtr
+                Q_colVal = qp.Q.colVal
+                Q_nzVal = qp.Q.nzVal
+                @cuda threads = 256 blocks = ceil(Int, n / 256) scale_rows_csr_kernel!(
+                    Q_rowPtr, Q_nzVal, temp_col_norm, n
+                )
+                CUDA.synchronize()
+                @cuda threads = 256 blocks = ceil(Int, n / 256) scale_csr_cols_kernel!(
+                    Q_rowPtr, Q_colVal, Q_nzVal, temp_col_norm, n
+                )
+                CUDA.synchronize()
+            else
+                DC = spdiagm(1.0 ./ temp_col_norm)
+                qp.Q = DC * qp.Q * DC
+            end
 
             # Scale A: A = DR * A * DC
             if m > 0
-                DR = spdiagm(1.0 ./ temp_row_norm)
-                qp.A = DR * qp.A * DC
+                if isa(qp, QP_info_gpu)
+                    A_rowPtr = qp.A.rowPtr
+                    A_colVal = qp.A.colVal
+                    A_nzVal = qp.A.nzVal
+                    AT_rowPtr = qp.AT.rowPtr
+                    AT_colVal = qp.AT.colVal
+                    AT_nzVal = qp.AT.nzVal
+
+                    @cuda threads = 256 blocks = ceil(Int, m / 256) scale_rows_csr_kernel!(
+                        A_rowPtr, A_nzVal, temp_row_norm, m
+                    )
+                    CUDA.synchronize()
+                    @cuda threads = 256 blocks = ceil(Int, m / 256) scale_csr_cols_kernel!(
+                        A_rowPtr, A_colVal, A_nzVal, temp_col_norm, m
+                    )
+                    CUDA.synchronize()
+
+                    @cuda threads = 256 blocks = ceil(Int, n / 256) scale_rows_csr_kernel!(
+                        AT_rowPtr, AT_nzVal, temp_col_norm, n
+                    )
+                    CUDA.synchronize()
+                    @cuda threads = 256 blocks = ceil(Int, n / 256) scale_csr_cols_kernel!(
+                        AT_rowPtr, AT_colVal, AT_nzVal, temp_row_norm, n
+                    )
+                    CUDA.synchronize()
+                else
+                    DR = spdiagm(1.0 ./ temp_row_norm)
+                    DC = spdiagm(1.0 ./ temp_col_norm)
+                    qp.A = DR * qp.A * DC
+                end
             end
 
             # Scale objective and constraint bounds
-            qp.c ./= temp_col_norm
+            if isa(qp, QP_info_gpu)
+                @cuda threads = 256 blocks = ceil(Int, n / 256) scale_vector_div_kernel!(
+                    qp.c, temp_col_norm, n
+                )
+                CUDA.synchronize()
 
-            # Scale constraint bounds
-            if m > 0
-                qp.AL ./= temp_row_norm
-                qp.AU ./= temp_row_norm
+                if m > 0
+                    @cuda threads = 256 blocks = ceil(Int, m / 256) scale_vector_div_kernel!(
+                        qp.AL, temp_row_norm, m
+                    )
+                    @cuda threads = 256 blocks = ceil(Int, m / 256) scale_vector_div_kernel!(
+                        qp.AU, temp_row_norm, m
+                    )
+                    CUDA.synchronize()
+                end
+
+                @cuda threads = 256 blocks = ceil(Int, n / 256) scale_vector_mul_kernel!(
+                    qp.l, temp_col_norm, n
+                )
+                @cuda threads = 256 blocks = ceil(Int, n / 256) scale_vector_mul_kernel!(
+                    qp.u, temp_col_norm, n
+                )
+                CUDA.synchronize()
+            else
+                qp.c ./= temp_col_norm
+                if m > 0
+                    qp.AL ./= temp_row_norm
+                    qp.AU ./= temp_row_norm
+                end
+                qp.l .*= temp_col_norm
+                qp.u .*= temp_col_norm
             end
-
-            # Scale variable bounds
-            qp.l .*= temp_col_norm
-            qp.u .*= temp_col_norm
         end
     end
 
     # Pock-Chambolle scaling
     if params.use_Pock_Chambolle_scaling
         # Compute column-wise sum of |Q| and |A| combined
-        temp_col_norm .= vec(sum(abs, qp.A, dims=1))
-        temp_norm_Q = vec(sum(abs, qp.Q, dims=1))
-        temp_col_norm .= sqrt.(temp_col_norm .+ temp_norm_Q)
-        temp_col_norm[iszero.(temp_col_norm)] .= 1.0
+        if isa(qp, QP_info_gpu)
+            AT_rowPtr = qp.AT.rowPtr
+            AT_nzVal = qp.AT.nzVal
+            Q_rowPtr = qp.Q.rowPtr
+            Q_nzVal = qp.Q.nzVal
+            @cuda threads = 256 blocks = ceil(Int, n / 256) compute_col_sum_abs_with_Q_kernel!(
+                AT_rowPtr, AT_nzVal, Q_rowPtr, Q_nzVal, temp_col_norm, n
+            )
+            CUDA.synchronize()
+        else
+            temp_col_norm .= vec(sum(abs, qp.A, dims=1))
+            temp_norm_Q = vec(sum(abs, qp.Q, dims=1))
+            temp_col_norm .= sqrt.(temp_col_norm .+ temp_norm_Q)
+            temp_col_norm[iszero.(temp_col_norm)] .= 1.0
+        end
 
         # Compute row-wise sum of |A|
         if m > 0
-            temp_row_norm .= sqrt.(vec(sum(abs, qp.A, dims=2)))
-            temp_row_norm[iszero.(temp_row_norm)] .= 1.0
+            if isa(qp, QP_info_gpu)
+                A_rowPtr = qp.A.rowPtr
+                A_nzVal = qp.A.nzVal
+                @cuda threads = 256 blocks = ceil(Int, m / 256) compute_row_sum_abs_kernel!(
+                    A_rowPtr, A_nzVal, temp_row_norm, m
+                )
+                CUDA.synchronize()
+            else
+                temp_row_norm .= sqrt.(vec(sum(abs, qp.A, dims=2)))
+                temp_row_norm[iszero.(temp_row_norm)] .= 1.0
+            end
         end
 
         # Update cumulative norms
@@ -315,23 +617,86 @@ function scaling_cpu!(qp::QP_info_cpu, params::HPRQP_parameters)
         col_norm .*= temp_col_norm
 
         # Scale Q: Q = DC * Q * DC
-        DC = spdiagm(1.0 ./ temp_col_norm)
-        qp.Q = DC * qp.Q * DC
+        if isa(qp, QP_info_gpu)
+            Q_rowPtr = qp.Q.rowPtr
+            Q_colVal = qp.Q.colVal
+            Q_nzVal = qp.Q.nzVal
+            @cuda threads = 256 blocks = ceil(Int, n / 256) scale_rows_csr_kernel!(
+                Q_rowPtr, Q_nzVal, temp_col_norm, n
+            )
+            CUDA.synchronize()
+            @cuda threads = 256 blocks = ceil(Int, n / 256) scale_csr_cols_kernel!(
+                Q_rowPtr, Q_colVal, Q_nzVal, temp_col_norm, n
+            )
+            CUDA.synchronize()
+        else
+            DC = spdiagm(1.0 ./ temp_col_norm)
+            qp.Q = DC * qp.Q * DC
+        end
 
         # Scale A: A = DR * A * DC
         if m > 0
-            DR = spdiagm(1.0 ./ temp_row_norm)
-            qp.A = DR * qp.A * DC
+            if isa(qp, QP_info_gpu)
+                A_rowPtr = qp.A.rowPtr
+                A_colVal = qp.A.colVal
+                A_nzVal = qp.A.nzVal
+                AT_rowPtr = qp.AT.rowPtr
+                AT_colVal = qp.AT.colVal
+                AT_nzVal = qp.AT.nzVal
+
+                @cuda threads = 256 blocks = ceil(Int, m / 256) scale_rows_csr_kernel!(
+                    A_rowPtr, A_nzVal, temp_row_norm, m
+                )
+                CUDA.synchronize()
+                @cuda threads = 256 blocks = ceil(Int, m / 256) scale_csr_cols_kernel!(
+                    A_rowPtr, A_colVal, A_nzVal, temp_col_norm, m
+                )
+                CUDA.synchronize()
+
+                @cuda threads = 256 blocks = ceil(Int, n / 256) scale_rows_csr_kernel!(
+                    AT_rowPtr, AT_nzVal, temp_col_norm, n
+                )
+                CUDA.synchronize()
+                @cuda threads = 256 blocks = ceil(Int, n / 256) scale_csr_cols_kernel!(
+                    AT_rowPtr, AT_colVal, AT_nzVal, temp_row_norm, n
+                )
+                CUDA.synchronize()
+            else
+                DR = spdiagm(1.0 ./ temp_row_norm)
+                DC = spdiagm(1.0 ./ temp_col_norm)
+                qp.A = DR * qp.A * DC
+            end
         end
 
         # Scale objective and bounds
-        qp.c ./= temp_col_norm
-        if m > 0
-            qp.AL ./= temp_row_norm
-            qp.AU ./= temp_row_norm
+        if isa(qp, QP_info_gpu)
+            @cuda threads = 256 blocks = ceil(Int, n / 256) scale_vector_div_kernel!(
+                qp.c, temp_col_norm, n
+            )
+            if m > 0
+                @cuda threads = 256 blocks = ceil(Int, m / 256) scale_vector_div_kernel!(
+                    qp.AL, temp_row_norm, m
+                )
+                @cuda threads = 256 blocks = ceil(Int, m / 256) scale_vector_div_kernel!(
+                    qp.AU, temp_row_norm, m
+                )
+            end
+            @cuda threads = 256 blocks = ceil(Int, n / 256) scale_vector_mul_kernel!(
+                qp.l, temp_col_norm, n
+            )
+            @cuda threads = 256 blocks = ceil(Int, n / 256) scale_vector_mul_kernel!(
+                qp.u, temp_col_norm, n
+            )
+            CUDA.synchronize()
+        else
+            qp.c ./= temp_col_norm
+            if m > 0
+                qp.AL ./= temp_row_norm
+                qp.AU ./= temp_row_norm
+            end
+            qp.l .*= temp_col_norm
+            qp.u .*= temp_col_norm
         end
-        qp.l .*= temp_col_norm
-        qp.u .*= temp_col_norm
     end
 
     # b and c scaling (disabled for now, same as GPU)
@@ -340,357 +705,56 @@ function scaling_cpu!(qp::QP_info_cpu, params::HPRQP_parameters)
         AU_nInf = copy(qp.AU)
         AL_nInf[qp.AL.==-Inf] .= 0.0
         AU_nInf[qp.AU.==Inf] .= 0.0
-        b_scale = 1 + norm(max.(abs.(AL_nInf), abs.(AU_nInf)))
-        c_scale = 1 + norm(qp.c)
+        b_scale = 1 + unified_norm(max.(abs.(AL_nInf), abs.(AU_nInf)))
+        c_scale = 1 + unified_norm(qp.c)
 
         if params.verbose
             println("b_scale: ", b_scale)
             println("c_scale: ", c_scale)
         end
 
-        # Scale Q: Q *= b_scale / c_scale
-        if Q_is_sparse
+        # Scale Q
+        if isa(qp, QP_info_gpu)
             scale_factor = b_scale / c_scale
-            qp.Q = qp.Q .* scale_factor
-        end
-
-        if m > 0
-            qp.AL ./= b_scale
-            qp.AU ./= b_scale
-        end
-        qp.c ./= c_scale
-        qp.l ./= b_scale
-        qp.u ./= b_scale
-
-        scaling_info.b_scale = b_scale
-        scaling_info.c_scale = c_scale
-    else
-        scaling_info.b_scale = 1.0
-        scaling_info.c_scale = 1.0
-    end
-
-    qp.AT = qp.A'
-
-    # Update diagonal of Q if Q is sparse
-    # Extract diagonal from Q matrix
-    diag_Q_cpu = Vector(diag(qp.Q))
-
-    # Check if Q is diagonal
-    temp_norm_Q = vec(sum(abs, qp.Q, dims=1))
-    Q_is_diag = (sum(temp_norm_Q .== abs.(diag_Q_cpu)) == length(temp_norm_Q))
-
-    # Symmetrize Q to eliminate numerical errors
-    qp.Q = (qp.Q + transpose(qp.Q)) / 2
-    # Compute final norms
-    AL_nInf = copy(qp.AL)
-    AU_nInf = copy(qp.AU)
-    AL_nInf[qp.AL.==-Inf] .= 0.0
-    AU_nInf[qp.AU.==Inf] .= 0.0
-    scaling_info.norm_b = norm(max.(abs.(AL_nInf), abs.(AU_nInf)))
-    scaling_info.norm_c = norm(qp.c)
-
-    # Store the cumulative scaling norms
-    scaling_info.row_norm = row_norm
-    scaling_info.col_norm = col_norm
-
-    return scaling_info, diag_Q_cpu, Q_is_diag
-end
-
-# Wrapper function for CPU scaling (similar to scale_on_gpu for consistency)
-function scale_on_cpu!(qp::QP_info_cpu, params::HPRQP_parameters)
-    if params.verbose
-        println("SCALING QP ON CPU ...")
-    end
-    t_start = time()
-
-    scaling_info_cpu, diag_Q, Q_is_diag = scaling_cpu!(qp, params)
-    CUDA.synchronize()
-
-    scaling_time = time() - t_start
-    if params.verbose
-        println(@sprintf("CPU SCALING time: %.2f seconds", scaling_time))
-    end
-
-    return scaling_info_cpu, scaling_time, diag_Q, Q_is_diag
-end
-
-# GPU-based scaling function for the QP problem
-function scaling_gpu!(qp::QP_info_gpu, params::HPRQP_parameters)
-    m = size(qp.A, 1)
-    n = size(qp.A, 2)
-
-    # Check if Q is a sparse matrix (not an operator)
-    # If Q is an operator (QAP/LASSO), we skip ALL scaling
-    Q_is_operator = isa(qp.Q, AbstractQOperator)
-
-    if Q_is_operator
-        println("Q is an operator - skipping ALL scaling")
-        # Return minimal scaling info with no scaling applied
-        row_norm = CUDA.ones(Float64, m)
-        col_norm = CUDA.ones(Float64, n)
-
-        AL_nInf = copy(qp.AL)
-        AU_nInf = copy(qp.AU)
-        AL_nInf[qp.AL.==-Inf] .= 0.0
-        AU_nInf[qp.AU.==Inf] .= 0.0
-        norm_b_org = m > 0 ? CUDA.norm(max.(abs.(AL_nInf), abs.(AU_nInf)), Inf) : 0.0
-        norm_c_org = CUDA.norm(qp.c, Inf)
-
-        scaling_info = Scaling_info_gpu(
-            copy(qp.l), copy(qp.u),
-            row_norm, col_norm,
-            1.0, 1.0, 1.0, 1.0,
-            norm_b_org, norm_c_org
-        )
-
-        scaling_info.norm_b = m > 0 ? CUDA.norm(max.(abs.(AL_nInf), abs.(AU_nInf))) : 0.0
-        scaling_info.norm_c = CUDA.norm(qp.c)
-
-        # For operator-based problems, Q is not a diagonal matrix
-        diag_Q = zeros(Float64, n)
-        Q_is_diag = false
-
-        return scaling_info, diag_Q, Q_is_diag
-    end
-
-    # For sparse Q, proceed with normal scaling
-    # Initialize scaling vectors on GPU
-    row_norm = CUDA.ones(Float64, m)
-    col_norm = CUDA.ones(Float64, n)
-
-    # Compute original norms for scaling info
-    AL_nInf = copy(qp.AL)
-    AU_nInf = copy(qp.AU)
-    AL_nInf[qp.AL.==-Inf] .= 0.0
-    AU_nInf[qp.AU.==Inf] .= 0.0
-    norm_b_org = CUDA.norm(max.(abs.(AL_nInf), abs.(AU_nInf)), Inf)
-    norm_c_org = CUDA.norm(qp.c, Inf)
-
-    # Initialize scaling info
-    scaling_info = Scaling_info_gpu(
-        copy(qp.l), copy(qp.u),
-        row_norm, col_norm,
-        1.0, 1.0, 1.0, 1.0,
-        norm_b_org, norm_c_org
-    )
-
-    # Get CSR matrix components for A and AT
-    A_rowPtr = qp.A.rowPtr
-    A_colVal = qp.A.colVal
-    A_nzVal = qp.A.nzVal
-    AT_rowPtr = qp.AT.rowPtr
-    AT_colVal = qp.AT.colVal
-    AT_nzVal = qp.AT.nzVal
-
-    # Temporary vectors for scaling
-    temp_row_norm = CUDA.ones(Float64, m)
-    temp_col_norm = CUDA.ones(Float64, n)
-
-    Q_rowPtr = qp.Q.rowPtr
-    Q_colVal = qp.Q.colVal
-    Q_nzVal = qp.Q.nzVal
-
-    # Ruiz scaling - only if Q is a sparse matrix
-    if params.use_Ruiz_scaling
-        for _ in 1:10
-            # Compute column-wise max of |Q| and |A| combined
-            @cuda threads = 256 blocks = ceil(Int, n / 256) compute_row_max_abs_with_Q_kernel!(
-                AT_rowPtr, AT_nzVal, Q_rowPtr, Q_nzVal, temp_col_norm, n
-            )
-            CUDA.synchronize()
-
-            # Compute row-wise max of |A|
-            if m > 0
-                @cuda threads = 256 blocks = ceil(Int, m / 256) compute_row_max_abs_kernel!(
-                    A_rowPtr, A_nzVal, temp_row_norm, m
-                )
-                CUDA.synchronize()
-            end
-
-            # Update cumulative norms
-            row_norm .*= temp_row_norm
-            col_norm .*= temp_col_norm
-
-            # Scale Q if it's a sparse matrix
-            # Scale Q: Q = DC * Q * DC (both rows and cols by temp_col_norm)
-            @cuda threads = 256 blocks = ceil(Int, n / 256) scale_rows_csr_kernel!(
-                Q_rowPtr, Q_nzVal, temp_col_norm, n
-            )
-            CUDA.synchronize()
-
-            @cuda threads = 256 blocks = ceil(Int, n / 256) scale_csr_cols_kernel!(
-                Q_rowPtr, Q_colVal, Q_nzVal, temp_col_norm, n
-            )
-            CUDA.synchronize()
-
-            # Scale A: A = DR * A * DC (rows by temp_row_norm, cols by temp_col_norm)
-            if m > 0
-                @cuda threads = 256 blocks = ceil(Int, m / 256) scale_rows_csr_kernel!(
-                    A_rowPtr, A_nzVal, temp_row_norm, m
-                )
-                CUDA.synchronize()
-
-                @cuda threads = 256 blocks = ceil(Int, m / 256) scale_csr_cols_kernel!(
-                    A_rowPtr, A_colVal, A_nzVal, temp_col_norm, m
-                )
-                CUDA.synchronize()
-
-                # Scale AT: AT = DC * AT * DR (rows by temp_col_norm, cols by temp_row_norm)
-                @cuda threads = 256 blocks = ceil(Int, n / 256) scale_rows_csr_kernel!(
-                    AT_rowPtr, AT_nzVal, temp_col_norm, n
-                )
-                CUDA.synchronize()
-
-                @cuda threads = 256 blocks = ceil(Int, n / 256) scale_csr_cols_kernel!(
-                    AT_rowPtr, AT_colVal, AT_nzVal, temp_row_norm, n
-                )
-                CUDA.synchronize()
-            end
-
-            # Scale objective and constraint bounds
-            @cuda threads = 256 blocks = ceil(Int, n / 256) scale_vector_div_kernel!(
-                qp.c, temp_col_norm, n
-            )
-            CUDA.synchronize()
-
-            # Scale constraint bounds
-            if m > 0
-                @cuda threads = 256 blocks = ceil(Int, m / 256) scale_vector_div_kernel!(
-                    qp.AL, temp_row_norm, m
-                )
-                @cuda threads = 256 blocks = ceil(Int, m / 256) scale_vector_div_kernel!(
-                    qp.AU, temp_row_norm, m
-                )
-                CUDA.synchronize()
-            end
-
-            # Scale variable bounds
-            @cuda threads = 256 blocks = ceil(Int, n / 256) scale_vector_mul_kernel!(
-                qp.l, temp_col_norm, n
-            )
-            @cuda threads = 256 blocks = ceil(Int, n / 256) scale_vector_mul_kernel!(
-                qp.u, temp_col_norm, n
-            )
-            CUDA.synchronize()
-        end
-    end
-
-    # Pock-Chambolle scaling - only if Q is a sparse matrix
-    if params.use_Pock_Chambolle_scaling
-        # Compute column-wise sum of |Q| and |A| combined
-        @cuda threads = 256 blocks = ceil(Int, n / 256) compute_col_sum_abs_with_Q_kernel!(
-            AT_rowPtr, AT_nzVal, Q_rowPtr, Q_nzVal, temp_col_norm, n
-        )
-        CUDA.synchronize()
-
-        # Compute row-wise sum of |A|
-        if m > 0
-            @cuda threads = 256 blocks = ceil(Int, m / 256) compute_row_sum_abs_kernel!(
-                A_rowPtr, A_nzVal, temp_row_norm, m
-            )
-            CUDA.synchronize()
-        end
-
-        # Update cumulative norms
-        row_norm .*= temp_row_norm
-        col_norm .*= temp_col_norm
-
-        # Scale Q if it's a sparse matrix
-        # Scale Q: Q = DC * Q * DC
-        @cuda threads = 256 blocks = ceil(Int, n / 256) scale_rows_csr_kernel!(
-            Q_rowPtr, Q_nzVal, temp_col_norm, n
-        )
-        CUDA.synchronize()
-
-        @cuda threads = 256 blocks = ceil(Int, n / 256) scale_csr_cols_kernel!(
-            Q_rowPtr, Q_colVal, Q_nzVal, temp_col_norm, n
-        )
-        CUDA.synchronize()
-
-        # Scale A: A = DR * A * DC
-        if m > 0
-            @cuda threads = 256 blocks = ceil(Int, m / 256) scale_rows_csr_kernel!(
-                A_rowPtr, A_nzVal, temp_row_norm, m
-            )
-            CUDA.synchronize()
-
-            @cuda threads = 256 blocks = ceil(Int, m / 256) scale_csr_cols_kernel!(
-                A_rowPtr, A_colVal, A_nzVal, temp_col_norm, m
-            )
-            CUDA.synchronize()
-
-            # Scale AT: AT = DC * AT * DR
-            @cuda threads = 256 blocks = ceil(Int, n / 256) scale_rows_csr_kernel!(
-                AT_rowPtr, AT_nzVal, temp_col_norm, n
-            )
-            CUDA.synchronize()
-
-            @cuda threads = 256 blocks = ceil(Int, n / 256) scale_csr_cols_kernel!(
-                AT_rowPtr, AT_colVal, AT_nzVal, temp_row_norm, n
-            )
-            CUDA.synchronize()
-        end
-
-        # Scale objective and bounds
-        @cuda threads = 256 blocks = ceil(Int, n / 256) scale_vector_div_kernel!(
-            qp.c, temp_col_norm, n
-        )
-        if m > 0
-            @cuda threads = 256 blocks = ceil(Int, m / 256) scale_vector_div_kernel!(
-                qp.AL, temp_row_norm, m
-            )
-            @cuda threads = 256 blocks = ceil(Int, m / 256) scale_vector_div_kernel!(
-                qp.AU, temp_row_norm, m
-            )
-        end
-        @cuda threads = 256 blocks = ceil(Int, n / 256) scale_vector_mul_kernel!(
-            qp.l, temp_col_norm, n
-        )
-        @cuda threads = 256 blocks = ceil(Int, n / 256) scale_vector_mul_kernel!(
-            qp.u, temp_col_norm, n
-        )
-        CUDA.synchronize()
-    end
-
-    # b and c scaling, dont use it for now
-    if params.use_bc_scaling && false
-        AL_nInf = copy(qp.AL)
-        AU_nInf = copy(qp.AU)
-        AL_nInf[qp.AL.==-Inf] .= 0.0
-        AU_nInf[qp.AU.==Inf] .= 0.0
-        b_scale = 1 + CUDA.norm(max.(abs.(AL_nInf), abs.(AU_nInf)))
-        c_scale = 1 + CUDA.norm(qp.c)
-
-        println("b_scale: ", b_scale)
-        println("c_scale: ", c_scale)
-
-        # Scale Q: Q *= b_scale / c_scale
-        if Q_is_sparse
-            scale_factor = b_scale / c_scale
+            Q_nzVal = qp.Q.nzVal
             @cuda threads = 256 blocks = ceil(Int, n / 256) scale_vector_scalar_mul_kernel!(
                 Q_nzVal, scale_factor, length(Q_nzVal)
             )
             CUDA.synchronize()
+        else
+            scale_factor = b_scale / c_scale
+            qp.Q = qp.Q .* scale_factor
         end
 
-        if m > 0
-            @cuda threads = 256 blocks = ceil(Int, m / 256) scale_vector_scalar_div_kernel!(
-                qp.AL, b_scale, m
+        # Scale bounds and objective
+        if isa(qp, QP_info_gpu)
+            if m > 0
+                @cuda threads = 256 blocks = ceil(Int, m / 256) scale_vector_scalar_div_kernel!(
+                    qp.AL, b_scale, m
+                )
+                @cuda threads = 256 blocks = ceil(Int, m / 256) scale_vector_scalar_div_kernel!(
+                    qp.AU, b_scale, m
+                )
+            end
+            @cuda threads = 256 blocks = ceil(Int, n / 256) scale_vector_scalar_div_kernel!(
+                qp.c, c_scale, n
             )
-            @cuda threads = 256 blocks = ceil(Int, m / 256) scale_vector_scalar_div_kernel!(
-                qp.AU, b_scale, m
+            @cuda threads = 256 blocks = ceil(Int, n / 256) scale_vector_scalar_div_kernel!(
+                qp.l, b_scale, n
             )
+            @cuda threads = 256 blocks = ceil(Int, n / 256) scale_vector_scalar_div_kernel!(
+                qp.u, b_scale, n
+            )
+            CUDA.synchronize()
+        else
+            if m > 0
+                qp.AL ./= b_scale
+                qp.AU ./= b_scale
+            end
+            qp.c ./= c_scale
+            qp.l ./= b_scale
+            qp.u ./= b_scale
         end
-        @cuda threads = 256 blocks = ceil(Int, n / 256) scale_vector_scalar_div_kernel!(
-            qp.c, c_scale, n
-        )
-        @cuda threads = 256 blocks = ceil(Int, n / 256) scale_vector_scalar_div_kernel!(
-            qp.l, b_scale, n
-        )
-        @cuda threads = 256 blocks = ceil(Int, n / 256) scale_vector_scalar_div_kernel!(
-            qp.u, b_scale, n
-        )
-        CUDA.synchronize()
 
         scaling_info.b_scale = b_scale
         scaling_info.c_scale = c_scale
@@ -699,34 +763,93 @@ function scaling_gpu!(qp::QP_info_gpu, params::HPRQP_parameters)
         scaling_info.c_scale = 1.0
     end
 
-    # Update diagonal of Q if Q is sparse
-    # Extract diagonal from GPU Q matrix
-    diag_Q = CUDA.zeros(Float64, n)
-    # This is a simple approach - extract diagonal elements
-    Q_cpu = SparseMatrixCSC(qp.Q)
-    diag_Q_cpu = Vector(diag(Q_cpu))
+    # Update AT if CPU (GPU already modified in-place)
+    if isa(qp, QP_info_cpu)
+        qp.AT = qp.A'
+    end
 
-    # Check if Q is diagonal
-    temp_norm_Q = sum(abs, Q_cpu, dims=1)[1, :]
-    Q_is_diag = (sum(temp_norm_Q .== abs.(diag_Q_cpu)) == length(temp_norm_Q))
-
-    # Symmetrize Q to eliminate numerical errors
-    Q_cpu = (Q_cpu + transpose(Q_cpu)) / 2
-    qp.Q = CuSparseMatrixCSR(Q_cpu)
+    # Symmetrize Q to eliminate numerical errors (after scaling) and extract diagonal
+    if isa(qp, QP_info_gpu)
+        # Symmetrize Q on GPU (requires CPU transfer for now due to CSR format limitations)
+        Q_cpu = SparseMatrixCSC(qp.Q)
+        Q_cpu = (Q_cpu + transpose(Q_cpu)) / 2
+        qp.Q = CuSparseMatrixCSR(Q_cpu)
+    else
+        # Symmetrize Q on CPU
+        qp.Q = (qp.Q + transpose(qp.Q)) / 2
+    end
 
     # Compute final norms
     AL_nInf = copy(qp.AL)
     AU_nInf = copy(qp.AU)
     AL_nInf[qp.AL.==-Inf] .= 0.0
     AU_nInf[qp.AU.==Inf] .= 0.0
-    scaling_info.norm_b = CUDA.norm(max.(abs.(AL_nInf), abs.(AU_nInf)))
-    scaling_info.norm_c = CUDA.norm(qp.c)
+    scaling_info.norm_b = unified_norm(max.(abs.(AL_nInf), abs.(AU_nInf)))
+    scaling_info.norm_c = unified_norm(qp.c)
 
     # Store the cumulative scaling norms
     scaling_info.row_norm = row_norm
     scaling_info.col_norm = col_norm
 
-    return scaling_info, diag_Q_cpu, Q_is_diag
+    CUDA.synchronize()
+
+    scaling_time = time() - t_start
+    if params.verbose
+        println("$(device_name) SCALING time: ", @sprintf("%.2f seconds", scaling_time))
+    end
+
+    return scaling_info
+end
+
+# ============================================================================
+# Legacy Wrapper Functions
+# ============================================================================
+
+# ============================================================================
+# Q Diagonal Check Function
+# ============================================================================
+
+"""
+    check_Q_diagonal(qp::HPRQP_QP_info)
+
+Check if Q matrix is diagonal (only needs sparsity pattern, not scaled values).
+This should be called BEFORE scaling.
+
+# Arguments
+- `qp::HPRQP_QP_info`: QP problem data (QP_info_cpu or QP_info_gpu)
+
+# Returns
+- `diag_Q::Vector{Float64}`: Diagonal elements of Q matrix (before scaling)
+- `Q_is_diag::Bool`: True if Q is diagonal, false otherwise
+"""
+function check_Q_diagonal(qp::HPRQP_QP_info)
+    m, n = size(qp.A)
+
+    # Check if Q is an operator (not a sparse matrix)
+    Q_is_operator = isa(qp.Q, Union{AbstractQOperator,AbstractQOperatorCPU})
+
+    if Q_is_operator
+        # For operator-based problems, return zero diagonal
+        return zeros(Float64, n), false
+    end
+
+    # Unified logic for both GPU and CPU: transfer to CPU for diagonal extraction
+    # This is simpler and avoids complex GPU kernels since we need the values anyway
+    if isa(qp, QP_info_gpu)
+        Q_cpu = SparseMatrixCSC(qp.Q)
+    else
+        Q_cpu = qp.Q
+    end
+
+    # Extract diagonal elements
+    diag_Q = Vector(diag(Q_cpu))
+
+    # Check if Q is diagonal: column sum of |Q| should equal |diag(Q)|
+    temp_norm_Q = vec(sum(abs, Q_cpu, dims=1))
+    diag_Q_abs = abs.(diag_Q)
+    Q_is_diag = all(temp_norm_Q .≈ diag_Q_abs)
+
+    return diag_Q, Q_is_diag
 end
 
 function mean(x::Vector{Float64})
@@ -1147,54 +1270,196 @@ function build_from_Ab_lambda(A::SparseMatrixCSC{Float64}, b::Vector{Float64},
     return qp
 end
 
-# Power iteration method to find the largest eigenvalue of a matrix AAT using GPU
-function power_iteration_A_gpu(A::CuSparseMatrixCSR, AT::CuSparseMatrixCSR, max_iterations=5000, tolerance=1e-4)
+# ============================================================================
+# Eigenvalue Estimation via Power Iteration
+# ============================================================================
+#
+# These functions estimate the largest eigenvalue of matrices A'A and Q using
+# the power iteration method. They are used to set algorithm step sizes.
+#
+# UNIFIED DESIGN VIA MULTIPLE DISPATCH:
+# -------------------------------------
+# These functions use Julia's multiple dispatch to provide a unified interface
+# that automatically selects CPU or GPU implementations based on matrix types:
+#   - CPU: SparseMatrixCSC matrices dispatch to CPU implementations
+#   - GPU: CuSparseMatrixCSR matrices dispatch to GPU implementations
+#
+# The implementations use unified operations (unified_norm, unified_dot,
+# unified_mul!) which dispatch to device-specific kernels at compile time
+# with zero runtime overhead. This is the same pattern used throughout the
+# main solver algorithm.
+#
+# BENEFITS:
+# ---------
+# 1. **Single Interface**: Algorithm code calls power_iteration_A/Q without
+#    needing to know about CPU vs GPU
+# 2. **Type Safety**: Compiler ensures correct device is used
+# 3. **Zero Overhead**: Multiple dispatch resolves at compile time
+# 4. **Maintainability**: Algorithm logic written once, not duplicated
+#
+# ============================================================================
+
+"""
+    power_iteration_A(A, AT, max_iterations=5000, tolerance=1e-4)
+
+Estimate the largest eigenvalue of A'A using power iteration.
+
+Automatically dispatches to CPU or GPU implementation based on matrix types:
+- CPU: `A::SparseMatrixCSC`, `AT::SparseMatrixCSC`
+- GPU: `A::CuSparseMatrixCSR`, `AT::CuSparseMatrixCSR`
+
+# Arguments
+- `A`: Constraint matrix (sparse matrix, CPU or GPU)
+- `AT`: Transpose of A (sparse matrix, CPU or GPU)
+- `max_iterations::Int`: Maximum number of iterations (default: 5000)
+- `tolerance::Float64`: Convergence tolerance (default: 1e-4)
+
+# Returns
+- `lambda_max::Float64`: Estimated largest eigenvalue of A'A
+
+# Algorithm
+Uses the power iteration method:
+1. Start with random vector z
+2. Iterate: q = z/‖z‖, compute A'(Aq), λ = q'(A'Aq)
+3. Check convergence: ‖A'Aq - λq‖ / (‖A'Aq‖ + λ) < tolerance
+
+# Examples
+```julia
+# CPU version
+A_cpu = sprand(100, 50, 0.1)
+AT_cpu = A_cpu'
+λ = power_iteration_A(A_cpu, AT_cpu)
+
+# GPU version
+A_gpu = CuSparseMatrixCSR(A_cpu)
+AT_gpu = CuSparseMatrixCSR(AT_cpu)
+λ = power_iteration_A(A_gpu, AT_gpu)
+```
+"""
+function power_iteration_A(ws::HPRQP_workspace,
+    max_iterations::Int=5000, tolerance::Float64=1e-4)
+    A = ws.A
+    AT = ws.AT
     seed = 1
     m, n = size(A)
-    z = CuVector(randn(Random.MersenneTwister(seed), m)) .+ 1e-8 # Initial random vector
-    q = CUDA.zeros(Float64, m)
-    ATq = CUDA.zeros(Float64, n)
+
+    # Create vectors with appropriate type (Vector for CPU, CuVector for GPU)
+    z_init = randn(Random.MersenneTwister(seed), m) .+ 1e-8
+    is_gpu = ws isa HPRQP_workspace_gpu
+    if is_gpu
+        spmv_A = ws.spmv_A
+        spmv_AT = ws.spmv_AT
+    else
+        spmv_A = nothing
+        spmv_AT = nothing
+    end
+    z = is_gpu ? CuVector(z_init) : z_init
+    q = similar(z)
+    ATq = similar(z, n)
+
     lambda_max = 1.0
     error = 1.0
+
     for i in 1:max_iterations
         q .= z
-        q ./= CUDA.norm(q)
-        CUDA.CUSPARSE.mv!('N', 1, AT, q, 0, ATq, 'O', CUDA.CUSPARSE.CUSPARSE_SPMV_CSR_ALG2)
-        CUDA.CUSPARSE.mv!('N', 1, A, ATq, 0, z, 'O', CUDA.CUSPARSE.CUSPARSE_SPMV_CSR_ALG2)
-        lambda_max = CUDA.dot(q, z)
-        q .= z .- lambda_max .* q        # error 
-        error = CUDA.norm(q) / (CUDA.norm(z) + lambda_max)
+        q ./= unified_norm(q)
+        # Use preprocessed structures if available (GPU only)
+        if spmv_AT !== nothing
+            unified_mul!(ATq, AT, q, spmv_AT)
+        else
+            unified_mul!(ATq, AT, q)
+        end
+        if spmv_A !== nothing
+            unified_mul!(z, A, ATq, spmv_A)
+        else
+            unified_mul!(z, A, ATq)
+        end
+        lambda_max = unified_dot(q, z)
+        q .= z .- lambda_max .* q
+        error = unified_norm(q) / (unified_norm(z) + lambda_max)
+
         if error < tolerance
             return lambda_max
         end
     end
-    println("Power iteration did not converge within the specified tolerance.")
+
+    println("Power iteration (A) did not converge within the specified tolerance.")
     println("The maximum iteration is ", max_iterations, " and the error is ", error)
     return lambda_max
 end
 
-# Power iteration method to find the largest eigenvalue of a matrix Q using GPU
-# Supports both CuSparseMatrixCSR and AbstractQOperator (LASSO, QAP, custom operators)
-function power_iteration_Q_gpu(Q::Union{CuSparseMatrixCSR, AbstractQOperator}, max_iterations=5000, tolerance=1e-4)
+"""
+    power_iteration_Q(Q, max_iterations=5000, tolerance=1e-4)
+
+Estimate the largest eigenvalue of Q using power iteration.
+
+Automatically dispatches to CPU or GPU implementation based on Q type:
+- CPU: `Q::SparseMatrixCSC` or `Q::AbstractQOperatorCPU`
+- GPU: `Q::CuSparseMatrixCSR` or `Q::AbstractQOperator` (GPU operators)
+
+# Arguments
+- `Q`: Quadratic term matrix or operator (CPU or GPU)
+- `max_iterations::Int`: Maximum number of iterations (default: 5000)
+- `tolerance::Float64`: Convergence tolerance (default: 1e-4)
+
+# Returns
+- `lambda_max::Float64`: Estimated largest eigenvalue of Q
+
+# Examples
+```julia
+# CPU sparse matrix
+Q_cpu = sprand(100, 100, 0.1)
+λ = power_iteration_Q(Q_cpu)
+
+# GPU sparse matrix
+Q_gpu = CuSparseMatrixCSR(Q_cpu)
+λ = power_iteration_Q(Q_gpu)
+
+# LASSO operator (GPU)
+lasso_op = create_lasso_operator_gpu(...)
+λ = power_iteration_Q(lasso_op)
+```
+"""
+function power_iteration_Q(ws::HPRQP_workspace,
+    max_iterations::Int=5000, tolerance::Float64=1e-4)
+    Q = ws.Q
     seed = 1
     n = get_problem_size(Q)
-    z = CuVector(randn(Random.MersenneTwister(seed), n)) .+ 1e-8 # Initial random vector
-    q = CUDA.zeros(Float64, n)
+
+    # Create vectors with appropriate type based on Q
+    z_init = randn(Random.MersenneTwister(seed), n) .+ 1e-8
+    is_gpu = ws isa HPRQP_workspace_gpu
+    if is_gpu
+        spmv_Q = ws.spmv_Q
+    else
+        spmv_Q = nothing
+    end
+    z = is_gpu ? CuVector(z_init) : z_init
+    q = similar(z)
+
     lambda_max = 1.0
     error = 1.0
+
     for i in 1:max_iterations
         q .= z
-        q ./= CUDA.norm(q)
-        Qmap!(q, z, Q)  # Uses operator's Qmap! and temp storage
-        lambda_max = CUDA.dot(q, z)
-        q .= z .- lambda_max .* q        # error 
-        error = CUDA.norm(q) / (CUDA.norm(z) + lambda_max)
+        q ./= unified_norm(q)
+        # For sparse matrices, pass spmv_Q if available
+        if Q isa Union{SparseMatrixCSC,CuSparseMatrixCSR}
+            Qmap!(q, z, Q, spmv_Q)
+        else
+            # For operators, they handle preprocessing internally
+            Qmap!(q, z, Q)
+        end
+        lambda_max = unified_dot(q, z)
+        q .= z .- lambda_max .* q
+        error = unified_norm(q) / (unified_norm(z) + lambda_max)
 
         if error < tolerance
             return lambda_max
         end
     end
-    println("Power iteration did not converge within the specified tolerance.")
+
+    println("Power iteration (Q) did not converge within the specified tolerance.")
     println("The maximum iteration is ", max_iterations, " and the error is ", error)
     return lambda_max
 end
@@ -1313,65 +1578,6 @@ function run_dataset(data_path::String, result_path::String, params::HPRQP_param
     end
 
     close(io)
-end
-
-# ============================================================================
-# CPU Power Iteration Functions
-# ============================================================================
-
-# Power iteration for CPU: A matrix (constraint matrix)
-function power_iteration_A_cpu(A::SparseMatrixCSC, AT::SparseMatrixCSC,
-    max_iterations::Int=5000, tolerance::Float64=1e-4)
-    seed = 1
-    m, n = size(A)
-    z = Vector(randn(Random.MersenneTwister(seed), m)) .+ 1e-8  # Initial random vector
-    q = zeros(Float64, m)
-    ATq = zeros(Float64, n)
-    lambda_max = 1.0
-    error = 1.0
-
-    for i in 1:max_iterations
-        q .= z
-        q ./= norm(q)
-        mul!(ATq, AT, q)
-        mul!(z, A, ATq)
-        lambda_max = dot(q, z)
-        q .= z .- lambda_max .* q  # error vector
-        error = norm(q) / (norm(z) + lambda_max)
-
-        if error < tolerance
-            return lambda_max
-        end
-    end
-
-    println("Power iteration (A) did not converge within the specified tolerance.")
-    println("The maximum iteration is ", max_iterations, " and the error is ", error)
-    return lambda_max
-end
-
-# Power iteration for CPU: Q sparse matrix
-function power_iteration_Q_cpu(Q::Union{SparseMatrixCSC, AbstractQOperatorCPU}, max_iterations=5000, tolerance=1e-4)
-    seed = 1
-    n = get_problem_size(Q)
-    z = randn(Random.MersenneTwister(seed), n) .+ 1e-8 # Initial random vector
-    q = zeros(Float64, n)
-    lambda_max = 1.0
-    error = 1.0
-    for i in 1:max_iterations
-        q .= z
-        q ./= norm(q)
-        Qmap!(q, z, Q)  # Uses operator's Qmap! and temp storage
-        lambda_max = dot(q, z)
-        q .= z .- lambda_max .* q        # error 
-        error = norm(q) / (norm(z) + lambda_max)
-
-        if error < tolerance
-            return lambda_max
-        end
-    end
-    println("Power iteration did not converge within the specified tolerance.")
-    println("The maximum iteration is ", max_iterations, " and the error is ", error)
-    return lambda_max
 end
 
 # ============================================================================
@@ -1503,31 +1709,4 @@ function spmv_AT_operation!(ws::HPRQP_workspace_gpu, vec_in::CuVector{Float64}, 
     end
 end
 
-# ============================================================================
-# MOI Cache Definition for JuMP Integration
-# ============================================================================
 
-MOI.Utilities.@product_of_sets(
-    QPSets,
-    MOI.EqualTo{T},
-    MOI.LessThan{T},
-    MOI.GreaterThan{T},
-    MOI.Interval{T},
-)
-
-# Define the cache type with MatrixOfConstraints for QP (similar to HPRLP)
-const OptimizerCache = MOI.Utilities.GenericModel{
-    Float64,
-    MOI.Utilities.ObjectiveContainer{Float64},
-    MOI.Utilities.VariablesContainer{Float64},
-    MOI.Utilities.MatrixOfConstraints{
-        Float64,
-        MOI.Utilities.MutableSparseMatrixCSC{
-            Float64,
-            Int,
-            MOI.Utilities.OneBasedIndexing,
-        },
-        MOI.Utilities.Hyperrectangle{Float64},
-        QPSets{Float64},
-    },
-}
