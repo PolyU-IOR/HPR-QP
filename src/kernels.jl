@@ -610,6 +610,47 @@ CUDA.@fastmath @inline function compute_tempv_unified_kernel!(::Val{UseCustom},
     return
 end
 
+# Unified tempv computation kernel
+# Computes: tempv = x_hat + sigma * (Qw - Qw_bar)
+# where Qw_bar can be computed inline (custom) or pre-computed (cuSPARSE)
+CUDA.@fastmath @inline function compute_tempv_zxwy_unified_kernel!(::Val{UseCustom},
+    Halpern_fact1::Float64, Halpern_fact2::Float64,
+    last_Qw::CuDeviceVector{Float64},
+    tempv::CuDeviceVector{Float64},
+    rowPtrQ::CuDeviceVector{Int32},
+    colValQ::CuDeviceVector{Int32},
+    nzValQ::CuDeviceVector{Float64},
+    w_bar::CuDeviceVector{Float64},
+    x_hat::CuDeviceVector{Float64},
+    Qw::CuDeviceVector{Float64},
+    Qw_bar::CuDeviceVector{Float64},
+    sigma::Float64,
+    n::Int) where {UseCustom}
+    i = threadIdx().x + (blockDim().x * (blockIdx().x - 1))
+    @inbounds if i <= n
+        if UseCustom
+            startQ = rowPtrQ[i]
+            stopQ = rowPtrQ[i+1] - 1
+            acc = 0.0
+            @inbounds for k in startQ:stopQ
+                acc += nzValQ[k] * w_bar[colValQ[k]]
+            end
+            x_hat_i = x_hat[i]
+            qw_i = Qw[i]
+            qw_bar_i = Qw_bar[i]
+            tempv[i] = x_hat_i + sigma * (qw_i - acc)
+            qw_hat_i = 2.0 * qw_bar_i - qw_i
+            Qw[i] = muladd(Halpern_fact2, qw_hat_i, Halpern_fact1 * last_Qw[i])
+        else
+            x_hat_i = x_hat[i]
+            qw_i = Qw[i]
+            qw_bar_i = Qw_bar[i]
+            tempv[i] = x_hat_i + sigma * (qw_i - qw_bar_i)
+        end
+    end
+    return
+end
+
 # Unified update_y kernel
 # Combines A*tempv computation with y update in a single kernel
 #
@@ -877,14 +918,14 @@ function unified_update_zxw_gpu!(ws::HPRQP_workspace_gpu, qp::QP_info_gpu,
     end
 
     # Use Qmap! for Q*w (works for both sparse matrices and operators)
-    if !use_custom_spmv_Q
-        # Pass ws.spmv_Q for sparse matrix Q, operators handle their own preprocessing
-        if isa(qp.Q, CuSparseMatrixCSR{Float64,Int32})
-            Qmap!(ws.w, ws.Qw, qp.Q, ws.spmv_Q)
-        else
-            Qmap!(ws.w, ws.Qw, qp.Q)
-        end
-    end
+    # if !use_custom_spmv_Q
+    #     # Pass ws.spmv_Q for sparse matrix Q, operators handle their own preprocessing
+    #     if isa(qp.Q, CuSparseMatrixCSR{Float64,Int32})
+    #         Qmap!(ws.w, ws.Qw, qp.Q, ws.spmv_Q)
+    #     else
+    #         Qmap!(ws.w, ws.Qw, qp.Q)
+    #     end
+    # end
 
     # Step 1: Update z, x, w1
     threads, blocks = gpu_launch_config(ws.n)
@@ -919,8 +960,10 @@ function unified_update_zxw_gpu!(ws::HPRQP_workspace_gpu, qp::QP_info_gpu,
     end
 
     if threads > 0
-        @cuda threads = threads blocks = blocks compute_tempv_unified_kernel!(
+        @cuda threads = threads blocks = blocks compute_tempv_zxwy_unified_kernel!(
             Val(use_custom_spmv_Q),
+            Halpern_fact1, Halpern_fact2,
+            ws.last_Qw,
             ws.tempv, rowPtrQ, colValQ, nzValQ,
             ws.w_bar, ws.x_hat, ws.Qw, ws.Qw_bar, ws.sigma, ws.n)
     end

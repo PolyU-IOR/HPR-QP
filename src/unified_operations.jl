@@ -646,3 +646,35 @@ function prepare_workspace_spmv!(ws::HPRQP_workspace_gpu, qp::QP_info_gpu, verbo
 
     return nothing
 end
+
+# ============================================================================
+# Problem Info Helper Functions
+# ============================================================================
+
+"""
+    get_Q_nnz(Q)
+
+Get the number of non-zero elements in Q matrix.
+Dispatches based on Q type (SparseMatrixCSC for CPU, CuSparseMatrixCSR for GPU).
+"""
+get_Q_nnz(Q::SparseMatrixCSC) = nnz(Q)
+get_Q_nnz(Q::CuSparseMatrixCSR) = length(Q.nzVal)
+
+"""
+    get_A_nnz(A)
+
+Get the number of non-zero elements in A matrix.
+Dispatches based on A type (SparseMatrixCSC for CPU, CuSparseMatrixCSR for GPU).
+"""
+get_A_nnz(A::SparseMatrixCSC) = nnz(A)
+get_A_nnz(A::CuSparseMatrixCSR) = length(A.nzVal)
+
+"""
+    is_q_operator(Q)
+
+Check if Q is an abstract Q operator (LASSO, QAP, or custom).
+Returns true for AbstractQOperator (GPU) or AbstractQOperatorCPU (CPU).
+"""
+is_q_operator(Q::AbstractQOperator) = true
+is_q_operator(Q::AbstractQOperatorCPU) = true
+is_q_operator(Q::Union{SparseMatrixCSC, CuSparseMatrixCSR}) = false

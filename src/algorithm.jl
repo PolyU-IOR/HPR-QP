@@ -541,6 +541,11 @@ function do_restart!(restart_info::HPRQP_restart,
             ws.ATy .= ws.ATy_bar
         end
 
+        if ws.noC
+            ws.Qw .= ws.Qw_bar
+            ws.last_Qw .= ws.Qw_bar
+        end
+
         # Update restart tracking information
         restart_info.last_gap = restart_info.current_gap
         restart_info.save_gap = Inf
@@ -1233,7 +1238,7 @@ function handle_termination(
 end
 
 # CPU version of print_problem_info
-function print_problem_info(qp::QP_info_cpu, ws::HPRQP_workspace_cpu, params::HPRQP_parameters)
+function print_problem_info(qp::HPRQP_QP_info, ws::HPRQP_workspace, params::HPRQP_parameters)
     if !params.verbose
         return
     end
@@ -1244,36 +1249,36 @@ function print_problem_info(qp::QP_info_cpu, ws::HPRQP_workspace_cpu, params::HP
     println("QP PROBLEM INFORMATION")
     println("="^80)
 
-    # Determine QP type
-    qp_type = if isa(qp.Q, AbstractQOperatorCPU)
+    # Determine QP type using helper functions
+    qp_type = if is_q_operator(qp.Q)
         get_operator_name(typeof(qp.Q))
-    elseif isa(qp.Q, SparseMatrixCSC)
-        if nnz(qp.Q) > 0
+    else
+        # Q is a sparse matrix
+        if get_Q_nnz(qp.Q) > 0
             "QP (Quadratic Program - Non-empty Q)"
         else
             "LP (Linear Program - Empty Q)"
         end
-    else
-        "Unknown QP Type"
     end
     println("Problem Type: $qp_type")
 
     # Q matrix information
-    if isa(qp.Q, SparseMatrixCSC)
+    if is_q_operator(qp.Q)
+        op_name = get_operator_name(typeof(qp.Q))
+        println("Q Operator: $op_name operator (implicit matrix)")
+    else
+        # Q is a sparse matrix
         q_size = size(qp.Q, 1)
-        q_nnz = nnz(qp.Q)
+        q_nnz = get_Q_nnz(qp.Q)
         println("Q Matrix: $(q_size)×$(q_size), nnz = $q_nnz")
         if q_nnz > 0
             println("Q is Diagonal: $(ws.Q_is_diag)")
         end
-    elseif isa(qp.Q, AbstractQOperatorCPU)
-        op_name = get_operator_name(typeof(qp.Q))
-        println("Q Operator: $op_name operator (implicit matrix)")
     end
 
     # Constraint matrix information
     if m > 0
-        a_nnz = nnz(qp.A)
+        a_nnz = get_A_nnz(qp.A)
         println("A Matrix: $(m)×$(n), nnz = $a_nnz")
     else
         println("A Matrix: No constraints (unconstrained)")
@@ -1593,7 +1598,7 @@ function main_update_gpu!(ws::HPRQP_workspace_gpu,
         return
     end
     if isa(qp.Q, QAP_Q_operator_gpu) || length(qp.Q.nzVal) > 0
-        if ws.noC || true
+        if ws.noC
             unified_update_zxw_gpu!(ws, qp, Halpern_fact1, Halpern_fact2)
             unified_update_y_gpu!(ws, Halpern_fact1, Halpern_fact2)
             desc_y = CUDA.CUSPARSE.CuDenseVectorDescriptor(ws.y)
@@ -1664,57 +1669,6 @@ function transfer_to_gpu(model::QP_info_cpu, params::HPRQP_parameters)
     return qp, transfer_time
 end
 
-# Print QP problem information
-function print_problem_info(qp::QP_info_gpu, ws::HPRQP_workspace_gpu, params::HPRQP_parameters)
-    if !params.verbose
-        return
-    end
-
-    m, n = size(qp.A)
-
-    println("="^80)
-    println("QP PROBLEM INFORMATION")
-    println("="^80)
-
-    # Determine QP type
-    # Determine problem type using the interface
-    qp_type = if isa(qp.Q, AbstractQOperator)
-        get_operator_name(typeof(qp.Q))
-    elseif isa(qp.Q, CuSparseMatrixCSR)
-        if length(qp.Q.nzVal) > 0
-            "QP (Quadratic Program - Non-empty Q)"
-        else
-            "LP (Linear Program - Empty Q)"
-        end
-    else
-        "Unknown QP Type"
-    end
-    println("Problem Type: $qp_type")
-
-    # Q matrix information
-    if isa(qp.Q, CuSparseMatrixCSR)
-        q_size = size(qp.Q, 1)
-        q_nnz = length(qp.Q.nzVal)
-        println("Q Matrix: $(q_size)×$(q_size), nnz = $q_nnz")
-        if q_nnz > 0
-            println("Q is Diagonal: $(ws.Q_is_diag)")
-        end
-    elseif isa(qp.Q, AbstractQOperator)
-        op_name = get_operator_name(typeof(qp.Q))
-        println("Q Operator: $op_name operator (implicit matrix)")
-    end
-
-    # Constraint matrix information
-    if m > 0
-        a_nnz = length(qp.A.nzVal)
-        println("A Matrix: $(m)×$(n), nnz = $a_nnz")
-    else
-        println("A Matrix: No constraints (unconstrained)")
-    end
-
-    println()
-end
-
 # Print solver parameters
 function print_solver_params(params::HPRQP_parameters, qp::Union{QP_info_gpu,QP_info_cpu}, spmv_mode_Q::String="", spmv_mode_A::String="")
     if !params.verbose
@@ -1735,7 +1689,8 @@ function print_solver_params(params::HPRQP_parameters, qp::Union{QP_info_gpu,QP_
     println("  Print frequency: ", params.print_frequency == -1 ? "Adaptive" : params.print_frequency)
     println("  Eigenvalue factor: ", params.eig_factor)
     println("  Sigma fixed: ", params.sigma_fixed)
-    if params.use_gpu
+    # Only print SpMV modes if they're non-empty (GPU sets them, CPU leaves empty)
+    if !isempty(spmv_mode_Q)
         println("  SpMV mode Q: ", spmv_mode_Q, params.spmv_mode_Q == "auto" ? " (auto-detected)" : "")
         println("  SpMV mode A: ", spmv_mode_A, params.spmv_mode_A == "auto" ? " (auto-detected)" : "")
     end
