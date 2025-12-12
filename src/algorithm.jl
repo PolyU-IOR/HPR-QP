@@ -148,35 +148,58 @@ function compute_residuals_gpu!(ws::HPRQP_workspace_gpu,
     compute_residuals!(ws, qp, sc, res, params, iter)
 end
 
-# This function saves the current and best-so-far state to an HDF5 file
-# It is called whenever the log is printed (if auto_save is enabled)
-# It saves:
-#   - Current solution (x_bar, y_bar, z_bar, w_bar) - scaled to original problem
-#   - Best solution so far (save_x, save_y, save_z, save_w) - scaled to original problem
-#   - Current and best sigma values
-#   - Current and best residuals, objectives, and iteration numbers
-#   - Current iteration number and elapsed time
-#   - All solver parameters including initial solutions
-function save_state_to_hdf5(
+
+# ============================================================================
+# Unified save_state_to_hdf5! function
+# ============================================================================
+
+"""
+    save_state_to_hdf5!(filename, ws, sc, residuals, params, iter, t_start_alg)
+
+Unified implementation of HDF5 state saving for both GPU and CPU workspaces.
+
+Saves the current algorithm state, best solution found so far, and algorithm
+parameters to an HDF5 file. This function uses multiple dispatch via the
+`to_cpu` helper to automatically transfer GPU arrays to CPU for file I/O
+while being a no-op for CPU workspaces.
+
+# Arguments
+- `filename::String`: Path to HDF5 file to create/overwrite
+- `ws`: Workspace (HPRQP_workspace_gpu or HPRQP_workspace_cpu)
+- `sc`: Scaling information (Scaling_info_gpu or Scaling_info_cpu)
+- `residuals::HPRQP_residuals`: Current residuals
+- `params::HPRQP_parameters`: Algorithm parameters
+- `iter::Int`: Current iteration number
+- `t_start_alg::Float64`: Algorithm start time
+
+# File Structure
+The HDF5 file contains three main groups:
+- `current/`: Current iteration state (solution, residuals, iteration info)
+- `best/`: Best solution found so far (solution, residuals)
+- `parameters/`: Algorithm parameters and settings
+
+All solution vectors are saved in their original (unscaled) space.
+"""
+function save_state_to_hdf5!(
     filename::String,
-    ws::HPRQP_workspace_gpu,
-    sc::Scaling_info_gpu,
+    ws::Union{HPRQP_workspace_gpu,HPRQP_workspace_cpu},
+    sc::Union{Scaling_info_gpu,Scaling_info_cpu},
     residuals::HPRQP_residuals,
     params::HPRQP_parameters,
     iter::Int,
     t_start_alg::Float64,
 )
-    # Convert GPU arrays to CPU
-    x_bar = Vector(ws.x_bar)
-    y_bar = Vector(ws.y_bar)
-    z_bar = Vector(ws.z_bar)
-    w_bar = Vector(ws.w_bar)
-    save_x = Vector(ws.saved_state.save_x)
-    save_y = Vector(ws.saved_state.save_y)
-    save_z = Vector(ws.saved_state.save_z)
-    save_w = Vector(ws.saved_state.save_w)
-    col_norm = Vector(sc.col_norm)
-    row_norm = Vector(sc.row_norm)
+    # Transfer arrays to CPU (no-op for CPU workspace)
+    x_bar = to_cpu(ws.x_bar)
+    y_bar = to_cpu(ws.y_bar)
+    z_bar = to_cpu(ws.z_bar)
+    w_bar = to_cpu(ws.w_bar)
+    save_x = to_cpu(ws.saved_state.save_x)
+    save_y = to_cpu(ws.saved_state.save_y)
+    save_z = to_cpu(ws.saved_state.save_z)
+    save_w = to_cpu(ws.saved_state.save_w)
+    col_norm = to_cpu(sc.col_norm)
+    row_norm = to_cpu(sc.row_norm)
 
     # Scale the variables (same as in collect_results)
     x_bar_scaled = sc.b_scale * (x_bar ./ col_norm)
@@ -240,6 +263,7 @@ function save_state_to_hdf5(
         file["best/primal_obj"] = ws.saved_state.save_primal_obj
         file["best/dual_obj"] = ws.saved_state.save_dual_obj
         file["best/rel_gap"] = ws.saved_state.save_rel_gap
+        file["best/KKTx_and_gap"] = max(ws.saved_state.save_err_Rp, ws.saved_state.save_err_Rd, ws.saved_state.save_rel_gap)
 
         # Save parameters
         file["parameters/stoptol"] = params.stoptol
@@ -269,6 +293,10 @@ function save_state_to_hdf5(
         if params.initial_y !== nothing
             file["parameters/initial_y"] = params.initial_y
         end
+    end
+
+    if params.verbose
+        println(@sprintf("State saved to %s at iteration %d", filename, iter))
     end
 end
 
@@ -519,12 +547,6 @@ function do_restart!(restart_info::HPRQP_restart,
         restart_info.times += 1
         restart_info.inner = 0
     end
-end
-
-# This function performs the restart for the HPR-QP algorithm on GPU.
-function do_restart(restart_info::HPRQP_restart, ws::HPRQP_workspace_gpu, qp::QP_info_gpu)
-    # Call unified implementation
-    do_restart!(restart_info, ws, qp)
 end
 
 # This function checks the stopping criteria for the HPR-QP algorithm on GPU.
@@ -1027,17 +1049,12 @@ The update follows the Halpern iteration scheme:
 
 # Three Update Paths:
 
-1. **Empty Q (Linear Program)**: 
-   - No Q matrix present (LP instead of QP)
-   - Simplified updates without proximal operator for Q
-   - Calls: unified_update_zx_cpu!, unified_update_y_noQ_cpu!
-
-2. **LASSO Operator**:
+1. **LASSO Operator**:
    - Q is a LASSO regularization operator
    - Uses soft-thresholding proximal operator
    - Calls: update_zxw_LASSO_cpu! with precomputed factors
 
-3. **Standard QP (Sparse Matrix or QAP)**:
+2. **Standard QP (Sparse Matrix or QAP) with non-empty Q**:
    - Q is sparse matrix or QAP operator
    - Three-step update process:
      * Step 1: Update z, x, w (without dual correction)
@@ -1045,6 +1062,11 @@ The update follows the Halpern iteration scheme:
      * Step 3: Complete w update (add dual correction)
    - Handles diagonal Q with precomputed factor vectors
    - Handles non-diagonal Q with scalar factors
+
+3. **Empty Q (Linear Program)**: 
+   - No Q matrix present (LP instead of QP)
+   - Simplified updates without proximal operator for Q
+   - Calls: unified_update_zx_cpu!, unified_update_y_noQ_cpu!
 
 # Arguments
 - `ws::HPRQP_workspace_cpu`: CPU workspace containing all iterate vectors
@@ -1056,6 +1078,7 @@ The update follows the Halpern iteration scheme:
 - **Cannot be unified**: Device-specific execution paths (loops vs kernels)
 - **Diagonal Q optimization**: Uses precomputed factor vectors when Q is diagonal
 - **Operator dispatch**: Different update logic for LASSO/QAP/sparse matrix Q
+- **Structure matches GPU**: Same branching logic as main_update_gpu! for consistency
 
 # See Also
 - `main_update_gpu!`: GPU version using CUDA kernels
@@ -1066,38 +1089,21 @@ function main_update_cpu!(ws::HPRQP_workspace_cpu, qp::QP_info_cpu, restart_info
     Halpern_fact1 = 1.0 / (restart_info.inner + 2.0)
     Halpern_fact2 = 1.0 - Halpern_fact1
 
-    # Check if Q is empty (noQ case - linear program)
-    is_noQ = isa(qp.Q, SparseMatrixCSC) && length(qp.Q.nzval) == 0
-
-    if is_noQ
-        # Empty Q case (linear program) - use unified noQ kernels
+    # Handle operator-based Q (QAP/LASSO) within main_update
+    if isa(qp.Q, LASSO_Q_operator_cpu)
+        # LASSO update with soft-thresholding (no A matrix for LASSO)
+        update_zxw_LASSO_cpu!(ws, qp, Halpern_fact1, Halpern_fact2)
+        return
+    end
+    if isa(qp.Q, QAP_Q_operator_cpu) || (isa(qp.Q, SparseMatrixCSC) && length(qp.Q.nzval) > 0)
+        # Standard case with Q matrix - use unified kernels with separate Q and A modes
+        update_zxw1_cpu!(ws, qp, Halpern_fact1, Halpern_fact2)
+        update_y_cpu!(ws, qp, Halpern_fact1, Halpern_fact2)
+        update_w2_cpu!(ws, qp, Halpern_fact1, Halpern_fact2)
+    else
+        # Empty Q case (linear program) - use unified kernels with A mode only
         unified_update_zx_cpu!(ws, Halpern_fact1, Halpern_fact2)
         unified_update_y_noQ_cpu!(ws, Halpern_fact1, Halpern_fact2)
-    elseif isa(qp.Q, LASSO_Q_operator_cpu)
-        # LASSO-specific update with soft-thresholding
-        # Compute fact scalars for LASSO
-        fact2_scalar = 1.0 / (1.0 + ws.sigma * ws.lambda_max_Q)
-        fact1_scalar = 1.0 - fact2_scalar
-        update_zxw_LASSO_cpu!(ws, fact1_scalar, fact2_scalar, Halpern_fact1, Halpern_fact2)
-    else
-        # Standard QP update (sparse matrix or QAP operator)
-        # Compute fact1 and fact2 scalars for non-diagonal Q or vector for diagonal Q
-        if ws.Q_is_diag
-            # Use precomputed fact1/fact2 vectors for diagonal Q
-            fact1_scalar = 0.0  # Not used for diagonal Q
-            fact2_scalar = 0.0  # Not used for diagonal Q
-        else
-            # Compute scalar factors for non-diagonal Q
-            fact2_scalar = 1.0 / (1.0 + ws.sigma * ws.lambda_max_Q)
-            fact1_scalar = 1.0 - fact2_scalar
-        end
-
-        # Step 1: Update z, x, and first w_bar (without AT*y_bar correction)
-        update_zxw1_cpu!(ws, fact1_scalar, fact2_scalar, Halpern_fact1, Halpern_fact2, ws.Q_is_diag)
-        # Step 2: Update dual variables y (computes y_bar)
-        update_y_cpu!(ws, Halpern_fact1, Halpern_fact2)
-        # Step 3: Complete w update using the new y_bar (adds AT*y_bar correction)
-        update_w2_cpu!(ws, Halpern_fact1, Halpern_fact2, ws.Q_is_diag)
     end
 end
 
@@ -1136,102 +1142,6 @@ end
 # CPU Helper Functions (restart, termination, etc.)
 # ============================================================================
 
-# CPU version of do_restart
-function do_restart_cpu!(restart_info::HPRQP_restart, ws::HPRQP_workspace_cpu, qp::QP_info_cpu)
-    # Call unified implementation
-    do_restart!(restart_info, ws, qp)
-end
-
-# CPU version of save_state_to_hdf5
-function save_state_to_hdf5_cpu(
-    filename::String,
-    ws::HPRQP_workspace_cpu,
-    sc::Scaling_info_cpu,
-    residuals::HPRQP_residuals,
-    params::HPRQP_parameters,
-    iter::Int,
-    t_start_alg::Float64,
-)
-    # For CPU, variables are already on CPU - just scale them
-    x_bar = ws.x_bar
-    y_bar = ws.y_bar
-    z_bar = ws.z_bar
-    w_bar = ws.w_bar
-    save_x = ws.saved_state.save_x
-    save_y = ws.saved_state.save_y
-    save_z = ws.saved_state.save_z
-    save_w = ws.saved_state.save_w
-    col_norm = sc.col_norm
-    row_norm = sc.row_norm
-
-    # Scale the variables (same as in collect_results)
-    x_bar_scaled = sc.b_scale * (x_bar ./ col_norm)
-    w_bar_scaled = sc.b_scale * (w_bar ./ col_norm)
-    save_x_scaled = sc.b_scale * (save_x ./ col_norm)
-    save_w_scaled = sc.b_scale * (save_w ./ col_norm)
-
-    if ws.m > 0
-        y_bar_scaled = sc.c_scale * (y_bar ./ row_norm)
-        save_y_scaled = sc.c_scale * (save_y ./ row_norm)
-        z_bar_scaled = sc.c_scale * (z_bar ./ col_norm)
-        save_z_scaled = sc.c_scale * (save_z ./ col_norm)
-    else
-        y_bar_scaled = Float64[]
-        save_y_scaled = Float64[]
-        z_bar_scaled = sc.c_scale * (z_bar ./ col_norm)
-        save_z_scaled = sc.c_scale * (save_z ./ col_norm)
-    end
-
-    # Create or open HDF5 file
-    if isfile(filename)
-        rm(filename, force=true)
-    end
-    h5open(filename, "w") do file
-        # Save current iteration info
-        file["current/iteration"] = iter
-        file["current/time_elapsed"] = time() - t_start_alg
-        file["current/timestamp"] = string(Dates.now())
-
-        # Save current solution (scaled)
-        file["current/x_org"] = x_bar_scaled
-        file["current/w_org"] = w_bar_scaled
-        if ws.m > 0
-            file["current/y_org"] = y_bar_scaled
-        end
-        file["current/z_org"] = z_bar_scaled
-        file["current/sigma"] = ws.sigma
-
-        # Save current residuals
-        file["current/err_Rp"] = residuals.err_Rp_org_bar
-        file["current/err_Rd"] = residuals.err_Rd_org_bar
-        file["current/primal_obj"] = residuals.primal_obj_bar
-        file["current/dual_obj"] = residuals.dual_obj_bar
-        file["current/rel_gap"] = residuals.rel_gap_bar
-        file["current/KKTx_and_gap"] = residuals.KKTx_and_gap_org_bar
-
-        # Save best solution so far (scaled)
-        file["best/x_org"] = save_x_scaled
-        file["best/w_org"] = save_w_scaled
-        if ws.m > 0
-            file["best/y_org"] = save_y_scaled
-        end
-        file["best/z_org"] = save_z_scaled
-        file["best/sigma"] = ws.saved_state.save_sigma
-        file["best/iteration"] = ws.saved_state.save_iter
-
-        # Save best residuals
-        file["best/err_Rp"] = ws.saved_state.save_err_Rp
-        file["best/err_Rd"] = ws.saved_state.save_err_Rd
-        file["best/primal_obj"] = ws.saved_state.save_primal_obj
-        file["best/dual_obj"] = ws.saved_state.save_dual_obj
-        file["best/rel_gap"] = ws.saved_state.save_rel_gap
-        file["best/KKTx_and_gap"] = max(ws.saved_state.save_err_Rp, ws.saved_state.save_err_Rd, ws.saved_state.save_rel_gap)
-    end
-
-    if params.verbose
-        println(@sprintf("State saved to %s at iteration %d", filename, iter))
-    end
-end
 
 # ============================================================================
 # Unified handle_termination function
@@ -1675,7 +1585,6 @@ function main_update_gpu!(ws::HPRQP_workspace_gpu,
 )
     Halpern_fact1 = 1.0 / (restart_info.inner + 2.0)
     Halpern_fact2 = 1.0 - Halpern_fact1
-    compute_full = ws.to_check
 
     # Handle operator-based Q (QAP/LASSO) within main_update
     if isa(qp.Q, LASSO_Q_operator_gpu)
@@ -1684,10 +1593,21 @@ function main_update_gpu!(ws::HPRQP_workspace_gpu,
         return
     end
     if isa(qp.Q, QAP_Q_operator_gpu) || length(qp.Q.nzVal) > 0
-        # Standard case with Q matrix - use unified kernels with separate Q and A modes
-        unified_update_zxw1_gpu!(ws, qp, Halpern_fact1, Halpern_fact2)
-        unified_update_y_gpu!(ws, Halpern_fact1, Halpern_fact2)
-        unified_update_w2_gpu!(ws, Halpern_fact1, Halpern_fact2)
+        if ws.noC || true
+            unified_update_zxw_gpu!(ws, qp, Halpern_fact1, Halpern_fact2)
+            unified_update_y_gpu!(ws, Halpern_fact1, Halpern_fact2)
+            desc_y = CUDA.CUSPARSE.CuDenseVectorDescriptor(ws.y)
+            desc_ATy = CUDA.CUSPARSE.CuDenseVectorDescriptor(ws.ATy)
+            CUDA.CUSPARSE.cusparseSpMV(ws.spmv_AT.handle, ws.spmv_AT.operator, ws.spmv_AT.alpha,
+                ws.spmv_AT.desc_AT, desc_y, ws.spmv_AT.beta, desc_ATy,
+                ws.spmv_AT.compute_type, ws.spmv_AT.alg, ws.spmv_AT.buf)
+            return
+        else
+            # Standard case with Q matrix - use unified kernels with separate Q and A modes
+            unified_update_zxw1_gpu!(ws, qp, Halpern_fact1, Halpern_fact2)
+            unified_update_y_gpu!(ws, Halpern_fact1, Halpern_fact2)
+            unified_update_w2_gpu!(ws, Halpern_fact1, Halpern_fact2)
+        end
     else
         # Empty Q case (linear program) - use unified kernels with A mode only
         unified_update_zx_gpu!(ws, Halpern_fact1, Halpern_fact2)
@@ -2251,23 +2171,9 @@ function should_print(iter::Int, params::HPRQP_parameters, t_start_alg::Float64)
     end
 end
 
-# Helper function: Print iteration log
-function print_iteration_log(iter::Int, residuals::HPRQP_residuals,
-    ws::HPRQP_workspace_gpu, t_start_alg::Float64)
-    println(@sprintf("%5.0f    %3.2e    %3.2e    %+7.6e    %+7.6e    %3.2e    %3.2e    %6.2f",
-        iter,
-        residuals.err_Rp_org_bar,
-        residuals.err_Rd_org_bar,
-        residuals.primal_obj_bar,
-        residuals.dual_obj_bar,
-        residuals.rel_gap_bar,
-        ws.sigma,
-        time() - t_start_alg))
-end
-
 # CPU version of print_iteration_log
 function print_iteration_log(iter::Int, residuals::HPRQP_residuals,
-    ws::HPRQP_workspace_cpu, t_start_alg::Float64)
+    ws::HPRQP_workspace, t_start_alg::Float64)
     println(@sprintf("%5.0f    %3.2e    %3.2e    %+7.6e    %+7.6e    %3.2e    %3.2e    %6.2f",
         iter,
         residuals.err_Rp_org_bar,
@@ -2334,6 +2240,7 @@ function handle_termination_cpu(
 end
 
 # Helper function: Perform main iteration step (update and norm computation)
+# GPU version
 function perform_iteration_step!(ws::HPRQP_workspace_gpu, qp::QP_info_gpu,
     params::HPRQP_parameters, restart_info::HPRQP_restart,
     iter::Int, check_iter::Int)
@@ -2346,6 +2253,24 @@ function perform_iteration_step!(ws::HPRQP_workspace_gpu, qp::QP_info_gpu,
 
     if rem(iter + 1, check_iter) == 0
         restart_info.current_gap = compute_M_norm_gpu!(ws, qp)
+    end
+
+    restart_info.inner += 1
+end
+
+# CPU version
+function perform_iteration_step!(ws::HPRQP_workspace_cpu, qp::QP_info_cpu,
+    params::HPRQP_parameters, restart_info::HPRQP_restart,
+    iter::Int, check_iter::Int)
+    # Main update
+    main_update_cpu!(ws, qp, restart_info)
+    # Compute M norm for restart decision (unified function via dispatch)
+    if restart_info.restart_flag > 0
+        restart_info.last_gap = compute_M_norm!(ws, qp)
+    end
+
+    if rem(iter + 1, check_iter) == 0
+        restart_info.current_gap = compute_M_norm!(ws, qp)
     end
 
     restart_info.inner += 1
@@ -2375,9 +2300,6 @@ function solve(model::QP_info_cpu, params::HPRQP_parameters)
 
     diag_Q, Q_is_diag = check_Q_diagonal(qp)
 
-    setup_time = time() - setup_start
-    t_start_alg = time()
-
     # Get problem dimensions
     m, n = size(qp.A)
 
@@ -2390,11 +2312,15 @@ function solve(model::QP_info_cpu, params::HPRQP_parameters)
     ws = allocate_workspace(qp, params, 0.0, 0.0, scaling_info, diag_Q, Q_is_diag)
 
     # Step 2: Prepare CUSPARSE SpMV structures (GPU-only, no-op for CPU)
-    # This is done BEFORE eigenvalue estimation so power_iteration can potentially use preprocessed structures
+    # This is done BEFORE eigenvalue estimation so power_iteration can use preprocessed structures
     prepare_workspace_spmv!(ws, qp, params.verbose)
 
     # Step 3: Estimate eigenvalues using power_iteration
     # Now utilizes preprocessed SpMV structures for better performance
+
+    setup_time = time() - setup_start
+    t_start_alg = time()
+
     ws.lambda_max_A, ws.lambda_max_Q, power_time = estimate_eigenvalues(qp, params, Q_is_diag, ws)
 
     # Step 4: Process initial_x if provided
@@ -2462,13 +2388,8 @@ function solve(model::QP_info_cpu, params::HPRQP_parameters)
 
     # Update Q factors for diagonal Q
     if ws.Q_is_diag
-        if isa(qp.Q, CuSparseMatrixCSR)
-            update_Q_factors_gpu!(ws.fact2, ws.fact, ws.fact1, ws.fact_M,
-                ws.diag_Q, ws.sigma)
-        else
-            update_Q_factors_cpu!(ws.fact2, ws.fact, ws.fact1, ws.fact_M,
-                ws.diag_Q, ws.sigma)
-        end
+        unified_update_Q_factors!(ws.fact2, ws.fact, ws.fact1, ws.fact_M,
+            ws.diag_Q, ws.sigma)
     end
 
     if params.verbose
@@ -2480,6 +2401,14 @@ function solve(model::QP_info_cpu, params::HPRQP_parameters)
 
     # Main iteration loop
     # Note: compute_residuals!, update_sigma! are now unified and dispatch based on workspace type
+    number_empty_lu = sum((model.l .== -Inf) .& (model.u .== Inf))
+    # noC = true
+    if (number_empty_lu > 0.8 * length(model.l))
+        ws.noC = true
+    else
+        ws.noC = false
+    end
+
     for iter = 0:params.max_iter
         # Determine if we should print at this iteration
         print_yes = should_print(iter, params, t_start_alg, params.max_iter)
@@ -2501,11 +2430,7 @@ function solve(model::QP_info_cpu, params::HPRQP_parameters)
         update_sigma!(params, restart_info, ws, qp, residuals)
 
         # Perform restart
-        if params.use_gpu
-            do_restart(restart_info, ws, qp)
-        else
-            do_restart_cpu!(restart_info, ws, qp)
-        end
+        do_restart!(restart_info, ws, qp)
 
         # Print iteration log
         if (print_yes || (status != "CONTINUE")) && params.verbose
@@ -2515,11 +2440,7 @@ function solve(model::QP_info_cpu, params::HPRQP_parameters)
         # Save to HDF5 if auto_save is enabled
         if (print_yes || (status != "CONTINUE")) && params.auto_save
             try
-                if params.use_gpu
-                    save_state_to_hdf5(params.save_filename, ws, scaling_info, residuals, params, iter, t_start_alg)
-                else
-                    save_state_to_hdf5_cpu(params.save_filename, ws, scaling_info, residuals, params, iter, t_start_alg)
-                end
+                save_state_to_hdf5!(params.save_filename, ws, scaling_info, residuals, params, iter, t_start_alg)
             catch e
                 if params.verbose
                     println("Warning: Failed to save to HDF5 file: ", e)
@@ -2546,24 +2467,9 @@ function solve(model::QP_info_cpu, params::HPRQP_parameters)
         elseif params.print_frequency > 0
             ws.to_check = ws.to_check || (rem(next_iter, params.print_frequency) == 0)
         end
-        ws.to_check = true
 
         # Perform main iteration step
         # Note: main_update_gpu!/main_update_cpu! must stay separate due to device-specific kernels
-        if params.use_gpu
-            perform_iteration_step!(ws, qp, params, restart_info, iter, check_iter)
-        else
-            main_update_cpu!(ws, qp, restart_info)
-            # Compute M norm for restart decision (unified function via dispatch)
-            if restart_info.restart_flag > 0
-                restart_info.last_gap = compute_M_norm!(ws, qp)
-            end
-
-            if rem(iter + 1, check_iter) == 0
-                restart_info.current_gap = compute_M_norm!(ws, qp)
-            end
-
-            restart_info.inner += 1
-        end
+        perform_iteration_step!(ws, qp, params, restart_info, iter, check_iter)
     end
 end

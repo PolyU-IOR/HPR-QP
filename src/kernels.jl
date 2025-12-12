@@ -448,6 +448,132 @@ CUDA.@fastmath @inline function unified_update_zxw1_kernel_partial!(::Val{UseCus
     return
 end
 
+# Full version: computes all intermediate values
+CUDA.@fastmath @inline function unified_update_zxw_kernel_full!(::Val{UseCustom}, ::Val{IsDiag},
+    last_w::CuDeviceVector{Float64}, dw::CuDeviceVector{Float64}, dx::CuDeviceVector{Float64},
+    rowPtrQ::CuDeviceVector{Int32}, colValQ::CuDeviceVector{Int32}, nzValQ::CuDeviceVector{Float64},
+    w_bar::CuDeviceVector{Float64}, w::CuDeviceVector{Float64},
+    z_bar::CuDeviceVector{Float64}, x_bar::CuDeviceVector{Float64}, x_hat::CuDeviceVector{Float64},
+    last_x::CuDeviceVector{Float64}, x::CuDeviceVector{Float64},
+    Qw::CuDeviceVector{Float64}, ATy::CuDeviceVector{Float64}, c::CuDeviceVector{Float64},
+    l::CuDeviceVector{Float64}, u::CuDeviceVector{Float64},
+    sigma::Float64, fact1_scalar::Float64, fact2_scalar::Float64,
+    fact1_vec::CuDeviceVector{Float64}, fact2_vec::CuDeviceVector{Float64},
+    Halpern_fact1::Float64, Halpern_fact2::Float64, n::Int) where {UseCustom,IsDiag}
+    i = threadIdx().x + (blockDim().x * (blockIdx().x - 1))
+    @inbounds if i <= n
+        qw_val = if UseCustom
+            startQ = rowPtrQ[i]
+            stopQ = rowPtrQ[i+1] - 1
+            acc = 0.0
+            @inbounds for k in startQ:stopQ
+                acc += nzValQ[k] * w[colValQ[k]]
+            end
+            Qw[i] = acc
+            acc
+        else
+            Qw[i]
+        end
+
+        atyi = ATy[i]
+        c_i = c[i]
+        x_i = x[i]
+        last_x_i = last_x[i]
+        last_w_i = last_w[i]
+        l_i = l[i]
+        u_i = u[i]
+        w_i = w[i]
+
+        tmp = -qw_val + atyi - c_i
+        z_raw = x_i + sigma * tmp
+        x_bar_i = min(max(z_raw, l_i), u_i)
+
+        x_hat_i = 2.0 * x_bar_i - x_i
+        x_new = muladd(Halpern_fact2, x_hat_i, Halpern_fact1 * last_x_i)
+
+        w_bar_i = if IsDiag
+            fact1_i = fact1_vec[i]
+            fact2_i = fact2_vec[i]
+            muladd(fact1_i, w_i, fact2_i * x_hat_i)
+        else
+            muladd(fact1_scalar, w_i, fact2_scalar * x_hat_i)
+        end
+
+        w_new = muladd(Halpern_fact2, w_bar_i, Halpern_fact1 * last_w_i)
+
+        dx_val = x_bar_i - x_i
+        dx[i] = dx_val
+        x_bar[i] = x_bar_i
+        z_bar[i] = (x_bar_i - z_raw) / sigma
+        x[i] = x_new
+        x_hat[i] = x_hat_i
+        w_bar[i] = w_bar_i
+        w[i] = w_new
+        dw[i] = w_bar_i - w_i
+    end
+    return
+end
+
+# Partial version: skips intermediate writes
+CUDA.@fastmath @inline function unified_update_zxw_kernel_partial!(::Val{UseCustom}, ::Val{IsDiag},
+    last_w::CuDeviceVector{Float64}, dw::CuDeviceVector{Float64}, dx::CuDeviceVector{Float64},
+    rowPtrQ::CuDeviceVector{Int32}, colValQ::CuDeviceVector{Int32}, nzValQ::CuDeviceVector{Float64},
+    w_bar::CuDeviceVector{Float64}, w::CuDeviceVector{Float64},
+    z_bar::CuDeviceVector{Float64}, x_bar::CuDeviceVector{Float64}, x_hat::CuDeviceVector{Float64},
+    last_x::CuDeviceVector{Float64}, x::CuDeviceVector{Float64},
+    Qw::CuDeviceVector{Float64}, ATy::CuDeviceVector{Float64}, c::CuDeviceVector{Float64},
+    l::CuDeviceVector{Float64}, u::CuDeviceVector{Float64},
+    sigma::Float64, fact1_scalar::Float64, fact2_scalar::Float64,
+    fact1_vec::CuDeviceVector{Float64}, fact2_vec::CuDeviceVector{Float64},
+    Halpern_fact1::Float64, Halpern_fact2::Float64, n::Int) where {UseCustom,IsDiag}
+    i = threadIdx().x + (blockDim().x * (blockIdx().x - 1))
+    @inbounds if i <= n
+        qw_val = if UseCustom
+            startQ = rowPtrQ[i]
+            stopQ = rowPtrQ[i+1] - 1
+            acc = 0.0
+            @inbounds for k in startQ:stopQ
+                acc += nzValQ[k] * w[colValQ[k]]
+            end
+            Qw[i] = acc
+            acc
+        else
+            Qw[i]
+        end
+
+        atyi = ATy[i]
+        c_i = c[i]
+        x_i = x[i]
+        last_x_i = last_x[i]
+        last_w_i = last_w[i]
+        l_i = l[i]
+        u_i = u[i]
+        w_i = w[i]
+
+        tmp = -qw_val + atyi - c_i
+        z_raw = x_i + sigma * tmp
+        x_bar_i = min(max(z_raw, l_i), u_i)
+
+        x_hat_i = 2.0 * x_bar_i - x_i
+        x_new = muladd(Halpern_fact2, x_hat_i, Halpern_fact1 * last_x_i)
+
+        w_bar_i = if IsDiag
+            fact1_i = fact1_vec[i]
+            fact2_i = fact2_vec[i]
+            muladd(fact1_i, w_i, fact2_i * x_hat_i)
+        else
+            muladd(fact1_scalar, w_i, fact2_scalar * x_hat_i)
+        end
+        w_new = muladd(Halpern_fact2, w_bar_i, Halpern_fact1 * last_w_i)
+
+        x[i] = x_new
+        x_hat[i] = x_hat_i
+        w_bar[i] = w_bar_i
+        w[i] = w_new
+    end
+    return
+end
+
 # Unified tempv computation kernel
 # Computes: tempv = x_hat + sigma * (Qw - Qw_bar)
 # where Qw_bar can be computed inline (custom) or pre-computed (cuSPARSE)
@@ -592,6 +718,7 @@ CUDA.@fastmath @inline function unified_update_y_kernel_partial!(::Val{UseCustom
         y_bar_i = fact2 * corr
         y_new = Halpern_fact1 * last_y_i + Halpern_fact2 * (2.0 * y_bar_i - y_i)
 
+        y_bar[i] = y_bar_i
         y[i] = y_new
     end
     return
@@ -724,6 +851,79 @@ CUDA.@fastmath @inline function unified_update_w2_kernel_partial!(::Val{UseCusto
         ATy[i] = ATy_new
     end
     return
+end
+
+# Unified wrapper for update_zxw1 that handles both custom and cuSPARSE SpMV, and regular/diagonal Q
+function unified_update_zxw_gpu!(ws::HPRQP_workspace_gpu, qp::QP_info_gpu,
+    Halpern_fact1::Float64, Halpern_fact2::Float64)
+    # Determine whether to use custom inline SpMV for Q operations
+    use_custom_spmv_Q = (ws.spmv_mode_Q == "customized")
+
+    # Prepare scalar factors for regular Q
+    fact2_scalar = 1.0 / (1.0 + ws.sigma * ws.lambda_max_Q)
+    fact1_scalar = 1.0 - fact2_scalar
+
+    # Pre-computed diagonal scaling factors (ignored when Q is not diagonal)
+    fact1_vec = ws.fact1
+    fact2_vec = ws.fact2
+
+    # Get Q matrix structure (use dummy vectors for operators)
+    # For operators, rowPtr/colVal/nzVal won't be accessed since use_custom_spmv_Q will be false
+    if isa(qp.Q, CuSparseMatrixCSR)
+        rowPtrQ, colValQ, nzValQ = qp.Q.rowPtr, qp.Q.colVal, qp.Q.nzVal
+    else
+        # Dummy vectors for operators (won't be accessed in kernel)
+        rowPtrQ, colValQ, nzValQ = ws.A.rowPtr, ws.A.colVal, ws.A.nzVal
+    end
+
+    # Use Qmap! for Q*w (works for both sparse matrices and operators)
+    if !use_custom_spmv_Q
+        # Pass ws.spmv_Q for sparse matrix Q, operators handle their own preprocessing
+        if isa(qp.Q, CuSparseMatrixCSR{Float64,Int32})
+            Qmap!(ws.w, ws.Qw, qp.Q, ws.spmv_Q)
+        else
+            Qmap!(ws.w, ws.Qw, qp.Q)
+        end
+    end
+
+    # Step 1: Update z, x, w1
+    threads, blocks = gpu_launch_config(ws.n)
+    if threads > 0
+        # Choose kernel based on to_check flag - no recompilation overhead
+        if ws.to_check
+            @cuda threads = threads blocks = blocks unified_update_zxw_kernel_full!(
+                Val(use_custom_spmv_Q), Val(ws.Q_is_diag),
+                ws.last_w, ws.dw, ws.dx, rowPtrQ, colValQ, nzValQ,
+                ws.w_bar, ws.w, ws.z_bar, ws.x_bar, ws.x_hat, ws.last_x, ws.x, ws.Qw, ws.ATy, ws.c,
+                ws.l, ws.u, ws.sigma, fact1_scalar, fact2_scalar, fact1_vec, fact2_vec,
+                Halpern_fact1, Halpern_fact2, ws.n)
+        else
+            @cuda threads = threads blocks = blocks unified_update_zxw_kernel_partial!(
+                Val(use_custom_spmv_Q), Val(ws.Q_is_diag),
+                ws.last_w, ws.dw, ws.dx, rowPtrQ, colValQ, nzValQ,
+                ws.w_bar, ws.w, ws.z_bar, ws.x_bar, ws.x_hat, ws.last_x, ws.x, ws.Qw, ws.ATy, ws.c,
+                ws.l, ws.u, ws.sigma, fact1_scalar, fact2_scalar, fact1_vec, fact2_vec,
+                Halpern_fact1, Halpern_fact2, ws.n)
+        end
+    end
+
+    # Step 2: Compute tempv for subsequent use in update_y
+    # Use Qmap! for Q*w_bar (works for both sparse matrices and operators)
+    if !use_custom_spmv_Q
+        # Pass ws.spmv_Q for sparse matrix Q, operators handle their own preprocessing
+        if isa(qp.Q, CuSparseMatrixCSR{Float64,Int32})
+            Qmap!(ws.w_bar, ws.Qw_bar, qp.Q, ws.spmv_Q)
+        else
+            Qmap!(ws.w_bar, ws.Qw_bar, qp.Q)
+        end
+    end
+
+    if threads > 0
+        @cuda threads = threads blocks = blocks compute_tempv_unified_kernel!(
+            Val(use_custom_spmv_Q),
+            ws.tempv, rowPtrQ, colValQ, nzValQ,
+            ws.w_bar, ws.x_hat, ws.Qw, ws.Qw_bar, ws.sigma, ws.n)
+    end
 end
 
 # Unified wrapper that handles all cases: regular/diagonal Q, custom/cuSPARSE SpMV
@@ -1777,13 +1977,17 @@ end
 
 # CPU version of update_zxw for standard QP (non-LASSO)
 function update_zxw1_cpu!(ws::HPRQP_workspace_cpu,
-    fact1_scalar::Float64,
-    fact2_scalar::Float64,
+    qp::QP_info_cpu,
     Halpern_fact1::Float64,
-    Halpern_fact2::Float64,
-    Q_is_diag::Bool)
+    Halpern_fact2::Float64)
     # Compute Qw
     Qmap!(ws.w, ws.Qw, ws.Q)
+
+    # Determine Q type and compute factors
+    Q_is_diag = ws.Q_is_diag
+    # Prepare scalar factors for regular Q
+    fact2_scalar = 1.0 / (1.0 + ws.sigma * ws.lambda_max_Q)
+    fact1_scalar = 1.0 - fact2_scalar
 
     x = ws.x
     x_bar = ws.x_bar
@@ -1872,10 +2076,13 @@ end
 
 # CPU version of update_zxw for LASSO problems
 function update_zxw_LASSO_cpu!(ws::HPRQP_workspace_cpu,
-    fact1_scalar::Float64,
-    fact2_scalar::Float64,
+    qp::QP_info_cpu,
     Halpern_fact1::Float64,
     Halpern_fact2::Float64)
+    # Compute fact scalars for LASSO
+    fact2_scalar = 1.0 / (1.0 + ws.sigma * ws.lambda_max_Q)
+    fact1_scalar = 1.0 - fact2_scalar
+    
     # Compute Qw (for LASSO, Q is the data matrix operations)
     Qmap!(ws.w, ws.Qw, ws.Q)
 
@@ -2151,6 +2358,7 @@ end
 # CPU version of update_y with Q matrix
 # Mirrors unified_update_y_kernel - computes y updates for standard QP
 function update_y_cpu!(ws::HPRQP_workspace_cpu,
+    qp::QP_info_cpu,
     Halpern_fact1::Float64,
     Halpern_fact2::Float64)
     if ws.m == 0
@@ -2215,12 +2423,15 @@ end
 # CPU version of update_w2 - completes the w update using y_bar
 # Mirrors unified_update_w2_kernel - computes AT*y_bar and updates w
 function update_w2_cpu!(ws::HPRQP_workspace_cpu,
+    qp::QP_info_cpu,
     Halpern_fact1::Float64,
-    Halpern_fact2::Float64,
-    Q_is_diag::Bool)
+    Halpern_fact2::Float64)
     # Compute ATy_bar
     mul!(ws.ATy_bar, ws.AT, ws.y_bar)
 
+    # Determine Q type
+    Q_is_diag = ws.Q_is_diag
+    
     # Determine the fact scalar for w update
     fact_scalar = ws.sigma / (1.0 + ws.sigma * ws.lambda_max_Q)
 

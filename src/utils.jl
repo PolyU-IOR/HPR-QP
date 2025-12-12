@@ -1514,13 +1514,14 @@ function run_dataset(data_path::String, result_path::String, params::HPRQP_param
         if occursin(".mps", file) && !(file in namelist)
             FILE_NAME = joinpath(data_path, file)
             println(@sprintf("solving the problem %d", i), @sprintf(": %s", file))
-
+            
             redirect_stdout(io) do
                 println(@sprintf("solving the problem %d", i), @sprintf(": %s", file))
                 println("main run starts: ----------------------------------------------------------------------------------------------------------")
                 t_start_all = time()
                 model = build_from_mps(FILE_NAME, verbose=true)
                 results = optimize(model, params)
+                params.warm_up = false  # disable warm-up for next runs
                 all_time = time() - t_start_all
                 println("main run ends----------------------------------------------------------------------------------------------------------")
 

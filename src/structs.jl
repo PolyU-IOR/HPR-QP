@@ -450,6 +450,7 @@ mutable struct HPRQP_workspace_gpu <: HPRQP_workspace
     # spmv mode
     spmv_mode_A::String
     spmv_mode_Q::String
+    noC::Bool
     HPRQP_workspace_gpu() = new()
 end
 
@@ -513,6 +514,7 @@ mutable struct HPRQP_workspace_cpu <: HPRQP_workspace
     # spmv mode
     spmv_mode_A::String
     spmv_mode_Q::String
+    noC::Bool
     HPRQP_workspace_cpu() = new()
 end
 
