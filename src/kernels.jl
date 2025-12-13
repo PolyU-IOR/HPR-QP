@@ -499,7 +499,8 @@ CUDA.@fastmath @inline function unified_update_zxw_kernel_full!(::Val{UseCustom}
             muladd(fact1_scalar, w_i, fact2_scalar * x_hat_i)
         end
 
-        w_new = muladd(Halpern_fact2, w_bar_i, Halpern_fact1 * last_w_i)
+        w_hat_i = 2.0 * w_bar_i - w_i
+        w_new = muladd(Halpern_fact2, w_hat_i, Halpern_fact1 * last_w_i)
 
         dx_val = x_bar_i - x_i
         dx[i] = dx_val
@@ -564,7 +565,8 @@ CUDA.@fastmath @inline function unified_update_zxw_kernel_partial!(::Val{UseCust
         else
             muladd(fact1_scalar, w_i, fact2_scalar * x_hat_i)
         end
-        w_new = muladd(Halpern_fact2, w_bar_i, Halpern_fact1 * last_w_i)
+        w_hat_i = 2.0 * w_bar_i - w_i
+        w_new = muladd(Halpern_fact2, w_hat_i, Halpern_fact1 * last_w_i)
 
         x[i] = x_new
         x_hat[i] = x_hat_i
@@ -637,14 +639,16 @@ CUDA.@fastmath @inline function compute_tempv_zxwy_unified_kernel!(::Val{UseCust
             end
             x_hat_i = x_hat[i]
             qw_i = Qw[i]
-            qw_bar_i = Qw_bar[i]
-            tempv[i] = x_hat_i + sigma * (qw_i - acc)
-            qw_hat_i = 2.0 * qw_bar_i - qw_i
+            qw_hat_i = 2.0 * acc - qw_i
+            Qw_bar[i] = acc
             Qw[i] = muladd(Halpern_fact2, qw_hat_i, Halpern_fact1 * last_Qw[i])
+            tempv[i] = x_hat_i + sigma * (qw_i - acc)
         else
             x_hat_i = x_hat[i]
             qw_i = Qw[i]
             qw_bar_i = Qw_bar[i]
+            qw_hat_i = 2.0 * qw_bar_i - qw_i
+            Qw[i] = muladd(Halpern_fact2, qw_hat_i, Halpern_fact1 * last_Qw[i])
             tempv[i] = x_hat_i + sigma * (qw_i - qw_bar_i)
         end
     end
@@ -2017,6 +2021,189 @@ end
 # NOTE: When modifying algorithmic logic, changes must be synchronized between
 # GPU kernels and CPU loops to maintain numerical equivalence.
 # ============================================================================
+
+# CPU version of unified_update_zxw for noC case
+# Updates z, x, and w in one pass, computing Qw inline and tempv for later use
+function unified_update_zxw_cpu!(ws::HPRQP_workspace_cpu,
+    qp::QP_info_cpu,
+    Halpern_fact1::Float64,
+    Halpern_fact2::Float64)
+    
+    # Compute Qw (maps w to Qw)
+    # Qmap!(ws.w, ws.Qw, ws.Q)
+    
+    # Determine Q type and compute factors
+    Q_is_diag = ws.Q_is_diag
+    fact2_scalar = 1.0 / (1.0 + ws.sigma * ws.lambda_max_Q)
+    fact1_scalar = 1.0 - fact2_scalar
+
+    x = ws.x
+    x_bar = ws.x_bar
+    z_bar = ws.z_bar
+    x_hat = ws.x_hat
+    dx = ws.dx
+    w = ws.w
+    w_bar = ws.w_bar
+    dw = ws.dw
+    last_x = ws.last_x
+    last_w = ws.last_w
+    Qw = ws.Qw
+    ATy = ws.ATy
+    c = ws.c
+    l = ws.l
+    u = ws.u
+    sigma = ws.sigma
+    fact1_vec = ws.fact1
+    fact2_vec = ws.fact2
+
+    if ws.to_check
+        @simd for i in eachindex(x)
+            @inbounds begin
+                qw_val = Qw[i]
+                atyi = ATy[i]
+                c_i = c[i]
+                x_i = x[i]
+                last_x_i = last_x[i]
+                last_w_i = last_w[i]
+                l_i = l[i]
+                u_i = u[i]
+                w_i = w[i]
+
+                tmp = -qw_val + atyi - c_i
+                z_raw = x_i + sigma * tmp
+                x_bar_i = min(max(z_raw, l_i), u_i)
+
+                x_hat_i = 2.0 * x_bar_i - x_i
+                x_new = muladd(Halpern_fact2, x_hat_i, Halpern_fact1 * last_x_i)
+
+                w_bar_i = if Q_is_diag
+                    muladd(fact1_vec[i], w_i, fact2_vec[i] * x_hat_i)
+                else
+                    muladd(fact1_scalar, w_i, fact2_scalar * x_hat_i)
+                end
+                w_hat_i = 2.0 * w_bar_i - w_i
+                w_new = muladd(Halpern_fact2, w_hat_i, Halpern_fact1 * last_w_i)
+
+                dx[i] = x_bar_i - x_i
+                x_bar[i] = x_bar_i
+                z_bar[i] = (x_bar_i - z_raw) / sigma
+                x[i] = x_new
+                x_hat[i] = x_hat_i
+                w_bar[i] = w_bar_i
+                w[i] = w_new
+                dw[i] = w_bar_i - w_i
+            end
+        end
+    else
+        @simd for i in eachindex(x)
+            @inbounds begin
+                qw_val = Qw[i]
+                atyi = ATy[i]
+                c_i = c[i]
+                x_i = x[i]
+                last_x_i = last_x[i]
+                last_w_i = last_w[i]
+                l_i = l[i]
+                u_i = u[i]
+                w_i = w[i]
+
+                tmp = -qw_val + atyi - c_i
+                z_raw = x_i + sigma * tmp
+                x_bar_i = min(max(z_raw, l_i), u_i)
+
+                x_hat_i = 2.0 * x_bar_i - x_i
+                x_new = muladd(Halpern_fact2, x_hat_i, Halpern_fact1 * last_x_i)
+
+                w_bar_i = if Q_is_diag
+                    muladd(fact1_vec[i], w_i, fact2_vec[i] * x_hat_i)
+                else
+                    muladd(fact1_scalar, w_i, fact2_scalar * x_hat_i)
+                end
+                w_hat_i = 2.0 * w_bar_i - w_i
+                w_new = muladd(Halpern_fact2, w_hat_i, Halpern_fact1 * last_w_i)
+
+                x[i] = x_new
+                x_hat[i] = x_hat_i
+                w_bar[i] = w_bar_i
+                w[i] = w_new
+            end
+        end
+    end
+    
+    # Compute Qw_bar for tempv computation
+    Qmap!(ws.w_bar, ws.Qw_bar, ws.Q)
+    
+    # Compute tempv = x_hat + sigma * (Qw - Qw_bar) and update Qw with Halpern averaging
+    @simd for i in eachindex(ws.tempv)
+        @inbounds begin
+            qw_i = ws.Qw[i]
+            qw_bar_i = ws.Qw_bar[i]
+            qw_hat_i = 2.0 * qw_bar_i - qw_i
+            ws.Qw[i] = muladd(Halpern_fact2, qw_hat_i, Halpern_fact1 * ws.last_Qw[i])
+            ws.tempv[i] = ws.x_hat[i] + sigma * (qw_i - qw_bar_i)
+        end
+    end
+end
+
+# CPU version of unified_update_y for noC case
+# Uses tempv computed by unified_update_zxw_cpu! instead of recomputing it
+function unified_update_y_cpu!(ws::HPRQP_workspace_cpu,
+    Halpern_fact1::Float64,
+    Halpern_fact2::Float64)
+    
+    if ws.m == 0
+        return
+    end
+    
+    # Compute A * tempv (tempv already computed in unified_update_zxw_cpu!)
+    mul!(ws.Ax, ws.A, ws.tempv)
+
+    fact1 = ws.lambda_max_A * ws.sigma
+    fact2 = 1.0 / fact1
+
+    y = ws.y
+    y_bar = ws.y_bar
+    dy = ws.dy
+    last_y = ws.last_y
+    s = ws.s
+    Ax = ws.Ax
+    AL = ws.AL
+    AU = ws.AU
+
+    if ws.to_check
+        @simd for i in eachindex(y)
+            @inbounds begin
+                yi = y[i]
+                s_raw = Ax[i] - fact1 * yi
+                s_proj = min(max(s_raw, AL[i]), AU[i])
+                corr = s_proj - s_raw
+                yb = fact2 * corr
+                yh = 2.0 * yb - yi
+                y_new = muladd(Halpern_fact2, yh, Halpern_fact1 * last_y[i])
+
+                s[i] = s_proj
+                dy[i] = yb - yi
+                y_bar[i] = yb
+                y[i] = y_new
+            end
+        end
+    else
+        @simd for i in eachindex(y)
+            @inbounds begin
+                yi = y[i]
+                s_raw = Ax[i] - fact1 * yi
+                s_proj = min(max(s_raw, AL[i]), AU[i])
+                corr = s_proj - s_raw
+                yb = fact2 * corr
+                yh = 2.0 * yb - yi
+                y_new = muladd(Halpern_fact2, yh, Halpern_fact1 * last_y[i])
+
+                y_bar[i] = yb
+                y[i] = y_new
+            end
+        end
+    end
+end
 
 # CPU version of update_zxw for standard QP (non-LASSO)
 function update_zxw1_cpu!(ws::HPRQP_workspace_cpu,

@@ -1101,10 +1101,19 @@ function main_update_cpu!(ws::HPRQP_workspace_cpu, qp::QP_info_cpu, restart_info
         return
     end
     if isa(qp.Q, QAP_Q_operator_cpu) || (isa(qp.Q, SparseMatrixCSC) && length(qp.Q.nzval) > 0)
-        # Standard case with Q matrix - use unified kernels with separate Q and A modes
-        update_zxw1_cpu!(ws, qp, Halpern_fact1, Halpern_fact2)
-        update_y_cpu!(ws, qp, Halpern_fact1, Halpern_fact2)
-        update_w2_cpu!(ws, qp, Halpern_fact1, Halpern_fact2)
+        if ws.noC
+            # noC case (no constraint c): use unified kernels that combine z, x, w updates
+            unified_update_zxw_cpu!(ws, qp, Halpern_fact1, Halpern_fact2)
+            unified_update_y_cpu!(ws, Halpern_fact1, Halpern_fact2)
+            # Compute AT*y for next iteration
+            mul!(ws.ATy, ws.AT, ws.y)
+            return
+        else
+            # Standard case with Q matrix - use unified kernels with separate Q and A modes
+            update_zxw1_cpu!(ws, qp, Halpern_fact1, Halpern_fact2)
+            update_y_cpu!(ws, qp, Halpern_fact1, Halpern_fact2)
+            update_w2_cpu!(ws, qp, Halpern_fact1, Halpern_fact2)
+        end
     else
         # Empty Q case (linear program) - use unified kernels with A mode only
         unified_update_zx_cpu!(ws, Halpern_fact1, Halpern_fact2)
@@ -1606,6 +1615,8 @@ function main_update_gpu!(ws::HPRQP_workspace_gpu,
             CUDA.CUSPARSE.cusparseSpMV(ws.spmv_AT.handle, ws.spmv_AT.operator, ws.spmv_AT.alpha,
                 ws.spmv_AT.desc_AT, desc_y, ws.spmv_AT.beta, desc_ATy,
                 ws.spmv_AT.compute_type, ws.spmv_AT.alg, ws.spmv_AT.buf)
+            # Update last_Qw for next iteration
+            ws.last_Qw .= ws.Qw
             return
         else
             # Standard case with Q matrix - use unified kernels with separate Q and A modes
