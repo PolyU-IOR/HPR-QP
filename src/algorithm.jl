@@ -960,8 +960,6 @@ function main_update_cpu!(ws::HPRQP_workspace_cpu, qp::QP_info_cpu, restart_info
             # noC case (no constraint c): use unified kernels that combine z, x, w updates
             unified_update_zxw_cpu!(ws, qp, Halpern_fact1, Halpern_fact2)
             unified_update_y_cpu!(ws, Halpern_fact1, Halpern_fact2)
-            # Compute AT*y for next iteration
-            mul!(ws.ATy, ws.AT, ws.y)
             return
         else
             # Standard case with Q matrix - use unified kernels with separate Q and A modes
@@ -1281,12 +1279,6 @@ function main_update_gpu!(ws::HPRQP_workspace_gpu,
         unified_update_zx_gpu!(ws, Halpern_fact1, Halpern_fact2)
         unified_update_y_noQ_gpu!(ws, Halpern_fact1, Halpern_fact2)
     end
-end
-
-# This function computes the M norm for the HPR-QP algorithm on GPU.
-function compute_M_norm_gpu!(ws::HPRQP_workspace_gpu, qp::QP_info_gpu)
-    # Call unified implementation
-    return compute_M_norm!(ws, qp)
 end
 
 # ==================== Helper Functions for Solver ====================
@@ -1821,30 +1813,16 @@ end
 
 # Helper function: Perform main iteration step (update and norm computation)
 # GPU version
-function perform_iteration_step!(ws::HPRQP_workspace_gpu, qp::QP_info_gpu,
+function perform_iteration_step!(ws::HPRQP_workspace, qp::HPRQP_QP_info,
     params::HPRQP_parameters, restart_info::HPRQP_restart,
     iter::Int, check_iter::Int)
     # Main update - now handles both operator and sparse matrix Q within main_update_gpu!
-    main_update_gpu!(ws, qp, restart_info)
+    if isa(ws, HPRQP_workspace_gpu) && isa(qp, QP_info_gpu)
+        main_update_gpu!(ws, qp, restart_info)
+    else
+        main_update_cpu!(ws, qp, restart_info)
+    end
     # Compute M norm for restart decision
-    if restart_info.restart_flag > 0
-        restart_info.last_gap = compute_M_norm_gpu!(ws, qp)
-    end
-
-    if rem(iter + 1, check_iter) == 0
-        restart_info.current_gap = compute_M_norm_gpu!(ws, qp)
-    end
-
-    restart_info.inner += 1
-end
-
-# CPU version
-function perform_iteration_step!(ws::HPRQP_workspace_cpu, qp::QP_info_cpu,
-    params::HPRQP_parameters, restart_info::HPRQP_restart,
-    iter::Int, check_iter::Int)
-    # Main update
-    main_update_cpu!(ws, qp, restart_info)
-    # Compute M norm for restart decision (unified function via dispatch)
     if restart_info.restart_flag > 0
         restart_info.last_gap = compute_M_norm!(ws, qp)
     end

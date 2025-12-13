@@ -925,8 +925,9 @@ function unified_update_zxw_gpu!(ws::HPRQP_workspace_gpu, qp::QP_info_gpu,
         rowPtrQ, colValQ, nzValQ = ws.A.rowPtr, ws.A.colVal, ws.A.nzVal
     end
 
+    use_custom_spmv_A = (ws.spmv_mode_A == "customized")
     # Only compute AT*y_bar via cuSPARSE if not using custom SpMV for A
-    if ws.spmv_mode_A == "CUSPARSE"
+    if !use_custom_spmv_A
         # Use preprocessed CUSPARSE if available
         if ws.spmv_AT !== nothing
             desc_y = CUDA.CUSPARSE.CuDenseVectorDescriptor(ws.y)
@@ -955,7 +956,7 @@ function unified_update_zxw_gpu!(ws::HPRQP_workspace_gpu, qp::QP_info_gpu,
         # Choose kernel based on to_check flag - no recompilation overhead
         if ws.to_check
             @cuda threads = threads blocks = blocks unified_update_zxw_kernel_full!(
-                Val(use_custom_spmv_Q), Val(ws.Q_is_diag),
+                Val(use_custom_spmv_A), Val(ws.Q_is_diag),
                 ws.y,
                 ws.last_w, ws.dw, ws.dx, ws.AT.rowPtr, ws.AT.colVal, ws.AT.nzVal,
                 ws.w_bar, ws.w, ws.z_bar, ws.x_bar, ws.x_hat, ws.last_x, ws.x, ws.Qw, ws.ATy, ws.c,
@@ -963,7 +964,7 @@ function unified_update_zxw_gpu!(ws::HPRQP_workspace_gpu, qp::QP_info_gpu,
                 Halpern_fact1, Halpern_fact2, ws.n)
         else
             @cuda threads = threads blocks = blocks unified_update_zxw_kernel_partial!(
-                Val(use_custom_spmv_Q), Val(ws.Q_is_diag),
+                Val(use_custom_spmv_A), Val(ws.Q_is_diag),
                 ws.y,
                 ws.last_w, ws.dw, ws.dx, ws.AT.rowPtr, ws.AT.colVal, ws.AT.nzVal,
                 ws.w_bar, ws.w, ws.z_bar, ws.x_bar, ws.x_hat, ws.last_x, ws.x, ws.Qw, ws.ATy, ws.c,
@@ -2051,6 +2052,8 @@ function unified_update_zxw_cpu!(ws::HPRQP_workspace_cpu,
 
     # Compute Qw (maps w to Qw)
     # Qmap!(ws.w, ws.Qw, ws.Q)
+    # Compute AT*y for next iteration
+    mul!(ws.ATy, ws.AT, ws.y)
 
     # Determine Q type and compute factors
     Q_is_diag = ws.Q_is_diag
