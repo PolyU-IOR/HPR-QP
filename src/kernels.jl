@@ -450,8 +450,9 @@ end
 
 # Full version: computes all intermediate values
 CUDA.@fastmath @inline function unified_update_zxw_kernel_full!(::Val{UseCustom}, ::Val{IsDiag},
+    y::CuDeviceVector{Float64},
     last_w::CuDeviceVector{Float64}, dw::CuDeviceVector{Float64}, dx::CuDeviceVector{Float64},
-    rowPtrQ::CuDeviceVector{Int32}, colValQ::CuDeviceVector{Int32}, nzValQ::CuDeviceVector{Float64},
+    rowPtrAT::CuDeviceVector{Int32}, colValAT::CuDeviceVector{Int32}, nzValAT::CuDeviceVector{Float64},
     w_bar::CuDeviceVector{Float64}, w::CuDeviceVector{Float64},
     z_bar::CuDeviceVector{Float64}, x_bar::CuDeviceVector{Float64}, x_hat::CuDeviceVector{Float64},
     last_x::CuDeviceVector{Float64}, x::CuDeviceVector{Float64},
@@ -462,20 +463,21 @@ CUDA.@fastmath @inline function unified_update_zxw_kernel_full!(::Val{UseCustom}
     Halpern_fact1::Float64, Halpern_fact2::Float64, n::Int) where {UseCustom,IsDiag}
     i = threadIdx().x + (blockDim().x * (blockIdx().x - 1))
     @inbounds if i <= n
-        qw_val = if UseCustom
-            startQ = rowPtrQ[i]
-            stopQ = rowPtrQ[i+1] - 1
+        ATy_val = if UseCustom
+            startAT = rowPtrAT[i]
+            stopAT = rowPtrAT[i+1] - 1
             acc = 0.0
-            @inbounds for k in startQ:stopQ
-                acc += nzValQ[k] * w[colValQ[k]]
+            @inbounds for k in startAT:stopAT
+                acc += nzValAT[k] * y[colValAT[k]]
             end
-            Qw[i] = acc
+            ATy[i] = acc
             acc
         else
-            Qw[i]
+            ATy[i]
         end
 
-        atyi = ATy[i]
+        atyi = ATy_val
+        qw_i = Qw[i]
         c_i = c[i]
         x_i = x[i]
         last_x_i = last_x[i]
@@ -484,7 +486,7 @@ CUDA.@fastmath @inline function unified_update_zxw_kernel_full!(::Val{UseCustom}
         u_i = u[i]
         w_i = w[i]
 
-        tmp = -qw_val + atyi - c_i
+        tmp = -qw_i + atyi - c_i
         z_raw = x_i + sigma * tmp
         x_bar_i = min(max(z_raw, l_i), u_i)
 
@@ -517,8 +519,9 @@ end
 
 # Partial version: skips intermediate writes
 CUDA.@fastmath @inline function unified_update_zxw_kernel_partial!(::Val{UseCustom}, ::Val{IsDiag},
+    y::CuDeviceVector{Float64},
     last_w::CuDeviceVector{Float64}, dw::CuDeviceVector{Float64}, dx::CuDeviceVector{Float64},
-    rowPtrQ::CuDeviceVector{Int32}, colValQ::CuDeviceVector{Int32}, nzValQ::CuDeviceVector{Float64},
+    rowPtrAT::CuDeviceVector{Int32}, colValAT::CuDeviceVector{Int32}, nzValAT::CuDeviceVector{Float64},
     w_bar::CuDeviceVector{Float64}, w::CuDeviceVector{Float64},
     z_bar::CuDeviceVector{Float64}, x_bar::CuDeviceVector{Float64}, x_hat::CuDeviceVector{Float64},
     last_x::CuDeviceVector{Float64}, x::CuDeviceVector{Float64},
@@ -529,20 +532,21 @@ CUDA.@fastmath @inline function unified_update_zxw_kernel_partial!(::Val{UseCust
     Halpern_fact1::Float64, Halpern_fact2::Float64, n::Int) where {UseCustom,IsDiag}
     i = threadIdx().x + (blockDim().x * (blockIdx().x - 1))
     @inbounds if i <= n
-        qw_val = if UseCustom
-            startQ = rowPtrQ[i]
-            stopQ = rowPtrQ[i+1] - 1
+        ATy_val = if UseCustom
+            startAT = rowPtrAT[i]
+            stopAT = rowPtrAT[i+1] - 1
             acc = 0.0
-            @inbounds for k in startQ:stopQ
-                acc += nzValQ[k] * w[colValQ[k]]
+            @inbounds for k in startAT:stopAT
+                acc += nzValAT[k] * y[colValAT[k]]
             end
-            Qw[i] = acc
+            ATy[i] = acc
             acc
         else
-            Qw[i]
+            ATy[i]
         end
 
-        atyi = ATy[i]
+        atyi = ATy_val
+        qw_i = Qw[i]
         c_i = c[i]
         x_i = x[i]
         last_x_i = last_x[i]
@@ -551,7 +555,7 @@ CUDA.@fastmath @inline function unified_update_zxw_kernel_partial!(::Val{UseCust
         u_i = u[i]
         w_i = w[i]
 
-        tmp = -qw_val + atyi - c_i
+        tmp = -qw_i + atyi - c_i
         z_raw = x_i + sigma * tmp
         x_bar_i = min(max(z_raw, l_i), u_i)
 
@@ -921,6 +925,20 @@ function unified_update_zxw_gpu!(ws::HPRQP_workspace_gpu, qp::QP_info_gpu,
         rowPtrQ, colValQ, nzValQ = ws.A.rowPtr, ws.A.colVal, ws.A.nzVal
     end
 
+    # Only compute AT*y_bar via cuSPARSE if not using custom SpMV for A
+    if ws.spmv_mode_A == "CUSPARSE"
+        # Use preprocessed CUSPARSE if available
+        if ws.spmv_AT !== nothing
+            desc_y = CUDA.CUSPARSE.CuDenseVectorDescriptor(ws.y)
+            desc_ATy = CUDA.CUSPARSE.CuDenseVectorDescriptor(ws.ATy)
+            CUDA.CUSPARSE.cusparseSpMV(ws.spmv_AT.handle, ws.spmv_AT.operator, ws.spmv_AT.alpha,
+                ws.spmv_AT.desc_AT, desc_y, ws.spmv_AT.beta, desc_ATy,
+                ws.spmv_AT.compute_type, ws.spmv_AT.alg, ws.spmv_AT.buf)
+        else
+            CUDA.CUSPARSE.mv!('N', 1, ws.AT, ws.y, 0, ws.ATy, 'O', CUDA.CUSPARSE.CUSPARSE_SPMV_CSR_ALG2)
+        end
+    end
+
     # Use Qmap! for Q*w (works for both sparse matrices and operators)
     # if !use_custom_spmv_Q
     #     # Pass ws.spmv_Q for sparse matrix Q, operators handle their own preprocessing
@@ -938,14 +956,16 @@ function unified_update_zxw_gpu!(ws::HPRQP_workspace_gpu, qp::QP_info_gpu,
         if ws.to_check
             @cuda threads = threads blocks = blocks unified_update_zxw_kernel_full!(
                 Val(use_custom_spmv_Q), Val(ws.Q_is_diag),
-                ws.last_w, ws.dw, ws.dx, rowPtrQ, colValQ, nzValQ,
+                ws.y,
+                ws.last_w, ws.dw, ws.dx, ws.AT.rowPtr, ws.AT.colVal, ws.AT.nzVal,
                 ws.w_bar, ws.w, ws.z_bar, ws.x_bar, ws.x_hat, ws.last_x, ws.x, ws.Qw, ws.ATy, ws.c,
                 ws.l, ws.u, ws.sigma, fact1_scalar, fact2_scalar, fact1_vec, fact2_vec,
                 Halpern_fact1, Halpern_fact2, ws.n)
         else
             @cuda threads = threads blocks = blocks unified_update_zxw_kernel_partial!(
                 Val(use_custom_spmv_Q), Val(ws.Q_is_diag),
-                ws.last_w, ws.dw, ws.dx, rowPtrQ, colValQ, nzValQ,
+                ws.y,
+                ws.last_w, ws.dw, ws.dx, ws.AT.rowPtr, ws.AT.colVal, ws.AT.nzVal,
                 ws.w_bar, ws.w, ws.z_bar, ws.x_bar, ws.x_hat, ws.last_x, ws.x, ws.Qw, ws.ATy, ws.c,
                 ws.l, ws.u, ws.sigma, fact1_scalar, fact2_scalar, fact1_vec, fact2_vec,
                 Halpern_fact1, Halpern_fact2, ws.n)
@@ -1832,7 +1852,7 @@ function check_diagonal_kernel!(rowPtr::CuDeviceVector{Int32},
             start_idx = rowPtr[i]
             end_idx = rowPtr[i+1] - 1
             nnz_in_row = end_idx - start_idx + 1
-            
+
             # Check: exactly one non-zero AND it's at column index i
             if nnz_in_row == 1
                 col_idx = colVal[start_idx]
@@ -1860,7 +1880,7 @@ function extract_diagonal_csr_kernel!(rowPtr::CuDeviceVector{Int32},
         @inbounds begin
             start_idx = rowPtr[i]
             end_idx = rowPtr[i+1] - 1
-            
+
             # Search for diagonal element in this row
             diag[i] = 0.0
             for k in start_idx:end_idx
@@ -2028,10 +2048,10 @@ function unified_update_zxw_cpu!(ws::HPRQP_workspace_cpu,
     qp::QP_info_cpu,
     Halpern_fact1::Float64,
     Halpern_fact2::Float64)
-    
+
     # Compute Qw (maps w to Qw)
     # Qmap!(ws.w, ws.Qw, ws.Q)
-    
+
     # Determine Q type and compute factors
     Q_is_diag = ws.Q_is_diag
     fact2_scalar = 1.0 / (1.0 + ws.sigma * ws.lambda_max_Q)
@@ -2129,10 +2149,10 @@ function unified_update_zxw_cpu!(ws::HPRQP_workspace_cpu,
             end
         end
     end
-    
+
     # Compute Qw_bar for tempv computation
     Qmap!(ws.w_bar, ws.Qw_bar, ws.Q)
-    
+
     # Compute tempv = x_hat + sigma * (Qw - Qw_bar) and update Qw with Halpern averaging
     @simd for i in eachindex(ws.tempv)
         @inbounds begin
@@ -2150,11 +2170,11 @@ end
 function unified_update_y_cpu!(ws::HPRQP_workspace_cpu,
     Halpern_fact1::Float64,
     Halpern_fact2::Float64)
-    
+
     if ws.m == 0
         return
     end
-    
+
     # Compute A * tempv (tempv already computed in unified_update_zxw_cpu!)
     mul!(ws.Ax, ws.A, ws.tempv)
 
@@ -2312,7 +2332,7 @@ function update_zxw_LASSO_cpu!(ws::HPRQP_workspace_cpu,
     # Compute fact scalars for LASSO
     fact2_scalar = 1.0 / (1.0 + ws.sigma * ws.lambda_max_Q)
     fact1_scalar = 1.0 - fact2_scalar
-    
+
     # Compute Qw (for LASSO, Q is the data matrix operations)
     Qmap!(ws.w, ws.Qw, ws.Q)
 
@@ -2412,10 +2432,10 @@ end
 function unified_update_zx_cpu!(ws::HPRQP_workspace_cpu,
     Halpern_fact1::Float64,
     Halpern_fact2::Float64)
-    
+
     # Compute AT*y
     mul!(ws.ATy, ws.AT, ws.y)
-    
+
     x = ws.x
     x_bar = ws.x_bar
     x_hat = ws.x_hat
@@ -2427,7 +2447,7 @@ function unified_update_zx_cpu!(ws::HPRQP_workspace_cpu,
     l = ws.l
     u = ws.u
     sigma = ws.sigma
-    
+
     if ws.to_check
         @simd for i in eachindex(x)
             @inbounds begin
@@ -2437,23 +2457,23 @@ function unified_update_zx_cpu!(ws::HPRQP_workspace_cpu,
                 c_i = c[i]
                 l_i = l[i]
                 u_i = u[i]
-                
+
                 # Compute z_raw = x + sigma * (AT*y - c)
                 tmp = ATy_i - c_i
                 z_raw = x_i + sigma * tmp
-                
+
                 # Project onto bounds [l, u]
                 x_bar_i = min(max(z_raw, l_i), u_i)
-                
+
                 # Compute x_hat = 2*x_bar - x (for Peaceman-Rachford)
                 x_hat_i = 2.0 * x_bar_i - x_i
-                
+
                 # Compute z_bar (dual variable for bounds)
                 z_bar_i = (x_bar_i - z_raw) / sigma
-                
+
                 # Halpern averaging: x_new = alpha*last_x + (1-alpha)*x_hat
                 x_new = muladd(Halpern_fact2, x_hat_i, Halpern_fact1 * last_x_i)
-                
+
                 # Store results
                 dx[i] = x_bar_i - x_i
                 x_bar[i] = x_bar_i
@@ -2471,13 +2491,13 @@ function unified_update_zx_cpu!(ws::HPRQP_workspace_cpu,
                 c_i = c[i]
                 l_i = l[i]
                 u_i = u[i]
-                
+
                 tmp = ATy_i - c_i
                 z_raw = x_i + sigma * tmp
                 x_bar_i = min(max(z_raw, l_i), u_i)
                 x_hat_i = 2.0 * x_bar_i - x_i
                 x_new = muladd(Halpern_fact2, x_hat_i, Halpern_fact1 * last_x_i)
-                
+
                 x[i] = x_new
                 x_hat[i] = x_hat_i
             end
@@ -2490,17 +2510,17 @@ end
 function unified_update_y_noQ_cpu!(ws::HPRQP_workspace_cpu,
     Halpern_fact1::Float64,
     Halpern_fact2::Float64)
-    
+
     if ws.m == 0
         return
     end
-    
+
     # Compute A*x_hat (no Q corrections needed for noQ case)
     mul!(ws.Ax, ws.A, ws.x_hat)
-    
+
     fact1 = ws.lambda_max_A * ws.sigma
     fact2 = 1.0 / fact1
-    
+
     y = ws.y
     y_bar = ws.y_bar
     dy = ws.dy
@@ -2509,7 +2529,7 @@ function unified_update_y_noQ_cpu!(ws::HPRQP_workspace_cpu,
     Ax = ws.Ax
     AL = ws.AL
     AU = ws.AU
-    
+
     if ws.to_check
         @simd for i in eachindex(y)
             @inbounds begin
@@ -2518,25 +2538,25 @@ function unified_update_y_noQ_cpu!(ws::HPRQP_workspace_cpu,
                 Ax_i = Ax[i]
                 AL_i = AL[i]
                 AU_i = AU[i]
-                
+
                 # Compute s_raw = Ax - fact1*y
                 s_raw = Ax_i - fact1 * y_i
-                
+
                 # Project onto constraint bounds [AL, AU]
                 s_proj = min(max(s_raw, AL_i), AU_i)
-                
+
                 # Compute correction
                 corr = s_proj - s_raw
-                
+
                 # Compute y_bar
                 y_bar_i = fact2 * corr
-                
+
                 # Compute y_hat = 2*y_bar - y
                 y_hat_i = 2.0 * y_bar_i - y_i
-                
+
                 # Halpern averaging: y_new = alpha*last_y + (1-alpha)*y_hat
                 y_new = muladd(Halpern_fact2, y_hat_i, Halpern_fact1 * last_y_i)
-                
+
                 # Store results
                 s[i] = s_proj
                 dy[i] = y_bar_i - y_i
@@ -2552,7 +2572,7 @@ function unified_update_y_noQ_cpu!(ws::HPRQP_workspace_cpu,
                 Ax_i = Ax[i]
                 AL_i = AL[i]
                 AU_i = AU[i]
-                
+
                 s_raw = Ax_i - fact1 * y_i
                 s_proj = min(max(s_raw, AL_i), AU_i)
                 corr = s_proj - s_raw
@@ -2661,7 +2681,7 @@ function update_w2_cpu!(ws::HPRQP_workspace_cpu,
 
     # Determine Q type
     Q_is_diag = ws.Q_is_diag
-    
+
     # Determine the fact scalar for w update
     fact_scalar = ws.sigma / (1.0 + ws.sigma * ws.lambda_max_Q)
 

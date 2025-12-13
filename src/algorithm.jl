@@ -887,151 +887,6 @@ function allocate_workspace(
     return ws
 end
 
-# Helper function to get workspace type from qp type
-workspace_type(::QP_info_cpu) = HPRQP_workspace_cpu
-workspace_type(::QP_info_gpu) = HPRQP_workspace_gpu
-
-# ============================================================================
-# Legacy Functions (Deprecated - use allocate_workspace instead)
-# ============================================================================
-
-# CPU version of allocate workspace
-function allocate_workspace_cpu(qp::QP_info_cpu, params::HPRQP_parameters,
-    lambda_max_A::Float64, lambda_max_Q::Float64, scaling_info::Scaling_info_cpu,
-    diag_Q::Vector{Float64}, Q_is_diag::Bool)
-    ws = HPRQP_workspace_cpu()
-    m, n = size(qp.A)
-    ws.m = m
-    ws.n = n
-    ws.w = zeros(Float64, n)
-    ws.w_hat = zeros(Float64, n)
-    ws.w_bar = zeros(Float64, n)
-    ws.dw = zeros(Float64, n)
-    ws.x = zeros(Float64, n)
-    ws.x_hat = zeros(Float64, n)
-    ws.x_bar = zeros(Float64, n)
-    ws.dx = zeros(Float64, n)
-    ws.y = zeros(Float64, m)
-    ws.y_hat = zeros(Float64, n)
-    ws.y_bar = zeros(Float64, m)
-    ws.dy = zeros(Float64, m)
-    ws.z_bar = zeros(Float64, n)
-    ws.Q = qp.Q
-    ws.A = qp.A
-    ws.AT = qp.AT
-    ws.AL = qp.AL
-    ws.AU = qp.AU
-    ws.c = qp.c
-    ws.l = qp.l
-    ws.u = qp.u
-    ws.Rp = zeros(Float64, m)
-    ws.Rd = zeros(Float64, n)
-    ws.Ax = zeros(Float64, m)
-    ws.ATy = zeros(Float64, n)
-    ws.ATy_bar = zeros(Float64, n)
-    ws.ATdy = zeros(Float64, n)
-    ws.QATdy = zeros(Float64, n)
-    ws.s = zeros(Float64, m)
-    ws.Qw = zeros(Float64, n)
-    ws.Qw_hat = zeros(Float64, n)
-    ws.Qw_bar = zeros(Float64, n)
-    ws.Qx = zeros(Float64, n)
-    ws.dQw = zeros(Float64, n)
-    ws.last_x = zeros(Float64, n)
-    ws.last_y = zeros(Float64, m)
-    ws.last_Qw = zeros(Float64, n)
-    ws.last_w = zeros(Float64, n)
-    ws.last_ATy = zeros(Float64, n)
-    ws.tempv = zeros(Float64, n)
-    ws.Q_is_diag = Q_is_diag
-    ws.diag_Q = diag_Q
-    ws.fact1 = zeros(Float64, n)
-    ws.fact2 = zeros(Float64, n)
-    ws.fact = zeros(Float64, n)
-    ws.fact_M = zeros(Float64, n)
-    ws.lambda_max_A = lambda_max_A
-    ws.lambda_max_Q = lambda_max_Q
-    if params.sigma == -1
-        norm_b = scaling_info.norm_b
-        norm_c = scaling_info.norm_c
-        if norm_c > 1e-16 && norm_b > 1e-16 && norm_b < 1e16 && norm_c < 1e16
-            ws.sigma = norm_b / norm_c
-        else
-            ws.sigma = 1.0
-        end
-    elseif params.sigma > 0
-        ws.sigma = params.sigma
-    else
-        error("Invalid sigma value: ", params.sigma, ". It should be a positive number or -1 for automatic.")
-    end
-    if ws.Q_is_diag
-        for i in 1:n
-            temp = 1.0 + ws.sigma * ws.diag_Q[i]
-            ws.fact1[i] = 1.0 / temp
-            ws.fact2[i] = (ws.sigma * ws.diag_Q[i]) / temp
-            ws.fact_M[i] = (ws.sigma^2 * ws.diag_Q[i]) / temp
-        end
-    end
-    # For CPU, lambda is scalar in QP_info_cpu but needs to be vector in workspace
-    # Convert scalar to vector filled with that value
-    ws.lambda = fill(qp.lambda, n)
-    ws.to_check = true
-    if params.auto_save
-        ws.saved_state = HPRQP_saved_state_cpu()
-        ws.saved_state.save_x = zeros(Float64, n)
-        ws.saved_state.save_y = zeros(Float64, m)
-        ws.saved_state.save_z = zeros(Float64, n)
-        ws.saved_state.save_w = zeros(Float64, n)
-        ws.saved_state.save_sigma = ws.sigma
-        ws.saved_state.save_iter = 0
-        ws.saved_state.save_err_Rp = Inf
-        ws.saved_state.save_err_Rd = Inf
-        ws.saved_state.save_primal_obj = Inf
-        ws.saved_state.save_dual_obj = Inf
-        ws.saved_state.save_rel_gap = Inf
-    end
-    if params.initial_x !== nothing
-        scaled_x = params.initial_x .* scaling_info.col_norm ./ scaling_info.b_scale
-        ws.x .= scaled_x
-        ws.x_bar .= scaled_x
-        ws.last_x .= scaled_x
-        ws.w .= scaled_x
-        ws.w_bar .= scaled_x
-        ws.last_w .= scaled_x
-    end
-    if params.initial_y !== nothing
-        ws.y .= params.initial_y .* scaling_info.row_norm ./ scaling_info.c_scale
-        ws.y_bar .= ws.y
-        ws.last_y .= ws.y
-        if m > 0
-            mul!(ws.ATy_bar, ws.AT, ws.y_bar)
-            ws.ATy .= ws.ATy_bar
-            ws.last_ATy .= ws.ATy_bar
-        end
-
-        # Compute z_bar from Rd = 0: z = Qx + c - A^T y
-        # Use the Qmap! function which works for both sparse matrices and Q operators
-        if isa(qp.Q, SparseMatrixCSC)
-            mul!(ws.Qx, qp.Q, ws.x_bar)
-        else
-            # For Q operators (QAP, LASSO, etc.), Qmap! is defined in their respective files
-            Qmap!(ws.x_bar, ws.Qx, qp.Q)
-        end
-        # Then z_bar = Qx + c - ATy
-        ws.z_bar .= ws.Qx .+ ws.c .- ws.ATy_bar
-
-        # Compute s for dual objective: s = proj_{[AL,AU]}(Ax - lambda_max_A * sigma * y)
-        if m > 0
-            # Compute Ax
-            mul!(ws.Ax, ws.A, ws.x_bar)
-            # s = proj_{[AL,AU]}(Ax - lambda_max_A * sigma * y)
-            fact1 = ws.lambda_max_A * ws.sigma
-            ws.s .= min.(max.(ws.Ax .- fact1 .* ws.y, ws.AL), ws.AU)
-        end
-    end
-    return ws
-end
-
 # ============================================================================
 # CPU Main Update Functions
 # ============================================================================
@@ -1300,202 +1155,6 @@ end
 # GPU Algorithm Functions  
 # ============================================================================
 
-# This function allocates the workspace for the HPR-QP algorithm on GPU.
-function allocate_workspace_gpu(qp::QP_info_gpu,
-    params::HPRQP_parameters,
-    lambda_max_A::Float64,
-    lambda_max_Q::Float64,
-    scaling_info::Scaling_info_gpu,
-    diag_Q::Vector{Float64},
-    Q_is_diag::Bool,
-)
-    ws = HPRQP_workspace_gpu()
-    m, n = size(qp.A)
-    ws.m = m
-    ws.n = n
-    if params.sigma == -1
-        norm_b = scaling_info.norm_b
-        norm_c = scaling_info.norm_c
-        if norm_c > 1e-16 && norm_b > 1e-16 && norm_b < 1e16 && norm_c < 1e16
-            ws.sigma = norm_b / norm_c
-        else
-            ws.sigma = 1.0
-        end
-    elseif params.sigma > 0
-        ws.sigma = params.sigma
-    else
-        error("Invalid sigma value: ", params.sigma, ". It should be a positive number or -1 for automatic.")
-    end
-    # println("initial sigma = ", ws.sigma)
-    ws.lambda_max_A = lambda_max_A
-    ws.lambda_max_Q = lambda_max_Q
-    ws.Q_is_diag = Q_is_diag
-    ws.diag_Q = CuVector(diag_Q)
-    ws.w = CUDA.zeros(Float64, n)
-    ws.w_hat = CUDA.zeros(Float64, n)
-    ws.w_bar = CUDA.zeros(Float64, n)
-    ws.dw = CUDA.zeros(Float64, n)
-    ws.x = CUDA.zeros(Float64, n)
-    ws.x_hat = CUDA.zeros(Float64, n)
-    ws.x_bar = CUDA.zeros(Float64, n)
-    ws.dx = CUDA.zeros(Float64, n)
-    ws.y = CUDA.zeros(Float64, m)
-    ws.y_hat = CUDA.zeros(Float64, m)
-    ws.y_bar = CUDA.zeros(Float64, m)
-    ws.dy = CUDA.zeros(Float64, m)
-    ws.s = CUDA.zeros(Float64, m)
-    ws.z_bar = CUDA.zeros(Float64, n)
-    ws.Q = qp.Q
-    ws.A = qp.A
-    ws.AT = qp.AT
-    ws.AL = qp.AL
-    ws.AU = qp.AU
-    ws.c = qp.c
-    ws.l = qp.l
-    ws.u = qp.u
-    ws.Rp = CUDA.zeros(Float64, m)
-    ws.Rd = CUDA.zeros(Float64, n)
-    ws.ATy = CUDA.zeros(Float64, n)
-    ws.ATy_bar = CUDA.zeros(Float64, n)
-    ws.ATdy = CUDA.zeros(Float64, n)
-    ws.QATdy = CUDA.zeros(Float64, n)
-    ws.Ax = CUDA.zeros(Float64, m)
-    ws.Qw = CUDA.zeros(Float64, n)
-    ws.Qw_bar = CUDA.zeros(Float64, n)
-    ws.Qw_hat = CUDA.zeros(Float64, n)
-    ws.Qx = CUDA.zeros(Float64, n)
-    ws.dQw = CUDA.zeros(Float64, n)
-    ws.last_x = CUDA.zeros(Float64, n)
-    ws.last_y = CUDA.zeros(Float64, m)
-    ws.last_Qw = CUDA.zeros(Float64, n)
-    ws.last_ATy = CUDA.zeros(Float64, n)
-    ws.last_w = CUDA.zeros(Float64, n)
-    ws.tempv = CUDA.zeros(Float64, n)
-    ws.fact1 = CUDA.zeros(Float64, n)
-    ws.fact2 = CUDA.zeros(Float64, n)
-    ws.fact = CUDA.zeros(Float64, n)
-    ws.fact_M = CUDA.zeros(Float64, n)
-
-    # For GPU, lambda is scalar in QP_info_gpu but needs to be vector in workspace
-    # Convert scalar to CuVector filled with that value (same logic as CPU)
-    ws.lambda = CUDA.fill(qp.lambda, n)
-
-    # Default to full updates until iteration loop sets adaptive flag
-    ws.to_check = true
-
-    # Prepare CUSPARSE SpMV structures for A and AT (if m > 0)
-    if m > 0
-        ws.spmv_A, ws.spmv_AT = prepare_spmv_A!(qp.A, qp.AT, ws.x_bar, ws.x_hat, ws.dx, ws.Ax,
-            ws.y_bar, ws.y, ws.ATy)
-    else
-        ws.spmv_A = nothing
-        ws.spmv_AT = nothing
-    end
-
-    # Prepare CUSPARSE SpMV structure for Q (only if Q is a sparse matrix, not an operator)
-    if isa(qp.Q, CuSparseMatrixCSR{Float64,Int32})
-        ws.spmv_Q = prepare_spmv_Q!(qp.Q, ws.w, ws.w_bar, ws.w_hat, ws.Qw)
-    else
-        # Q is an operator (QAP/LASSO/custom) - check if it supports preprocessing
-        ws.spmv_Q = nothing
-        if supports_cusparse_preprocessing(qp.Q)
-            # Operator supports preprocessing - call its prepare function
-            # This stores CUSPARSE structures inside the operator itself
-            prepare_operator_spmv!(qp.Q, ws.w, ws.Qw)
-        end
-    end
-
-    # Initialize saved_state for auto_save feature
-    if params.auto_save
-        ws.saved_state = HPRQP_saved_state_gpu()
-        ws.saved_state.save_x = CUDA.zeros(Float64, n)
-        ws.saved_state.save_y = CUDA.zeros(Float64, m)
-        ws.saved_state.save_z = CUDA.zeros(Float64, n)
-        ws.saved_state.save_w = CUDA.zeros(Float64, n)
-        ws.saved_state.save_sigma = ws.sigma
-        ws.saved_state.save_iter = 0
-        ws.saved_state.save_err_Rp = Inf
-        ws.saved_state.save_err_Rd = Inf
-        ws.saved_state.save_primal_obj = Inf
-        ws.saved_state.save_dual_obj = Inf
-        ws.saved_state.save_rel_gap = Inf
-    end
-
-    # Initialize with user-provided initial x if available
-    if params.initial_x !== nothing
-        # Copy initial_x to GPU first
-        initial_x_gpu = CuArray(params.initial_x)
-
-        # Scale x on GPU: inverse of x_result = b_scale * (x_bar / col_norm)
-        # So x_bar = x_input * col_norm / b_scale
-        scaled_x = initial_x_gpu .* scaling_info.col_norm ./ scaling_info.b_scale
-
-        # Initialize x and related variables
-        ws.x .= scaled_x
-        ws.x_bar .= scaled_x
-        ws.last_x .= scaled_x
-
-        # Initialize w and related variables with the same initial x
-        ws.w .= scaled_x
-        ws.w_bar .= scaled_x
-        ws.last_w .= scaled_x
-    end
-
-    # Initialize with user-provided initial y if available
-    if params.initial_y !== nothing
-        # Copy initial_y to GPU first
-        ws.y .= CuArray(params.initial_y)
-
-        # Scale y on GPU: inverse of y_result = c_scale * (y_bar / row_norm)
-        # So y_bar = y_input * row_norm / c_scale
-        ws.y .= ws.y .* scaling_info.row_norm ./ scaling_info.c_scale
-        ws.y_bar .= ws.y
-        ws.last_y .= ws.y
-
-        # Compute ATy_bar from y_bar
-        if m > 0
-            # Use CUSPARSE preprocessed spmv if available
-            if ws.spmv_AT !== nothing
-                CUDA.CUSPARSE.cusparseSpMV(ws.spmv_AT.handle, ws.spmv_AT.operator, ws.spmv_AT.alpha,
-                    ws.spmv_AT.desc_AT, ws.spmv_AT.desc_y_bar, ws.spmv_AT.beta, ws.spmv_AT.desc_ATy,
-                    ws.spmv_AT.compute_type, ws.spmv_AT.alg, ws.spmv_AT.buf)
-            else
-                CUDA.CUSPARSE.mv!('N', 1, ws.AT, ws.y_bar, 0, ws.ATy_bar, 'O', CUDA.CUSPARSE.CUSPARSE_SPMV_CSR_ALG2)
-            end
-            ws.ATy .= ws.ATy_bar
-            ws.last_ATy .= ws.ATy_bar
-        end
-
-        # Compute z_bar from Rd = 0: z = Qx + c - A^T y
-        # First compute Qx_bar
-        # Pass spmv_Q for GPU sparse matrices to use preprocessed CUSPARSE
-        if isa(qp.Q, CuSparseMatrixCSR{Float64,Int32})
-            Qmap!(ws.x_bar, ws.Qx, qp.Q, ws.spmv_Q)
-        else
-            Qmap!(ws.x_bar, ws.Qx, qp.Q)
-        end
-        # Then z_bar = Qx + c - ATy
-        ws.z_bar .= ws.Qx .+ ws.c .- ws.ATy_bar
-
-        # Compute s for dual objective: s = proj_{[AL,AU]}(Ax - lambda_max_A * sigma * y)
-        if m > 0
-            # Compute Ax
-            if ws.spmv_A !== nothing
-                CUDA.CUSPARSE.cusparseSpMV(ws.spmv_A.handle, ws.spmv_A.operator, ws.spmv_A.alpha,
-                    ws.spmv_A.desc_A, ws.spmv_A.desc_x_bar, ws.spmv_A.beta, ws.spmv_A.desc_Ax,
-                    ws.spmv_A.compute_type, ws.spmv_A.alg, ws.spmv_A.buf)
-            else
-                CUDA.CUSPARSE.mv!('N', 1, ws.A, ws.x_bar, 0, ws.Ax, 'O', CUDA.CUSPARSE.CUSPARSE_SPMV_CSR_ALG2)
-            end
-            # s = proj_{[AL,AU]}(Ax - lambda_max_A * sigma * y)
-            fact1 = ws.lambda_max_A * ws.sigma
-            ws.s .= min.(max.(ws.Ax .- fact1 .* ws.y, ws.AL), ws.AU)
-        end
-    end
-
-    return ws
-end
-
 # This function initializes the restart information for the HPR-QP algorithm.
 function initialize_restart()
     restart_info = HPRQP_restart()
@@ -1610,13 +1269,6 @@ function main_update_gpu!(ws::HPRQP_workspace_gpu,
         if ws.noC
             unified_update_zxw_gpu!(ws, qp, Halpern_fact1, Halpern_fact2)
             unified_update_y_gpu!(ws, Halpern_fact1, Halpern_fact2)
-            desc_y = CUDA.CUSPARSE.CuDenseVectorDescriptor(ws.y)
-            desc_ATy = CUDA.CUSPARSE.CuDenseVectorDescriptor(ws.ATy)
-            CUDA.CUSPARSE.cusparseSpMV(ws.spmv_AT.handle, ws.spmv_AT.operator, ws.spmv_AT.alpha,
-                ws.spmv_AT.desc_AT, desc_y, ws.spmv_AT.beta, desc_ATy,
-                ws.spmv_AT.compute_type, ws.spmv_AT.alg, ws.spmv_AT.buf)
-            # Update last_Qw for next iteration
-            ws.last_Qw .= ws.Qw
             return
         else
             # Standard case with Q matrix - use unified kernels with separate Q and A modes
@@ -1678,6 +1330,17 @@ function transfer_to_gpu(model::QP_info_cpu, params::HPRQP_parameters)
     end
 
     return qp, transfer_time
+end
+
+# Unified model preparation function
+# Handles both GPU transfer and CPU copy with consistent interface
+function prepare_model(model::QP_info_cpu, params::HPRQP_parameters)
+    if params.use_gpu
+        return transfer_to_gpu(model, params)
+    else
+        # CPU: work on a copy to avoid modifying original, no transfer time
+        return deepcopy(model), 0.0
+    end
 end
 
 # Print solver parameters
@@ -1752,7 +1415,7 @@ function print_solver_params(params::HPRQP_parameters, qp::Union{QP_info_gpu,QP_
 end
 
 # Estimate maximum eigenvalues using power iteration
-function estimate_eigenvalues(qp::HPRQP_QP_info, params::HPRQP_parameters, Q_is_diag::Bool, ws::HPRQP_workspace)
+function estimate_eigenvalues(qp::HPRQP_QP_info, params::HPRQP_parameters, ws::HPRQP_workspace)
     if params.verbose
         println("ESTIMATING MAXIMUM EIGENVALUES ...")
     end
@@ -1768,36 +1431,8 @@ function estimate_eigenvalues(qp::HPRQP_QP_info, params::HPRQP_parameters, Q_is_
         lambda_max_A = 0.0
     end
 
-    # Estimate lambda_max_Q based on Q type, using preprocessed structures if available
-    # Compute largest eigenvalue of Q using power iteration or direct computation
-    if isa(qp.Q, AbstractQOperator) || isa(qp.Q, AbstractQOperatorCPU)
-        # Use power_iteration_Q for all operators (they handle preprocessing internally)
-        lambda_max_Q = power_iteration_Q(ws) * params.eig_factor
-    elseif isa(qp.Q, CuSparseMatrixCSR)
-        if length(qp.Q.nzVal) > 0
-            if !Q_is_diag
-                # Use preprocessed spmv_Q structure
-                lambda_max_Q = power_iteration_Q(ws) * params.eig_factor
-            else
-                lambda_max_Q = maximum(qp.Q.nzVal)
-            end
-        else
-            lambda_max_Q = 0.0
-        end
-    elseif isa(qp.Q, SparseMatrixCSC)
-        if length(qp.Q.nzval) > 0
-            if !Q_is_diag
-                # Use power iteration on CPU sparse matrix
-                lambda_max_Q = power_iteration_Q(ws) * params.eig_factor
-            else
-                lambda_max_Q = maximum(qp.Q.nzval)
-            end
-        else
-            lambda_max_Q = 0.0
-        end
-    else
-        error("Unsupported Q type: ", typeof(qp.Q))
-    end
+    # Estimate lambda_max_Q based on Q type using unified dispatch
+    lambda_max_Q = compute_lambda_max_Q(qp.Q, ws, params.eig_factor)
 
     CUDA.synchronize()
     power_time = time() - t_start
@@ -2121,6 +1756,12 @@ function determine_spmv_mode(qp::QP_info_gpu, params::HPRQP_parameters, ws::HPRQ
     return (spmv_mode_Q, spmv_mode_A)
 end
 
+# CPU stub - no SpMV mode selection needed for CPU
+# CPU always uses standard LinearAlgebra operations, no benchmarking required
+function determine_spmv_mode(qp::QP_info_cpu, params::HPRQP_parameters, ws::HPRQP_workspace_cpu)
+    return ("", "")  # CPU doesn't use SpMV modes
+end
+
 # Helper function: Determine if iteration should print
 function should_print(iter::Int, params::HPRQP_parameters, t_start_alg::Float64)
     if params.print_frequency == -1
@@ -2178,33 +1819,6 @@ function update_milestone_tracking!(residuals::HPRQP_residuals, iter::Int,
     return iter_4, time_4, first_4, iter_6, time_6, first_6
 end
 
-# Helper function: Handle termination and collect results
-# Legacy GPU-specific wrapper (kept for compatibility, calls unified version)
-function handle_termination_gpu(
-    status::String, residuals::HPRQP_residuals,
-    ws::HPRQP_workspace_gpu, scaling_info_gpu::Scaling_info_gpu,
-    iter::Int, t_start_alg::Float64, power_time::Float64,
-    setup_time::Float64, iter_4::Int, time_4::Float64,
-    iter_6::Int, time_6::Float64, verbose::Bool
-)
-    return handle_termination(status, residuals, ws, scaling_info_gpu,
-        iter, t_start_alg, power_time, setup_time, iter_4, time_4,
-        iter_6, time_6, verbose)
-end
-
-# Legacy CPU-specific wrapper (kept for compatibility, calls unified version)
-function handle_termination_cpu(
-    status::String, residuals::HPRQP_residuals,
-    ws::HPRQP_workspace_cpu, scaling_info::Scaling_info_cpu,
-    iter::Int, t_start_alg::Float64, power_time::Float64,
-    setup_time::Float64, iter_4::Int, time_4::Float64,
-    iter_6::Int, time_6::Float64, verbose::Bool
-)
-    return handle_termination(status, residuals, ws, scaling_info,
-        iter, t_start_alg, power_time, setup_time, iter_4, time_4,
-        iter_6, time_6, verbose)
-end
-
 # Helper function: Perform main iteration step (update and norm computation)
 # GPU version
 function perform_iteration_step!(ws::HPRQP_workspace_gpu, qp::QP_info_gpu,
@@ -2256,11 +1870,7 @@ function solve(model::QP_info_cpu, params::HPRQP_parameters)
 
     # Setup: GPU transfer and scaling
     diag_Q, Q_is_diag = nothing, false
-    if params.use_gpu
-        qp, transfer_time = transfer_to_gpu(model, params)
-    else
-        qp = deepcopy(model)  # Work on a copy to avoid modifying original
-    end
+    qp, transfer_time = prepare_model(model, params)
 
     scaling_info = scaling!(qp, params)
 
@@ -2287,7 +1897,7 @@ function solve(model::QP_info_cpu, params::HPRQP_parameters)
     setup_time = time() - setup_start
     t_start_alg = time()
 
-    ws.lambda_max_A, ws.lambda_max_Q, power_time = estimate_eigenvalues(qp, params, Q_is_diag, ws)
+    ws.lambda_max_A, ws.lambda_max_Q, power_time = estimate_eigenvalues(qp, params, ws)
 
     # Step 4: Process initial_x if provided
     if params.initial_x !== nothing
@@ -2336,11 +1946,7 @@ function solve(model::QP_info_cpu, params::HPRQP_parameters)
         end
     end
 
-    if params.use_gpu
-        ws.spmv_mode_Q, ws.spmv_mode_A = determine_spmv_mode(qp, params, ws)
-    else
-        ws.spmv_mode_Q, ws.spmv_mode_A = "", ""
-    end
+    ws.spmv_mode_Q, ws.spmv_mode_A = determine_spmv_mode(qp, params, ws)
 
     # Initialize best_sigma with the initial sigma value
     restart_info.best_sigma = ws.sigma

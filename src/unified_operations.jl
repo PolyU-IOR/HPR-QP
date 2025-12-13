@@ -678,3 +678,45 @@ Returns true for AbstractQOperator (GPU) or AbstractQOperatorCPU (CPU).
 is_q_operator(Q::AbstractQOperator) = true
 is_q_operator(Q::AbstractQOperatorCPU) = true
 is_q_operator(Q::Union{SparseMatrixCSC, CuSparseMatrixCSR}) = false
+
+"""
+    get_Q_nzvals(Q)
+
+Get the array of non-zero values in Q matrix.
+Dispatches based on Q type (SparseMatrixCSC for CPU, CuSparseMatrixCSR for GPU).
+"""
+get_Q_nzvals(Q::SparseMatrixCSC) = Q.nzval
+get_Q_nzvals(Q::CuSparseMatrixCSR) = Q.nzVal
+
+"""
+    compute_lambda_max_Q(Q, ws, eig_factor, Q_is_diag)
+
+Compute the maximum eigenvalue of Q matrix.
+Dispatches based on Q type (AbstractQOperator, SparseMatrixCSC, or CuSparseMatrixCSR).
+
+For Q operators: Uses power iteration with eigenvalue factor.
+For sparse matrices: 
+  - If Q is diagonal: Returns maximum of diagonal values
+  - If Q is non-diagonal: Uses power iteration with eigenvalue factor
+  - If Q is empty: Returns 0.0
+"""
+function compute_lambda_max_Q(Q::Union{AbstractQOperator, AbstractQOperatorCPU}, ws, eig_factor)
+    return power_iteration_Q(ws) * eig_factor
+end
+
+function compute_lambda_max_Q(Q::Union{CuSparseMatrixCSR, SparseMatrixCSC}, ws, eig_factor)
+    nz_vals = get_Q_nzvals(Q)
+    if length(nz_vals) > 0
+        if !ws.Q_is_diag
+            return power_iteration_Q(ws) * eig_factor
+        else
+            return maximum(nz_vals)
+        end
+    else
+        return 0.0
+    end
+end
+
+# Helper function to get workspace type from qp type
+workspace_type(::QP_info_cpu) = HPRQP_workspace_cpu
+workspace_type(::QP_info_gpu) = HPRQP_workspace_gpu
