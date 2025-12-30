@@ -1,0 +1,273 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8"/><meta name="viewport" content="width=device-width, initial-scale=1.0"/><title>QAP Problems · HPRQP.jl</title><meta name="title" content="QAP Problems · HPRQP.jl"/><meta property="og:title" content="QAP Problems · HPRQP.jl"/><meta property="twitter:title" content="QAP Problems · HPRQP.jl"/><meta name="description" content="Documentation for HPRQP.jl."/><meta property="og:description" content="Documentation for HPRQP.jl."/><meta property="twitter:description" content="Documentation for HPRQP.jl."/><meta property="og:url" content="https://PolyU-IOR.github.io/HPR-QP/guide/qap_problems/"/><meta property="twitter:url" content="https://PolyU-IOR.github.io/HPR-QP/guide/qap_problems/"/><link rel="canonical" href="https://PolyU-IOR.github.io/HPR-QP/guide/qap_problems/"/><script data-outdated-warner src="../../assets/warner.js"></script><link href="https://cdnjs.cloudflare.com/ajax/libs/lato-font/3.0.0/css/lato-font.min.css" rel="stylesheet" type="text/css"/><link href="https://cdnjs.cloudflare.com/ajax/libs/juliamono/0.050/juliamono.min.css" rel="stylesheet" type="text/css"/><link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.2/css/fontawesome.min.css" rel="stylesheet" type="text/css"/><link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.2/css/solid.min.css" rel="stylesheet" type="text/css"/><link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.2/css/brands.min.css" rel="stylesheet" type="text/css"/><link href="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.8/katex.min.css" rel="stylesheet" type="text/css"/><script>documenterBaseURL="../.."</script><script src="https://cdnjs.cloudflare.com/ajax/libs/require.js/2.3.6/require.min.js" data-main="../../assets/documenter.js"></script><script src="../../search_index.js"></script><script src="../../siteinfo.js"></script><script src="../../../versions.js"></script><link class="docs-theme-link" rel="stylesheet" type="text/css" href="../../assets/themes/catppuccin-mocha.css" data-theme-name="catppuccin-mocha"/><link class="docs-theme-link" rel="stylesheet" type="text/css" href="../../assets/themes/catppuccin-macchiato.css" data-theme-name="catppuccin-macchiato"/><link class="docs-theme-link" rel="stylesheet" type="text/css" href="../../assets/themes/catppuccin-frappe.css" data-theme-name="catppuccin-frappe"/><link class="docs-theme-link" rel="stylesheet" type="text/css" href="../../assets/themes/catppuccin-latte.css" data-theme-name="catppuccin-latte"/><link class="docs-theme-link" rel="stylesheet" type="text/css" href="../../assets/themes/documenter-dark.css" data-theme-name="documenter-dark" data-theme-primary-dark/><link class="docs-theme-link" rel="stylesheet" type="text/css" href="../../assets/themes/documenter-light.css" data-theme-name="documenter-light" data-theme-primary/><script src="../../assets/themeswap.js"></script></head><body><div id="documenter"><nav class="docs-sidebar"><div class="docs-package-name"><span class="docs-autofit"><a href="../../">HPRQP.jl</a></span></div><button class="docs-search-query input is-rounded is-small is-clickable my-2 mx-auto py-1 px-2" id="documenter-search-query">Search docs (Ctrl + /)</button><ul class="docs-menu"><li><a class="tocitem" href="../../">Home</a></li><li><a class="tocitem" href="../../getting_started/">Getting Started</a></li><li><span class="tocitem">User Guide</span><ul><li><input class="collapse-toggle" id="menuitem-3-1" type="checkbox"/><label class="tocitem" for="menuitem-3-1"><span class="docs-label">Input Methods</span><i class="docs-chevron"></i></label><ul class="collapsed"><li><a class="tocitem" href="../input_overview/">Overview</a></li><li><a class="tocitem" href="../direct_api/">Direct API</a></li><li><a class="tocitem" href="../jump_integration/">JuMP Integration</a></li><li><a class="tocitem" href="../mps_files/">MPS Files</a></li></ul></li><li><input class="collapse-toggle" id="menuitem-3-2" type="checkbox" checked/><label class="tocitem" for="menuitem-3-2"><span class="docs-label">Q Operators</span><i class="docs-chevron"></i></label><ul class="collapsed"><li><a class="tocitem" href="../q_operators_overview/">Overview</a></li><li><a class="tocitem" href="../sparse_matrix_qp/">Sparse Matrix QP</a></li><li><a class="tocitem" href="../lasso_problems/">LASSO Problems</a></li><li class="is-active"><a class="tocitem" href>QAP Problems</a><ul class="internal"><li><a class="tocitem" href="#Problem-Formulation"><span>Problem Formulation</span></a></li><li><a class="tocitem" href="#Why-Use-the-QAP-Operator?"><span>Why Use the QAP Operator?</span></a></li><li><a class="tocitem" href="#Basic-Usage"><span>Basic Usage</span></a></li><li><a class="tocitem" href="#Constructing-QAP-Constraints"><span>Constructing QAP Constraints</span></a></li><li><a class="tocitem" href="#Complete-Example:-Facility-Location"><span>Complete Example: Facility Location</span></a></li><li><a class="tocitem" href="#Rounding-to-Integer-Solution"><span>Rounding to Integer Solution</span></a></li><li><a class="tocitem" href="#Applications"><span>Applications</span></a></li><li><a class="tocitem" href="#Performance-Tips"><span>Performance Tips</span></a></li><li><a class="tocitem" href="#See-Also"><span>See Also</span></a></li></ul></li></ul></li><li><a class="tocitem" href="../parameters/">Parameters</a></li><li><a class="tocitem" href="../output_results/">Output &amp; Results</a></li></ul></li><li><a class="tocitem" href="../../api/">API Reference</a></li><li><a class="tocitem" href="../../examples/">Examples</a></li></ul><div class="docs-version-selector field has-addons"><div class="control"><span class="docs-label button is-static is-size-7">Version</span></div><div class="docs-selector control is-expanded"><div class="select is-fullwidth is-size-7"><select id="documenter-version-selector"></select></div></div></div></nav><div class="docs-main"><header class="docs-navbar"><a class="docs-sidebar-button docs-navbar-link fa-solid fa-bars is-hidden-desktop" id="documenter-sidebar-button" href="#"></a><nav class="breadcrumb"><ul class="is-hidden-mobile"><li><a class="is-disabled">User Guide</a></li><li><a class="is-disabled">Q Operators</a></li><li class="is-active"><a href>QAP Problems</a></li></ul><ul class="is-hidden-tablet"><li class="is-active"><a href>QAP Problems</a></li></ul></nav><div class="docs-right"><a class="docs-navbar-link" href="https://github.com/PolyU-IOR/HPR-QP" title="View the repository on GitHub"><span class="docs-icon fa-brands"></span><span class="docs-label is-hidden-touch">GitHub</span></a><a class="docs-navbar-link" href="https://github.com/PolyU-IOR/HPR-QP/blob/main/docs/src/guide/qap_problems.md" title="Edit source on GitHub"><span class="docs-icon fa-solid"></span></a><a class="docs-settings-button docs-navbar-link fa-solid fa-gear" id="documenter-settings-button" href="#" title="Settings"></a><a class="docs-article-toggle-button fa-solid fa-chevron-up" id="documenter-article-toggle-button" href="javascript:;" title="Collapse all docstrings"></a></div></header><article class="content" id="documenter-page"><h1 id="QAP-Problems"><a class="docs-heading-anchor" href="#QAP-Problems">QAP Problems</a><a id="QAP-Problems-1"></a><a class="docs-heading-anchor-permalink" href="#QAP-Problems" title="Permalink"></a></h1><p>The Quadratic Assignment Problem (QAP) is a fundamental combinatorial optimization problem. HPRQP provides a specialized operator for efficiently solving QAP and its relaxations.</p><h2 id="Problem-Formulation"><a class="docs-heading-anchor" href="#Problem-Formulation">Problem Formulation</a><a id="Problem-Formulation-1"></a><a class="docs-heading-anchor-permalink" href="#Problem-Formulation" title="Permalink"></a></h2><p>The QAP aims to assign <span>$n$</span> facilities to <span>$n$</span> locations to minimize:</p><p class="math-container">\[\min_{\pi} \quad \sum_{i=1}^n \sum_{j=1}^n f_{ij} \cdot d_{\pi(i),\pi(j)}\]</p><p>where:</p><ul><li><span>$f_{ij}$</span> is the flow between facilities <span>$i$</span> and <span>$j$</span> (flow matrix <span>$F$</span>)</li><li><span>$d_{kl}$</span> is the distance between locations <span>$k$</span> and <span>$l$</span> (distance matrix <span>$D$</span>)</li><li><span>$\pi$</span> is a permutation (assignment)</li></ul><h3 id="Linearized-Formulation"><a class="docs-heading-anchor" href="#Linearized-Formulation">Linearized Formulation</a><a id="Linearized-Formulation-1"></a><a class="docs-heading-anchor-permalink" href="#Linearized-Formulation" title="Permalink"></a></h3><p>Using decision variables <span>$x_{ik} \in \{0, 1\}$</span> where <span>$x_{ik} = 1$</span> if facility <span>$i$</span> is assigned to location <span>$k$</span>:</p><p class="math-container">\[\begin{array}{ll}
+\min \quad &amp; \sum_{i=1}^n \sum_{j=1}^n \sum_{k=1}^n \sum_{l=1}^n f_{ij} \cdot d_{kl} \cdot x_{ik} \cdot x_{jl} \\
+\text{s.t.} \quad &amp; \sum_{k=1}^n x_{ik} = 1, \quad \forall i \\
+&amp; \sum_{i=1}^n x_{ik} = 1, \quad \forall k \\
+&amp; x_{ik} \in \{0, 1\}
+\end{array}\]</p><p>This is a quadratic program with the quadratic term having Kronecker product structure: <span>$Q = F \otimes D$</span>.</p><h3 id="Continuous-Relaxation"><a class="docs-heading-anchor" href="#Continuous-Relaxation">Continuous Relaxation</a><a id="Continuous-Relaxation-1"></a><a class="docs-heading-anchor-permalink" href="#Continuous-Relaxation" title="Permalink"></a></h3><p>Replace <span>$x_{ik} \in \{0,1\}$</span> with <span>$x_{ik} \in [0,1]$</span> to get a QP that HPRQP can solve:</p><p class="math-container">\[\begin{array}{ll}
+\min \quad &amp; \text{vec}(X)^T (F \otimes D) \text{vec}(X) \\
+\text{s.t.} \quad &amp; X \mathbf{1} = \mathbf{1}, \quad X^T \mathbf{1} = \mathbf{1} \\
+&amp; 0 \leq X \leq 1
+\end{array}\]</p><h2 id="Why-Use-the-QAP-Operator?"><a class="docs-heading-anchor" href="#Why-Use-the-QAP-Operator?">Why Use the QAP Operator?</a><a id="Why-Use-the-QAP-Operator?-1"></a><a class="docs-heading-anchor-permalink" href="#Why-Use-the-QAP-Operator?" title="Permalink"></a></h2><p>The QAP operator exploits the Kronecker product structure <span>$Q = F \otimes D$</span>:</p><p><strong>Benefits:</strong></p><ul><li>✅ <strong>Memory efficient</strong>: Stores <span>$F$</span> and <span>$D$</span> (<span>$2n^2$</span>) instead of full <span>$Q$</span> (<span>$n^4$</span> entries)</li><li>✅ <strong>Faster computation</strong>: Exploits structure in matrix-vector products</li><li>✅ <strong>Numerically stable</strong>: Avoids explicitly forming huge Kronecker product</li></ul><p><strong>Memory comparison for <span>$n = 100$</span>:</strong></p><ul><li>Full Q matrix: <span>$n^4 = 100,000,000$</span> entries (800 MB)</li><li>F and D matrices: <span>$2n^2 = 20,000$</span> entries (0.16 MB)</li></ul><h2 id="Basic-Usage"><a class="docs-heading-anchor" href="#Basic-Usage">Basic Usage</a><a id="Basic-Usage-1"></a><a class="docs-heading-anchor-permalink" href="#Basic-Usage" title="Permalink"></a></h2><pre><code class="language-julia hljs">using HPRQP
+using SparseArrays
+
+# Problem size
+n = 10  # Facilities/locations
+
+# Flow matrix (traffic between facilities)
+F = rand(n, n)
+F = (F + F&#39;) / 2  # Make symmetric
+
+# Distance matrix (distance between locations)
+D = rand(n, n)
+D = (D + D&#39;) / 2  # Make symmetric
+
+# Create QAP operator
+Q_qap = QAPOperatorCPU(F, D, n)
+
+# Build QAP constraints
+# Vectorize X: x = vec(X) has length n^2
+n2 = n * n
+
+# Row sum constraints: X*1 = 1
+A_row = sparse(zeros(n, n2))
+for i in 1:n
+    for k in 1:n
+        A_row[i, (i-1)*n + k] = 1.0
+    end
+end
+
+# Column sum constraints: X&#39;*1 = 1
+A_col = sparse(zeros(n, n2))
+for k in 1:n
+    for i in 1:n
+        A_col[k, (i-1)*n + k] = 1.0
+    end
+end
+
+# Combine constraints
+A = vcat(A_row, A_col)
+AL = ones(2n)
+AU = ones(2n)
+
+# No linear term
+c = zeros(n2)
+
+# Box constraints: 0 &lt;= x &lt;= 1
+l = zeros(n2)
+u = ones(n2)
+
+# Build and solve
+model = build_from_QAbc(Q_qap, A, c, AL, AU, l, u)
+
+params = HPRQP_parameters()
+params.use_gpu = true
+params.stoptol = 1e-4
+
+result = optimize(model, params)
+
+# Extract solution matrix
+X_vec = result.x
+X = reshape(X_vec, n, n)
+
+println(&quot;QAP relaxation objective: &quot;, result.primal_obj)
+println(&quot;Solution matrix X:&quot;)
+display(X)</code></pre><h2 id="Constructing-QAP-Constraints"><a class="docs-heading-anchor" href="#Constructing-QAP-Constraints">Constructing QAP Constraints</a><a id="Constructing-QAP-Constraints-1"></a><a class="docs-heading-anchor-permalink" href="#Constructing-QAP-Constraints" title="Permalink"></a></h2><h3 id="Helper-Function"><a class="docs-heading-anchor" href="#Helper-Function">Helper Function</a><a id="Helper-Function-1"></a><a class="docs-heading-anchor-permalink" href="#Helper-Function" title="Permalink"></a></h3><pre><code class="language-julia hljs">using SparseArrays
+
+function build_qap_constraints(n::Int)
+    &quot;&quot;&quot;Build constraint matrix for QAP with n facilities/locations&quot;&quot;&quot;
+    n2 = n * n
+    
+    # Row constraints: sum over k of x[i,k] = 1 for each i
+    rows_row = Int[]
+    cols_row = Int[]
+    vals_row = Float64[]
+    
+    for i in 1:n
+        for k in 1:n
+            idx = (i-1)*n + k  # vec(X) index
+            push!(rows_row, i)
+            push!(cols_row, idx)
+            push!(vals_row, 1.0)
+        end
+    end
+    A_row = sparse(rows_row, cols_row, vals_row, n, n2)
+    
+    # Column constraints: sum over i of x[i,k] = 1 for each k
+    rows_col = Int[]
+    cols_col = Int[]
+    vals_col = Float64[]
+    
+    for k in 1:n
+        for i in 1:n
+            idx = (i-1)*n + k
+            push!(rows_col, k)
+            push!(cols_col, idx)
+            push!(vals_col, 1.0)
+        end
+    end
+    A_col = sparse(rows_col, cols_col, vals_col, n, n2)
+    
+    # Combine
+    A = vcat(A_row, A_col)
+    AL = ones(2n)
+    AU = ones(2n)
+    
+    return A, AL, AU
+end
+
+# Use it
+A, AL, AU = build_qap_constraints(n)</code></pre><h2 id="Complete-Example:-Facility-Location"><a class="docs-heading-anchor" href="#Complete-Example:-Facility-Location">Complete Example: Facility Location</a><a id="Complete-Example:-Facility-Location-1"></a><a class="docs-heading-anchor-permalink" href="#Complete-Example:-Facility-Location" title="Permalink"></a></h2><pre><code class="language-julia hljs">using HPRQP
+using SparseArrays
+using LinearAlgebra
+
+# Problem: Assign 5 facilities to 5 locations
+n = 5
+
+# Flow matrix: how much traffic between facilities
+# Example: factories with material flow
+F = [
+    0  10  5   2   1;
+    10  0  8   3   2;
+    5   8  0   6   4;
+    2   3  6   0   7;
+    1   2  4   7   0
+]
+F = Float64.(F)
+
+# Distance matrix: distance between locations
+# Example: geographical distances
+D = [
+    0.0  1.0  2.0  3.0  4.0;
+    1.0  0.0  1.0  2.0  3.0;
+    2.0  1.0  0.0  1.0  2.0;
+    3.0  2.0  1.0  0.0  1.0;
+    4.0  3.0  2.0  1.0  0.0
+]
+
+# Create QAP operator
+Q_qap = QAPOperatorCPU(F, D, n)
+
+# Build constraints
+A, AL, AU = build_qap_constraints(n)
+
+# Solve relaxation
+model = build_from_QAbc(Q_qap, A, zeros(n^2), AL, AU, zeros(n^2), ones(n^2))
+
+params = HPRQP_parameters()
+params.use_gpu = false  # Small problem
+result = optimize(model, params)
+
+# Display solution
+X = reshape(result.x, n, n)
+println(&quot;\nQAP Relaxation Solution:&quot;)
+println(&quot;Objective value: &quot;, result.primal_obj)
+println(&quot;\nAssignment matrix X:&quot;)
+display(round.(X, digits=3))
+
+# Find near-integer assignments
+println(&quot;\nNear-integer assignments (&gt; 0.9):&quot;)
+for i in 1:n, k in 1:n
+    if X[i,k] &gt; 0.9
+        println(&quot;  Facility $i → Location $k (x = &quot;, round(X[i,k], digits=3), &quot;)&quot;)
+    end
+end</code></pre><h2 id="Rounding-to-Integer-Solution"><a class="docs-heading-anchor" href="#Rounding-to-Integer-Solution">Rounding to Integer Solution</a><a id="Rounding-to-Integer-Solution-1"></a><a class="docs-heading-anchor-permalink" href="#Rounding-to-Integer-Solution" title="Permalink"></a></h2><p>The continuous relaxation often gives fractional solutions. Common rounding strategies:</p><h3 id="Greedy-Rounding"><a class="docs-heading-anchor" href="#Greedy-Rounding">Greedy Rounding</a><a id="Greedy-Rounding-1"></a><a class="docs-heading-anchor-permalink" href="#Greedy-Rounding" title="Permalink"></a></h3><pre><code class="language-julia hljs">function greedy_rounding(X::Matrix)
+    n = size(X, 1)
+    assignment = zeros(Int, n)
+    facilities_assigned = Set{Int}()
+    locations_used = Set{Int}()
+    
+    # Flatten and sort by value
+    entries = [(i, k, X[i,k]) for i in 1:n, k in 1:n]
+    sort!(entries, by=x-&gt;x[3], rev=true)
+    
+    # Greedily assign
+    for (i, k, val) in entries
+        if !(i in facilities_assigned) &amp;&amp; !(k in locations_used)
+            assignment[i] = k
+            push!(facilities_assigned, i)
+            push!(locations_used, k)
+        end
+    end
+    
+    return assignment
+end
+
+# Use it
+X = reshape(result.x, n, n)
+assignment = greedy_rounding(X)
+println(&quot;Greedy assignment: &quot;, assignment)
+
+# Evaluate objective
+obj = sum(F[i,j] * D[assignment[i], assignment[j]] for i in 1:n, j in 1:n)
+println(&quot;Integer objective: &quot;, obj)</code></pre><h3 id="Randomized-Rounding"><a class="docs-heading-anchor" href="#Randomized-Rounding">Randomized Rounding</a><a id="Randomized-Rounding-1"></a><a class="docs-heading-anchor-permalink" href="#Randomized-Rounding" title="Permalink"></a></h3><pre><code class="language-julia hljs">function randomized_rounding(X::Matrix; n_samples=100)
+    n = size(X, 1)
+    best_obj = Inf
+    best_assignment = nothing
+    
+    for _ in 1:n_samples
+        assignment = zeros(Int, n)
+        locations = collect(1:n)
+        
+        for i in 1:n
+            # Sample location proportional to X[i,:]
+            probs = X[i, locations]
+            probs ./= sum(probs)
+            
+            k_idx = sample(1:length(locations), Weights(probs))
+            k = locations[k_idx]
+            
+            assignment[i] = k
+            deleteat!(locations, k_idx)
+        end
+        
+        # Evaluate
+        obj = sum(F[i,j] * D[assignment[i], assignment[j]] for i in 1:n, j in 1:n)
+        if obj &lt; best_obj
+            best_obj = obj
+            best_assignment = assignment
+        end
+    end
+    
+    return best_assignment, best_obj
+end</code></pre><h2 id="Applications"><a class="docs-heading-anchor" href="#Applications">Applications</a><a id="Applications-1"></a><a class="docs-heading-anchor-permalink" href="#Applications" title="Permalink"></a></h2><h3 id="Factory-Layout"><a class="docs-heading-anchor" href="#Factory-Layout">Factory Layout</a><a id="Factory-Layout-1"></a><a class="docs-heading-anchor-permalink" href="#Factory-Layout" title="Permalink"></a></h3><pre><code class="language-julia hljs"># Arrange machines to minimize material handling
+n_machines = 8
+
+# Material flow (parts/hour between machines)
+F = rand(0:10, n_machines, n_machines)
+F = (F + F&#39;) / 2
+F[diagind(F)] .= 0
+
+# Distance between locations (meters)
+D = rand(1.0:20.0, n_machines, n_machines)
+D = (D + D&#39;) / 2
+D[diagind(D)] .= 0
+
+Q_qap = QAPOperatorCPU(F, D, n_machines)
+# ... solve as above</code></pre><h3 id="Communication-Network"><a class="docs-heading-anchor" href="#Communication-Network">Communication Network</a><a id="Communication-Network-1"></a><a class="docs-heading-anchor-permalink" href="#Communication-Network" title="Permalink"></a></h3><pre><code class="language-julia hljs"># Assign tasks to processors to minimize communication cost
+n_tasks = 12
+
+# Communication volume between tasks (MB)
+F = rand(0:100, n_tasks, n_tasks)
+F = (F + F&#39;) / 2
+
+# Network latency between processors (ms)
+D = rand(1.0:10.0, n_tasks, n_tasks)
+D = (D + D&#39;) / 2
+
+Q_qap = QAPOperatorCPU(F, D, n_tasks)
+# ... solve</code></pre><h2 id="Performance-Tips"><a class="docs-heading-anchor" href="#Performance-Tips">Performance Tips</a><a id="Performance-Tips-1"></a><a class="docs-heading-anchor-permalink" href="#Performance-Tips" title="Permalink"></a></h2><ol><li><p><strong>GPU for Large Problems</strong>:</p><pre><code class="language-julia hljs">params = HPRQP_parameters()
+params.use_gpu = true  # Essential for n &gt; 20</code></pre></li><li><p><strong>Warm-Start from Heuristics</strong>:</p><pre><code class="language-julia hljs"># Get initial assignment from greedy heuristic
+x0 = zeros(n^2)
+# ... fill x0 based on heuristic
+
+params.initial_x = x0</code></pre></li><li><p><strong>Hierarchical Approach</strong>:</p><pre><code class="language-julia hljs"># Solve small problem first, use to warm-start larger
+n_small = 5
+n_large = 10
+
+# Solve small
+Q_small = QAPOperatorCPU(F[1:n_small, 1:n_small], D[1:n_small, 1:n_small], n_small)
+# ... solve
+
+# Extend solution to larger problem
+# Use as warm-start for full problem</code></pre></li></ol><h2 id="See-Also"><a class="docs-heading-anchor" href="#See-Also">See Also</a><a id="See-Also-1"></a><a class="docs-heading-anchor-permalink" href="#See-Also" title="Permalink"></a></h2><ul><li><a href="../q_operators_overview/">Q Operators Overview</a> - Understanding Q operators</li><li><a href="../sparse_matrix_qp/">Sparse Matrix QP</a> - Alternative approach</li><li><a href="../direct_api/">Direct API</a> - Building models with operators</li></ul></article><nav class="docs-footer"><a class="docs-footer-prevpage" href="../lasso_problems/">« LASSO Problems</a><a class="docs-footer-nextpage" href="../parameters/">Parameters »</a><div class="flexbox-break"></div><p class="footer-message">Powered by <a href="https://github.com/JuliaDocs/Documenter.jl">Documenter.jl</a> and the <a href="https://julialang.org/">Julia Programming Language</a>.</p></nav></div><div class="modal" id="documenter-settings"><div class="modal-background"></div><div class="modal-card"><header class="modal-card-head"><p class="modal-card-title">Settings</p><button class="delete"></button></header><section class="modal-card-body"><p><label class="label">Theme</label><div class="select"><select id="documenter-themepicker"><option value="auto">Automatic (OS)</option><option value="documenter-light">documenter-light</option><option value="documenter-dark">documenter-dark</option><option value="catppuccin-latte">catppuccin-latte</option><option value="catppuccin-frappe">catppuccin-frappe</option><option value="catppuccin-macchiato">catppuccin-macchiato</option><option value="catppuccin-mocha">catppuccin-mocha</option></select></div></p><hr/><p>This document was generated with <a href="https://github.com/JuliaDocs/Documenter.jl">Documenter.jl</a> version 1.16.1 on <span class="colophon-date" title="Tuesday 30 December 2025 15:08">Tuesday 30 December 2025</span>. Using Julia version 1.10.10.</p></section><footer class="modal-card-foot"></footer></div></div></div></body></html>
