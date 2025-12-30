@@ -18,21 +18,16 @@ Q = SparseMatrixCSC{Float64, Int32}([2 0; 0 2])
 A = SparseMatrixCSC{Float64, Int32}([-1 -2; -3 -1])
 AL = Vector{Float64}([-10, -12])
 AU = Vector{Float64}([Inf, Inf])
-# empty A, AL, AU
-# A = SparseMatrixCSC{Float64, Int32}(undef, 0, 2)
-# AL = Vector{Float64}(zeros(0))
-# AU = Vector{Float64}(zeros(0))
 c = Vector{Float64}([-3, -5])
 l = Vector{Float64}([0.0, 0.0])
 u = Vector{Float64}([Inf, Inf])
 obj_constant = 0.0
 
 params = HPRQP.HPRQP_parameters()
-params.max_iter = typemax(Int32)
 params.time_limit = 3600
 params.stoptol = 1e-8
 params.device_number = 0 
-params.warm_up = true
+params.auto_save = true
 
 model = HPRQP.build_from_QAbc(Q, c, A, AL, AU, l, u)
 result = HPRQP.optimize(model, params)

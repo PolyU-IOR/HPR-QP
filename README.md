@@ -4,6 +4,34 @@
 
 ---
 
+## 🎉 What's New in v0.11
+
+This version represents a major architectural overhaul with significant improvements:
+
+### **1. Unified Architecture**
+- **Single codebase** for all problem types (standard QP, QAP, LASSO)
+- Modular **Q operator system** for extensibility: easily add custom problem types
+
+### **2. CPU & GPU Support**
+- **Full CPU implementation** in addition to GPU acceleration
+- Automatic device selection via `use_gpu` parameter
+
+### **3. JuMP Integration**
+- **Native JuMP/MathOptInterface (MOI) support** for easy modeling
+- Use HPR-QP directly as a JuMP optimizer
+
+### **4. Warm-Start Capability**
+- Initialize via `initial_x` and `initial_y` parameters
+- Resume optimization from previous (auto-saved) solutions
+
+### **5. Auto-Save Feature**
+- Automatically save best solution during optimization (`auto_save=true`)
+- Resume from saved states for long-running problems
+
+> **📖 For detailed documentation**, see the [docs/](docs/) directory or visit our [documentation pages](docs/README.md).
+
+---
+
 ## CCQP Problem Formulation
 
 <div align="center">
@@ -22,75 +50,7 @@ $$
 - $\phi$ is a proper closed convex function.
 ---
 
-## Numerical Results
-
-- **HPR-QP** is implemented in Julia and leverages CUDA for GPU acceleration
-- [**PDQP**](https://github.com/jinwen-yang/PDQP.jl) (GPU, downloaded in April 2025)
-- [**SCS**](https://github.com/jump-dev/SCS.jl) (GPU, version 2.1.0) is written in C/C++ with a Julia interface. GPU acceleration is enabled via its indirect solver, which performs all matrix operations on the GPU
-- [**CuClarabel**](https://github.com/oxfordcontrol/Clarabel.jl/tree/CuClarabel) (GPU, version 0.10.0)
-- [**Gurobi**](https://www.gurobi.com/) (CPU, version 12.0.2, academic license) is executed on CPU using the barrier method
-- All benchmarks were conducted on a SuperServer SYS-420GP-TNR with an NVIDIA A100-SXM4-80GB GPU, Intel Xeon Platinum 8338C CPU @ 2.60 GHz, and 256 GB RAM
-
-### Maros-Mészáros Data Set (137 Instances, Tolerance $10^{-6}$ and $10^{-8}$)
-
-| **Solver**   | **SGM10<br/>($10^{-6}$)** | **Solved<br/>($10^{-6}$)** | **SGM10<br/>($10^{-8}$)** | **Solved<br/>($10^{-8}$)** |
-|:------------ | ------------------------: | -------------------------: | ------------------------: | -------------------------: |
-| **HPR-QP**   | 10.5                      | 129                        | 12.6                      | 128                        |
-| **PDQP**     | 33.1                      | 125                        | 42.5                      | 124                        |
-| **SCS**      | 126.0                     | 103                        | 165.0                     | 93                         |
-| **CuClarabel** | 3.7                     | 130                        | 7.8                       | 124                        |
-| **Gurobi**   | 0.4                       | 137                        | 1.2                       | 135                        |
-
----
-
-### QAP Relaxations (36 Instances, Tolerance $10^{-6}$ and $10^{-8}$)
-
-| **Solver**   | **SGM10<br/>($10^{-6}$)** | **Solved<br/>($10^{-6}$)** | **SGM10<br/>($10^{-8}$)** | **Solved<br/>($10^{-8}$)** |
-|:------------ | ------------------------: | -------------------------: | ------------------------: | -------------------------: |
-| **HPR-QP**   | 1.8                       | 36                         | 4.7                       | 36                         |
-| **PDQP**     | 124.1                     | 23                         | 149.4                     | 23                         |
-| **SCS**      | 11.3                      | 36                         | 86.0                      | 36                         |
-| **CuClarabel** | 13.6                    | 33                         | 114.9                     | 22                         |
-| **Gurobi**   | 24.8                      | 36                         | 26.8                      | 36                         |
-
----
-
-### LASSO Problems (11 Instances, Tolerance $10^{-8}$)
-
-Abbreviations: **T** = time-limit, **F** = failure (e.g., unbounded or infeasible).
-
-| **Instance**         | **HPR-QP** | **PDQP** | **SCS** | **CuClarabel** | **Gurobi** |
-|:---------------------| ----------:| --------:| -------:| -------------:| ----------:|
-| abalone7             | 10.5       | 372.5    | T       | 24.4          | 127.3      |
-| bodyfat7             | 1.2        | 33.3     | T       | 2.2           | 30.8       |
-| E2006.test           | 0.2        | 1.3      | T       | 15.4          | 9.0        |
-| E2006.train          | 0.7        | 1.9      | F       | 116.0         | 277.8      |
-| housing7             | 22.6       | 123.3    | T       | 5.7           | 125.9      |
-| log1p.E2006.test     | 7.0        | 1416.9   | T       | 196.0         | 137.0      |
-| log1p.E2006.train    | 17.3       | 2983.2   | T       | 361.0         | 878.8      |
-| mpg7                 | 0.6        | 18.1     | 2000.0  | 0.3           | 1.2        |
-| pyrim5               | 49.1       | 410.6    | T       | 3.5           | 35.9       |
-| space_ga9            | 0.6        | 62.7     | 1210.0  | 6.7           | 38.1       |
-| triazines4           | 401.3      | 3533.3   | T       | 26.0          | 843.1      |
-| **SGM10 (Time)**     | **13.2**   | **161.8**| **3091.0** | **26.1**   | **91.2**   |
-
----
-
 # Getting Started
-
-## First Step — Pick the Right Solver for Your Problem
-If you need to solve a LASSO problem (with an $\ell_1$ regularizer) or a QAP instance where the matrix form of $Q$ is unavailable, please refer to the HPR-QP_QAP_LASSO module.
-
-
-```shell
-cd HPR-QP_QAP_LASSO
-```
-
-otherwise, for convex QP (COP) problems where the matrix form of $Q$ is available, please refer to the HPR-QP module.
-
-```shell
-cd HPR-QP
-```
 
 ## Prerequisites
 
@@ -159,7 +119,6 @@ julia --project demo/demo_JuMP.jl
 
 The script:
 - Builds a CQP model.
-- Saves the model as an MPS file.
 - Uses HPR-QP to solve the CQP instance.
 
 > **Remark:** If the model may be infeasible or unbounded, you can use HiGHS to check it.
@@ -238,19 +197,30 @@ Below is a list of the parameters in HPR-QP along with their default values and 
     </tr>
   </thead>
   <tbody>
-    <tr><td><code>warm_up</code></td><td><code>false</code></td><td>Determines if a warm-up phase is performed before main execution.</td></tr>
-    <tr><td><code>time_limit</code></td><td><code>3600</code></td><td>Maximum allowed runtime (seconds) for the algorithm.</td></tr>
     <tr><td><code>stoptol</code></td><td><code>1e-6</code></td><td>Stopping tolerance for convergence checks.</td></tr>
-    <tr><td><code>device_number</code></td><td><code>0</code></td><td>GPU device number (only relevant if <code>use_gpu</code> is true).</td></tr>
-    <tr><td><code>max_iter</code></td><td><code>typemax(Int32)</code></td><td>Maximum number of iterations allowed.</td></tr>
     <tr><td><code>sigma</code></td><td><code>-1 (auto)</code></td><td>Initial value of the σ parameter used in the algorithm.</td></tr>
+    <tr><td><code>max_iter</code></td><td><code>typemax(Int32)</code></td><td>Maximum number of iterations allowed.</td></tr>
     <tr><td><code>sigma_fixed</code></td><td><code>false</code></td><td>Whether σ is fixed throughout the optimization process.</td></tr>
-    <tr><td><code>check_iter</code></td><td><code>100</code></td><td>Number of iterations to check residuals.</td></tr>
-    <tr><td><code>use_Ruiz_scaling</code></td><td><code>true</code></td><td>Whether to apply Ruiz scaling.</td></tr>
-    <tr><td><code>use_Pock_Chambolle_scaling</code></td><td><code>true</code></td><td>Whether to use the Pock-Chambolle scaling.</td></tr>
-    <tr><td><code>use_l2_scaling</code></td><td><code>true</code></td><td>Whether to use the Pock-Chambolle scaling.</td></tr>
-    <tr><td><code>use_bc_scaling</code></td><td><code>true</code></td><td>Whether to use the scaling for b and c. (For QAP and LASSO, only this scaling is applicable)</td></tr>
-    <tr><td><code>print_frequency</code></td><td><code>-1 (auto)</code></td><td>Print the log every <code>print_frequency</code> iterations.</td></tr>
+    <tr><td><code>time_limit</code></td><td><code>3600.0</code></td><td>Maximum allowed runtime (seconds) for the algorithm.</td></tr>
+    <tr><td><code>eig_factor</code></td><td><code>1.05</code></td><td>Factor used to scale the maximum eigenvalue estimation.</td></tr>
+    <tr><td><code>check_iter</code></td><td><code>100</code></td><td>Frequency (in iterations) to check for convergence or perform other checks.</td></tr>
+    <tr><td><code>warm_up</code></td><td><code>false</code></td><td>Determines if a warm-up phase is performed before main execution.</td></tr>
+    <tr><td><code>spmv_mode_Q</code></td><td><code>"auto"</code></td><td>Mode for Q matrix-vector multiplication (e.g., "auto", "CUSPARSE", "customized", "operator").</td></tr>
+    <tr><td><code>spmv_mode_A</code></td><td><code>"auto"</code></td><td>Mode for A matrix-vector multiplication (e.g., "auto", "CUSPARSE", "customized").</td></tr>
+    <tr><td><code>print_frequency</code></td><td><code>-1 (auto)</code></td><td>Frequency (in iterations) for printing progress or logging information.</td></tr>
+    <tr><td><code>device_number</code></td><td><code>0</code></td><td>GPU device number (e.g., 0, 1, 2, 3).</td></tr>
+    <tr><td><code>use_Ruiz_scaling</code></td><td><code>true</code></td><td>Whether to apply Ruiz scaling to the problem data.</td></tr>
+    <tr><td><code>use_bc_scaling</code></td><td><code>false</code></td><td>Whether to apply bc scaling. (For QAP and LASSO, only this scaling is applicable)</td></tr>
+    <tr><td><code>use_l2_scaling</code></td><td><code>false</code></td><td>Whether to apply L2-norm based scaling.</td></tr>
+    <tr><td><code>use_Pock_Chambolle_scaling</code></td><td><code>true</code></td><td>Whether to apply Pock-Chambolle scaling to the problem data.</td></tr>
+    <tr><td><code>problem_type</code></td><td><code>"QP"</code></td><td>Type of problem being solved (e.g., "QP", "LASSO", "QAP").</td></tr>
+    <tr><td><code>lambda</code></td><td><code>0.0</code></td><td>Regularization parameter for LASSO problems.</td></tr>
+    <tr><td><code>initial_x</code></td><td><code>nothing</code></td><td>Initial primal solution for warm-start.</td></tr>
+    <tr><td><code>initial_y</code></td><td><code>nothing</code></td><td>Initial dual solution for warm-start.</td></tr>
+    <tr><td><code>auto_save</code></td><td><code>false</code></td><td>Automatically save best x, y, z, w, and sigma during optimization.</td></tr>
+    <tr><td><code>save_filename</code></td><td><code>"hprqp_autosave.h5"</code></td><td>Filename for auto-save HDF5 file.</td></tr>
+    <tr><td><code>verbose</code></td><td><code>true</code></td><td>Enable verbose output during optimization.</td></tr>
+    <tr><td><code>use_gpu</code></td><td><code>true</code></td><td>Whether to use GPU acceleration (requires CUDA).</td></tr>
   </tbody>
 </table>
 
@@ -293,39 +263,6 @@ println("x2 = ", result.x[2])
     <tr><td></td><td><code>w</code></td><td>The final solution vector <code>w</code>.</td></tr>
   </tbody>
 </table>
-
----
-
-## Documentation
-
-Comprehensive documentation is available in the `docs/` directory:
-
-📚 **[View Full Documentation](docs/README.md)**
-
-### Quick Links
-
-- **[Getting Started](docs/src/getting_started.md)** - Installation and first examples
-- **[User Guide](docs/src/guide/input_overview.md)** - Detailed usage guides
-  - [Direct API](docs/src/guide/direct_api.md) - Matrix-based input
-  - [JuMP Integration](docs/src/guide/jump_integration.md) - Modeling interface
-  - [MPS Files](docs/src/guide/mps_files.md) - File-based input
-  - [Q Operators](docs/src/guide/q_operators_overview.md) - QAP, LASSO, and custom operators
-  - [Parameters](docs/src/guide/parameters.md) - Solver configuration
-  - [Output & Results](docs/src/guide/output_results.md) - Interpreting results
-- **[API Reference](docs/src/api.md)** - Complete API documentation
-- **[Examples](docs/src/examples.md)** - Collection of examples
-
-### Building Documentation Locally
-
-To build the HTML documentation:
-
-```bash
-cd docs
-julia --project -e 'using Pkg; Pkg.instantiate()'
-julia --project make.jl
-```
-
-The generated documentation will be in `docs/build/`.
 
 ---
 

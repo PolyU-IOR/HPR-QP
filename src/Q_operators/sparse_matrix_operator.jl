@@ -26,17 +26,19 @@ get_problem_size(Q::SparseMatrixCSC{Float64,Int32}) = size(Q, 1)
 # With optional preprocessed CUSPARSE structure
 @inline function Qmap!(x::CuVector{Float64}, Qx::CuVector{Float64}, Q::CuSparseMatrixCSR{Float64,Int32}, 
                       spmv_Q::Union{Nothing, CUSPARSE_spmv_Q}=nothing)
-    if spmv_Q !== nothing
-        # Use preprocessed CUSPARSE SpMV
-        desc_x = CUDA.CUSPARSE.CuDenseVectorDescriptor(x)
-        desc_Qx = CUDA.CUSPARSE.CuDenseVectorDescriptor(Qx)
-        CUDA.CUSPARSE.cusparseSpMV(spmv_Q.handle, spmv_Q.operator, spmv_Q.alpha,
-            spmv_Q.desc_Q, desc_x, spmv_Q.beta, desc_Qx,
-            spmv_Q.compute_type, spmv_Q.alg, spmv_Q.buf)
-    else
-        # Fallback to standard CUSPARSE
-        CUDA.CUSPARSE.mv!('N', 1, Q, x, 0, Qx, 'O', CUDA.CUSPARSE.CUSPARSE_SPMV_CSR_ALG2)
-    end
+    # Standard CUSPARSE operation
+    CUDA.CUSPARSE.mv!('N', 1, Q, x, 0, Qx, 'O', CUDA.CUSPARSE.CUSPARSE_SPMV_CSR_ALG2)
+end
+
+# Q operator mapping with pre-created descriptors (zero allocation)
+@inline function Qmap!(desc_x::CUDA.CUSPARSE.CuDenseVectorDescriptor, 
+                      desc_Qx::CUDA.CUSPARSE.CuDenseVectorDescriptor,
+                      Q::CuSparseMatrixCSR{Float64,Int32}, 
+                      spmv_Q::CUSPARSE_spmv_Q)
+    # Use preprocessed CUSPARSE with pre-created descriptors - zero allocation!
+    CUDA.CUSPARSE.cusparseSpMV(spmv_Q.handle, spmv_Q.operator, spmv_Q.alpha,
+        spmv_Q.desc_Q, desc_x, spmv_Q.beta, desc_Qx,
+        spmv_Q.compute_type, spmv_Q.alg, spmv_Q.buf)
 end
 
 # Q operator mapping for sparse matrix Q (CPU)
@@ -54,26 +56,30 @@ end
 supports_cusparse_preprocessing(Q::CuSparseMatrixCSR{Float64,Int32}) = Q.nnz > 0
 
 """
-    prepare_spmv_Q!(Q, w, w_bar, w_hat, Qw)
+    prepare_spmv_Q!(Q, w, w_bar, Qw, Qw_bar)
 
 Prepare CUSPARSE SpMV operations for Q matrix (when Q is a sparse matrix, not an operator).
 Allocates buffers and performs preprocessing (for CUDA >= 12.4).
 
 # Arguments
 - `Q::CuSparseMatrixCSR`: The Q matrix in CSR format
-- `w, w_bar, w_hat::CuVector{Float64}`: Dense vectors for Q operations
-- `Qw::CuVector{Float64}`: Output vector for Q*w
+- `w, w_bar::CuVector{Float64}`: Dense vectors for Q operations
+- `Qw, Qw_bar::CuVector{Float64}`: Output vectors for Q*w and Q*w_bar
 
 # Returns
 - `spmv_Q::CUSPARSE_spmv_Q`: CUSPARSE structure for Q matrix operations
 """
 function prepare_spmv_Q!(Q::CuSparseMatrixCSR{Float64,Int32}, 
                         w::CuVector{Float64},
-                        Qw::CuVector{Float64})
+                        w_bar::CuVector{Float64},
+                        Qw::CuVector{Float64},
+                        Qw_bar::CuVector{Float64})
     # Create matrix and vector descriptors
     desc_Q = CUDA.CUSPARSE.CuSparseMatrixDescriptor(Q, 'O')
     desc_w = CUDA.CUSPARSE.CuDenseVectorDescriptor(w)
+    desc_w_bar = CUDA.CUSPARSE.CuDenseVectorDescriptor(w_bar)
     desc_Qw = CUDA.CUSPARSE.CuDenseVectorDescriptor(Qw)
+    desc_Qw_bar = CUDA.CUSPARSE.CuDenseVectorDescriptor(Qw_bar)
     
     CUSPARSE_handle = CUDA.CUSPARSE.handle()
     ref_one = Ref{Float64}(one(Float64))
@@ -91,8 +97,8 @@ function prepare_spmv_Q!(Q::CuSparseMatrixCSR{Float64,Int32},
             Float64, CUDA.CUSPARSE.CUSPARSE_SPMV_CSR_ALG2, buf_Q)
     end
     
-    spmv_Q = CUSPARSE_spmv_Q(CUSPARSE_handle, 'N', ref_one, desc_Q, desc_w,
-        ref_zero, desc_Qw, Float64, CUDA.CUSPARSE.CUSPARSE_SPMV_CSR_ALG2, buf_Q)
+    spmv_Q = CUSPARSE_spmv_Q(CUSPARSE_handle, 'N', ref_one, desc_Q, desc_w, desc_w_bar,
+        ref_zero, desc_Qw, desc_Qw_bar, Float64, CUDA.CUSPARSE.CUSPARSE_SPMV_CSR_ALG2, buf_Q)
     
     return spmv_Q
 end

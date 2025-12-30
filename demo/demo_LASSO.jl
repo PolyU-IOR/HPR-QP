@@ -53,6 +53,18 @@ model = HPRQP.build_from_Ab_lambda(A, b, lambda)
 params = HPRQP.HPRQP_parameters()
 params.stoptol = 1e-8
 params.warm_up = true
+params.use_gpu = false
 
 println("\nSolving LASSO problem...")
-result = HPRQP.optimize(model, params)
+result_cpu = HPRQP.optimize(model, params)
+
+params.use_gpu = true
+result_gpu = HPRQP.optimize(model, params)
+
+println("\nResults:")
+println("  Objective value (CPU): ", result_cpu.primal_obj)
+println("  Objective value (GPU): ", result_gpu.primal_obj)
+println("  Residuals (CPU):      ",  result_cpu.residuals)
+println("  Residuals (GPU):      ",  result_gpu.residuals)
+println("  Iterations (CPU):      ", result_cpu.iter)
+println("  Iterations (GPU):      ", result_gpu.iter)

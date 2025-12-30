@@ -11,6 +11,94 @@
 ##   end
 
 # ============================================================================
+# Matrix-Vector Multiplication Wrappers for A and AT
+# ============================================================================
+# Similar to Qmap!, these wrappers provide a clean interface for A*x and AT*y
+# operations, automatically selecting between preprocessed CUSPARSE or standard
+# CUSPARSE based on available workspace structures.
+# ============================================================================
+
+"""
+    Amap!(x, Ax, A, spmv_A)
+
+Compute Ax = A * x using GPU sparse matrix-vector multiplication.
+Automatically selects between preprocessed CUSPARSE (if spmv_A available) or standard CUSPARSE.
+
+# Arguments
+- `x`: Input vector (CuVector)
+- `Ax`: Output vector (CuVector), will contain A*x
+- `A`: Sparse matrix in CSR format (CuSparseMatrixCSR)
+- `spmv_A`: Optional preprocessed CUSPARSE structure (can be nothing)
+"""
+@inline function Amap!(x::CuVector{Float64}, Ax::CuVector{Float64}, 
+                       A::CuSparseMatrixCSR{Float64,Int32}, 
+                       spmv_A::Union{CUSPARSE_spmv_A,Nothing})
+    # Standard CUSPARSE operation (preprocessing doesn't help without pre-created descriptors)
+    CUDA.CUSPARSE.mv!('N', 1, A, x, 0, Ax, 'O', CUDA.CUSPARSE.CUSPARSE_SPMV_CSR_ALG2)
+end
+
+"""
+    Amap!(desc_x, desc_Ax, A, spmv_A)
+
+Compute Ax = A * x using preprocessed CUSPARSE with pre-created descriptors (zero allocation).
+
+# Arguments
+- `desc_x`: Pre-created CuDenseVectorDescriptor for input vector
+- `desc_Ax`: Pre-created CuDenseVectorDescriptor for output vector
+- `A`: Sparse matrix in CSR format (CuSparseMatrixCSR)
+- `spmv_A`: Preprocessed CUSPARSE structure (must not be nothing)
+"""
+@inline function Amap!(desc_x::CUDA.CUSPARSE.CuDenseVectorDescriptor, 
+                       desc_Ax::CUDA.CUSPARSE.CuDenseVectorDescriptor,
+                       A::CuSparseMatrixCSR{Float64,Int32}, 
+                       spmv_A::CUSPARSE_spmv_A)
+    # Use preprocessed CUSPARSE with pre-created descriptors - zero allocation!
+    CUDA.CUSPARSE.cusparseSpMV(spmv_A.handle, spmv_A.operator, spmv_A.alpha,
+        spmv_A.desc_A, desc_x, spmv_A.beta, desc_Ax,
+        spmv_A.compute_type, spmv_A.alg, spmv_A.buf)
+end
+
+"""
+    ATmap!(y, ATy, AT, spmv_AT)
+
+Compute ATy = AT * y using GPU sparse matrix-vector multiplication.
+Automatically selects between preprocessed CUSPARSE (if spmv_AT available) or standard CUSPARSE.
+
+# Arguments
+- `y`: Input vector (CuVector)
+- `ATy`: Output vector (CuVector), will contain AT*y
+- `AT`: Sparse matrix in CSR format (CuSparseMatrixCSR)
+- `spmv_AT`: Optional preprocessed CUSPARSE structure (can be nothing)
+"""
+@inline function ATmap!(y::CuVector{Float64}, ATy::CuVector{Float64}, 
+                        AT::CuSparseMatrixCSR{Float64,Int32}, 
+                        spmv_AT::Union{CUSPARSE_spmv_AT,Nothing})
+    # Standard CUSPARSE operation
+    CUDA.CUSPARSE.mv!('N', 1, AT, y, 0, ATy, 'O', CUDA.CUSPARSE.CUSPARSE_SPMV_CSR_ALG2)
+end
+
+"""
+    ATmap!(desc_y, desc_ATy, AT, spmv_AT)
+
+Compute ATy = AT * y using preprocessed CUSPARSE with pre-created descriptors (zero allocation).
+
+# Arguments
+- `desc_y`: Pre-created CuDenseVectorDescriptor for input vector
+- `desc_ATy`: Pre-created CuDenseVectorDescriptor for output vector
+- `AT`: Sparse matrix in CSR format (CuSparseMatrixCSR)
+- `spmv_AT`: Preprocessed CUSPARSE structure (must not be nothing)
+"""
+@inline function ATmap!(desc_y::CUDA.CUSPARSE.CuDenseVectorDescriptor, 
+                        desc_ATy::CUDA.CUSPARSE.CuDenseVectorDescriptor,
+                        AT::CuSparseMatrixCSR{Float64,Int32}, 
+                        spmv_AT::CUSPARSE_spmv_AT)
+    # Use preprocessed CUSPARSE with pre-created descriptors - zero allocation!
+    CUDA.CUSPARSE.cusparseSpMV(spmv_AT.handle, spmv_AT.operator, spmv_AT.alpha,
+        spmv_AT.desc_AT, desc_y, spmv_AT.beta, desc_ATy,
+        spmv_AT.compute_type, spmv_AT.alg, spmv_AT.buf)
+end
+
+# ============================================================================
 # Unified Kernel Wrapper Functions (CPU and GPU)
 # ============================================================================
 # These functions dispatch based on workspace type, following the Q operator pattern.
@@ -928,16 +1016,7 @@ function unified_update_zxw_gpu!(ws::HPRQP_workspace_gpu, qp::QP_info_gpu,
     use_custom_spmv_A = (ws.spmv_mode_A == "customized")
     # Only compute AT*y_bar via cuSPARSE if not using custom SpMV for A
     if !use_custom_spmv_A
-        # Use preprocessed CUSPARSE if available
-        if ws.spmv_AT !== nothing
-            desc_y = CUDA.CUSPARSE.CuDenseVectorDescriptor(ws.y)
-            desc_ATy = CUDA.CUSPARSE.CuDenseVectorDescriptor(ws.ATy)
-            CUDA.CUSPARSE.cusparseSpMV(ws.spmv_AT.handle, ws.spmv_AT.operator, ws.spmv_AT.alpha,
-                ws.spmv_AT.desc_AT, desc_y, ws.spmv_AT.beta, desc_ATy,
-                ws.spmv_AT.compute_type, ws.spmv_AT.alg, ws.spmv_AT.buf)
-        else
-            CUDA.CUSPARSE.mv!('N', 1, ws.AT, ws.y, 0, ws.ATy, 'O', CUDA.CUSPARSE.CUSPARSE_SPMV_CSR_ALG2)
-        end
+        ATmap!(ws.y, ws.ATy, ws.AT, ws.spmv_AT)
     end
 
     # Use Qmap! for Q*w (works for both sparse matrices and operators)
@@ -1021,7 +1100,10 @@ function unified_update_zxw1_gpu!(ws::HPRQP_workspace_gpu, qp::QP_info_gpu,
     # Use Qmap! for Q*w (works for both sparse matrices and operators)
     if !use_custom_spmv_Q
         # Pass ws.spmv_Q for sparse matrix Q, operators handle their own preprocessing
-        if isa(qp.Q, CuSparseMatrixCSR{Float64,Int32})
+        if isa(qp.Q, CuSparseMatrixCSR{Float64,Int32}) && ws.spmv_Q !== nothing
+            # Use descriptor version for zero allocation
+            Qmap!(ws.spmv_Q.desc_w, ws.spmv_Q.desc_Qw, qp.Q, ws.spmv_Q)
+        elseif isa(qp.Q, CuSparseMatrixCSR{Float64,Int32})
             Qmap!(ws.w, ws.Qw, qp.Q, ws.spmv_Q)
         else
             Qmap!(ws.w, ws.Qw, qp.Q)
@@ -1053,7 +1135,10 @@ function unified_update_zxw1_gpu!(ws::HPRQP_workspace_gpu, qp::QP_info_gpu,
     # Use Qmap! for Q*w_bar (works for both sparse matrices and operators)
     if !use_custom_spmv_Q
         # Pass ws.spmv_Q for sparse matrix Q, operators handle their own preprocessing
-        if isa(qp.Q, CuSparseMatrixCSR{Float64,Int32})
+        if isa(qp.Q, CuSparseMatrixCSR{Float64,Int32}) && ws.spmv_Q !== nothing
+            # Use descriptor version for zero allocation
+            Qmap!(ws.spmv_Q.desc_w_bar, ws.spmv_Q.desc_Qw_bar, qp.Q, ws.spmv_Q)
+        elseif isa(qp.Q, CuSparseMatrixCSR{Float64,Int32})
             Qmap!(ws.w_bar, ws.Qw_bar, qp.Q, ws.spmv_Q)
         else
             Qmap!(ws.w_bar, ws.Qw_bar, qp.Q)
@@ -1080,15 +1165,11 @@ function unified_update_y_gpu!(ws::HPRQP_workspace_gpu, Halpern_fact1::Float64,
 
     # Only compute A*tempv via cuSPARSE if not using custom SpMV for A
     if !use_custom_spmv_A
-        # Use preprocessed CUSPARSE if available
         if ws.spmv_A !== nothing
-            desc_tempv = CUDA.CUSPARSE.CuDenseVectorDescriptor(ws.tempv)
-            desc_Ax = CUDA.CUSPARSE.CuDenseVectorDescriptor(ws.Ax)
-            CUDA.CUSPARSE.cusparseSpMV(ws.spmv_A.handle, ws.spmv_A.operator, ws.spmv_A.alpha,
-                ws.spmv_A.desc_A, desc_tempv, ws.spmv_A.beta, desc_Ax,
-                ws.spmv_A.compute_type, ws.spmv_A.alg, ws.spmv_A.buf)
+            # Use descriptor version for zero allocation
+            Amap!(ws.spmv_A.desc_tempv, ws.spmv_A.desc_Ax, ws.A, ws.spmv_A)
         else
-            CUDA.CUSPARSE.mv!('N', 1, ws.A, ws.tempv, 0, ws.Ax, 'O', CUDA.CUSPARSE.CUSPARSE_SPMV_CSR_ALG2)
+            Amap!(ws.tempv, ws.Ax, ws.A, ws.spmv_A)
         end
     end
 
@@ -1128,15 +1209,11 @@ function unified_update_w2_gpu!(ws::HPRQP_workspace_gpu, Halpern_fact1::Float64,
 
     # Only compute AT*y_bar via cuSPARSE if not using custom SpMV for A
     if !use_custom_spmv_A
-        # Use preprocessed CUSPARSE if available
         if ws.spmv_AT !== nothing
-            desc_y_bar = CUDA.CUSPARSE.CuDenseVectorDescriptor(ws.y_bar)
-            desc_ATy_bar = CUDA.CUSPARSE.CuDenseVectorDescriptor(ws.ATy_bar)
-            CUDA.CUSPARSE.cusparseSpMV(ws.spmv_AT.handle, ws.spmv_AT.operator, ws.spmv_AT.alpha,
-                ws.spmv_AT.desc_AT, desc_y_bar, ws.spmv_AT.beta, desc_ATy_bar,
-                ws.spmv_AT.compute_type, ws.spmv_AT.alg, ws.spmv_AT.buf)
+            # Use descriptor version for zero allocation
+            ATmap!(ws.spmv_AT.desc_y_bar, ws.spmv_AT.desc_ATy_bar, ws.AT, ws.spmv_AT)
         else
-            CUDA.CUSPARSE.mv!('N', 1, ws.AT, ws.y_bar, 0, ws.ATy_bar, 'O', CUDA.CUSPARSE.CUSPARSE_SPMV_CSR_ALG2)
+            ATmap!(ws.y_bar, ws.ATy_bar, ws.AT, ws.spmv_AT)
         end
     end
 
@@ -1279,15 +1356,11 @@ function unified_update_zx_gpu!(ws::HPRQP_workspace_gpu, Halpern_fact1::Float64,
 
     # Only compute AT*y via cuSPARSE if not using custom SpMV for A
     if !use_custom_spmv_A
-        # Use preprocessed CUSPARSE if available
         if ws.spmv_AT !== nothing
-            desc_y = CUDA.CUSPARSE.CuDenseVectorDescriptor(ws.y)
-            desc_ATy = CUDA.CUSPARSE.CuDenseVectorDescriptor(ws.ATy)
-            CUDA.CUSPARSE.cusparseSpMV(ws.spmv_AT.handle, ws.spmv_AT.operator, ws.spmv_AT.alpha,
-                ws.spmv_AT.desc_AT, desc_y, ws.spmv_AT.beta, desc_ATy,
-                ws.spmv_AT.compute_type, ws.spmv_AT.alg, ws.spmv_AT.buf)
+            # Use descriptor version for zero allocation
+            ATmap!(ws.spmv_AT.desc_y, ws.spmv_AT.desc_ATy, ws.AT, ws.spmv_AT)
         else
-            CUDA.CUSPARSE.mv!('N', 1, ws.AT, ws.y, 0, ws.ATy, 'O', CUDA.CUSPARSE.CUSPARSE_SPMV_CSR_ALG2)
+            ATmap!(ws.y, ws.ATy, ws.AT, ws.spmv_AT)
         end
     end
 
@@ -1322,15 +1395,11 @@ function unified_update_y_noQ_gpu!(ws::HPRQP_workspace_gpu, Halpern_fact1::Float
 
     # Only compute A*x_hat via cuSPARSE if not using custom SpMV for A
     if !use_custom_spmv_A
-        # Use preprocessed CUSPARSE if available
         if ws.spmv_A !== nothing
-            desc_x_hat = CUDA.CUSPARSE.CuDenseVectorDescriptor(ws.x_hat)
-            desc_Ax = CUDA.CUSPARSE.CuDenseVectorDescriptor(ws.Ax)
-            CUDA.CUSPARSE.cusparseSpMV(ws.spmv_A.handle, ws.spmv_A.operator, ws.spmv_A.alpha,
-                ws.spmv_A.desc_A, desc_x_hat, ws.spmv_A.beta, desc_Ax,
-                ws.spmv_A.compute_type, ws.spmv_A.alg, ws.spmv_A.buf)
+            # Use descriptor version for zero allocation
+            Amap!(ws.spmv_A.desc_x_hat, ws.spmv_A.desc_Ax, ws.A, ws.spmv_A)
         else
-            CUDA.CUSPARSE.mv!('N', 1, ws.A, ws.x_hat, 0, ws.Ax, 'O', CUDA.CUSPARSE.CUSPARSE_SPMV_CSR_ALG2)
+            Amap!(ws.x_hat, ws.Ax, ws.A, ws.spmv_A)
         end
     end
 

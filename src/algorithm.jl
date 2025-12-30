@@ -881,9 +881,6 @@ function allocate_workspace(
         ws.saved_state.save_rel_gap = Inf
     end
 
-    # Note: initial_x and initial_y processing will be done in solve function
-    # after eigenvalue estimation and prepare_workspace_spmv
-
     return ws
 end
 
@@ -1549,10 +1546,6 @@ function optimize(model::QP_info_cpu, params::HPRQP_parameters)
     # Run the main algorithm (scaling and GPU transfer happen inside solve)
     results = solve(model, params)
 
-    if params.verbose
-        println("="^80)
-    end
-
     return results
 end
 
@@ -1770,6 +1763,74 @@ function should_print(iter::Int, params::HPRQP_parameters, t_start_alg::Float64)
     end
 end
 
+"""
+    process_initial_points!(ws, qp, params, scaling_info, m)
+
+Process initial primal and dual points if provided in parameters.
+Scales and assigns initial values to workspace variables.
+
+# Arguments
+- `ws`: Workspace containing solver state
+- `qp`: QP problem information
+- `params`: Solver parameters (containing initial_x and initial_y)
+- `scaling_info`: Scaling information for the problem
+- `m`: Number of constraints
+"""
+function process_initial_points!(
+    ws::HPRQP_workspace,
+    qp::HPRQP_QP_info,
+    params::HPRQP_parameters,
+    scaling_info::HPRQP_scaling,
+    m::Int
+)
+    # Process initial_x if provided
+    if params.initial_x !== nothing
+        # Convert to device array and scale
+        WS = workspace_type(qp)
+        initial_x_device = convert_to_device(WS, params.initial_x)
+        scaled_x = initial_x_device .* scaling_info.col_norm ./ scaling_info.b_scale
+
+        ws.x .= scaled_x
+        ws.x_bar .= scaled_x
+        ws.last_x .= scaled_x
+        ws.w .= scaled_x
+        ws.w_bar .= scaled_x
+        ws.last_w .= scaled_x
+    end
+
+    # Process initial_y if provided (depends on lambda_max_A)
+    if params.initial_y !== nothing
+        # Warning: may have bug that quit with wrong result when we have initial points (<z,x> not equals to support function)
+        # Convert to device array and scale
+        WS = workspace_type(qp)
+        ws.y .= convert_to_device(WS, params.initial_y)
+        ws.y .= ws.y .* scaling_info.row_norm ./ scaling_info.c_scale
+        ws.y_bar .= ws.y
+        ws.last_y .= ws.y
+
+        # Compute ATy_bar from y_bar
+        if m > 0
+            unified_mul!(ws.ATy_bar, ws.AT, ws.y_bar)
+            ws.ATy .= ws.ATy_bar
+            ws.last_ATy .= ws.ATy_bar
+        end
+
+        # Compute z_bar from projection: z_bar = (x_bar - z_raw) / sigma
+        # where z_raw = x_bar + sigma * (-Qx + ATy - c)
+        Qmap!(ws.x_bar, ws.Qx, qp.Q)
+        tmp = .-ws.Qx .+ ws.ATy_bar .- ws.c
+        z_raw = ws.x_bar .+ ws.sigma .* tmp
+        ws.z_bar .= (ws.x_bar .- z_raw) ./ ws.sigma
+
+        # Compute s for dual objective: s = proj_{[AL,AU]}(Ax - lambda_max_A * sigma * y)
+        if m > 0
+            unified_mul!(ws.Ax, ws.A, ws.x_bar)
+            fact1 = ws.lambda_max_A * ws.sigma
+            ws.s .= min.(max.(ws.Ax .- fact1 .* ws.y, ws.AL), ws.AU)
+        end
+    end
+end
+
 # CPU version of print_iteration_log
 function print_iteration_log(iter::Int, residuals::HPRQP_residuals,
     ws::HPRQP_workspace, t_start_alg::Float64)
@@ -1857,72 +1918,24 @@ function solve(model::QP_info_cpu, params::HPRQP_parameters)
     # Get problem dimensions
     m, n = size(qp.A)
 
-    # Initialize workspace and solver state (with dummy lambda values initially)
+    # Initialize workspace and solver state
     residuals = HPRQP_residuals()
     restart_info = initialize_restart()
 
-    # Step 1: Allocate workspace (with dummy lambda_max values = 0.0)
-    # The correct lambda_max values will be set after eigenvalue estimation
+    # Allocate workspace
     ws = allocate_workspace(qp, params, 0.0, 0.0, scaling_info, diag_Q, Q_is_diag)
 
-    # Step 2: Prepare CUSPARSE SpMV structures (GPU-only, no-op for CPU)
-    # This is done BEFORE eigenvalue estimation so power_iteration can use preprocessed structures
+    # Prepare CUSPARSE SpMV structures (GPU-only, no-op for CPU)
     prepare_workspace_spmv!(ws, qp, params.verbose)
-
-    # Step 3: Estimate eigenvalues using power_iteration
-    # Now utilizes preprocessed SpMV structures for better performance
 
     setup_time = time() - setup_start
     t_start_alg = time()
 
+    # Estimate eigenvalues using power_iteration
     ws.lambda_max_A, ws.lambda_max_Q, power_time = estimate_eigenvalues(qp, params, ws)
 
-    # Step 4: Process initial_x if provided
-    if params.initial_x !== nothing
-        # Convert to device array and scale
-        WS = workspace_type(qp)
-        initial_x_device = convert_to_device(WS, params.initial_x)
-        scaled_x = initial_x_device .* scaling_info.col_norm ./ scaling_info.b_scale
-
-        ws.x .= scaled_x
-        ws.x_bar .= scaled_x
-        ws.last_x .= scaled_x
-        ws.w .= scaled_x
-        ws.w_bar .= scaled_x
-        ws.last_w .= scaled_x
-    end
-
-    # Step 5: Process initial_y if provided (depends on lambda_max_A)
-    if params.initial_y !== nothing
-        # TODO: may have bug that quit with wrong result when we have initial points (<z,x> not equals to support function)
-        # Convert to device array and scale
-        WS = workspace_type(qp)
-        ws.y .= convert_to_device(WS, params.initial_y)
-        ws.y .= ws.y .* scaling_info.row_norm ./ scaling_info.c_scale
-        ws.y_bar .= ws.y
-        ws.last_y .= ws.y
-
-        # Compute ATy_bar from y_bar
-        if m > 0
-            unified_mul!(ws.ATy_bar, ws.AT, ws.y_bar)
-            ws.ATy .= ws.ATy_bar
-            ws.last_ATy .= ws.ATy_bar
-        end
-
-        # Compute z_bar from projection: z_bar = (x_bar - z_raw) / sigma
-        # where z_raw = x_bar + sigma * (-Qx + ATy - c)
-        Qmap!(ws.x_bar, ws.Qx, qp.Q)
-        tmp = .-ws.Qx .+ ws.ATy_bar .- ws.c
-        z_raw = ws.x_bar .+ ws.sigma .* tmp
-        ws.z_bar .= (ws.x_bar .- z_raw) ./ ws.sigma
-
-        # Compute s for dual objective: s = proj_{[AL,AU]}(Ax - lambda_max_A * sigma * y)
-        if m > 0
-            unified_mul!(ws.Ax, ws.A, ws.x_bar)
-            fact1 = ws.lambda_max_A * ws.sigma
-            ws.s .= min.(max.(ws.Ax .- fact1 .* ws.y, ws.AL), ws.AU)
-        end
-    end
+    # Process initial points if provided
+    process_initial_points!(ws, qp, params, scaling_info, m)
 
     ws.spmv_mode_Q, ws.spmv_mode_A = determine_spmv_mode(qp, params, ws)
 
@@ -1949,16 +1962,14 @@ function solve(model::QP_info_cpu, params::HPRQP_parameters)
 
     check_iter = params.check_iter
 
-    # Main iteration loop
-    # Note: compute_residuals!, update_sigma! are now unified and dispatch based on workspace type
     number_empty_lu = sum((model.l .== -Inf) .& (model.u .== Inf))
-    # noC = true
     if (number_empty_lu > 0.8 * length(model.l))
         ws.noC = true
     else
         ws.noC = false
     end
 
+    # Main iteration loop
     for iter = 0:params.max_iter
         # Determine if we should print at this iteration
         print_yes = should_print(iter, params, t_start_alg, params.max_iter)
@@ -2019,7 +2030,6 @@ function solve(model::QP_info_cpu, params::HPRQP_parameters)
         end
 
         # Perform main iteration step
-        # Note: main_update_gpu!/main_update_cpu! must stay separate due to device-specific kernels
         perform_iteration_step!(ws, qp, params, restart_info, iter, check_iter)
     end
 end

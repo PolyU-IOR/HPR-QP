@@ -622,8 +622,8 @@ function prepare_workspace_spmv!(ws::HPRQP_workspace_gpu, qp::QP_info_gpu, verbo
 
     # Prepare CUSPARSE SpMV structures for A and AT (if m > 0)
     if m > 0
-        ws.spmv_A, ws.spmv_AT = prepare_spmv_A!(qp.A, qp.AT, ws.x_bar, ws.x_hat, ws.dx, ws.Ax,
-            ws.y_bar, ws.y, ws.ATy)
+        ws.spmv_A, ws.spmv_AT = prepare_spmv_A!(qp.A, qp.AT, ws.x_bar, ws.x_hat, ws.dx, ws.tempv, ws.Ax,
+            ws.y_bar, ws.y, ws.ATy_bar, ws.ATy)
         if verbose
             println("Preprocess CUSPARSE SpMV structures for A and AT.")
         end
@@ -638,7 +638,7 @@ function prepare_workspace_spmv!(ws::HPRQP_workspace_gpu, qp::QP_info_gpu, verbo
     if supports_cusparse_preprocessing(qp.Q)
         # Operator supports preprocessing - call its prepare function
         # This stores CUSPARSE structures inside the operator itself
-        ws.spmv_Q = prepare_spmv_Q!(qp.Q, ws.w, ws.Qw)
+        ws.spmv_Q = prepare_spmv_Q!(qp.Q, ws.w, ws.w_bar, ws.Qw, ws.Qw_bar)
         if verbose
             println("Preprocess CUSPARSE SpMV structure for Q.")
         end

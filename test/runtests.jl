@@ -608,6 +608,185 @@ using HDF5
         end
     end
     
+    @testset "CPU Mode Tests with Data Files" begin
+        @testset "CPU - MPS file (AUG2D.mps)" begin
+            mps_file = joinpath(@__DIR__, "..", "data", "AUG2D.mps")
+            
+            if isfile(mps_file)
+                # Build model from MPS file
+                model = build_from_mps(mps_file; verbose=false)
+                
+                # Configure parameters for CPU
+                params = HPRQP_parameters()
+                params.use_gpu = false
+                params.max_iter = 100000
+                params.stoptol = 1e-6
+                params.time_limit = 1200.0
+                params.warm_up = false
+                params.verbose = false
+                params.print_frequency = -1
+                
+                result = optimize(model, params)
+                
+                @test result !== nothing
+                @test result.status in ["OPTIMAL", "MAX_ITER"]
+                if result.status == "OPTIMAL"
+                    @test result.residuals < 1e-6
+                end
+                
+                println("CPU - AUG2D.mps: Status=$(result.status), Objective=$(result.primal_obj)")
+            else
+                @warn "AUG2D.mps file not found, skipping CPU MPS test"
+            end
+        end
+        
+        @testset "CPU - LASSO (E2006.test.mat)" begin
+            lasso_file = joinpath(@__DIR__, "..", "data", "E2006.test.mat")
+            
+            if isfile(lasso_file)
+                # Build LASSO model from .mat file
+                model = build_from_mat(lasso_file; problem_type="LASSO", verbose=false)
+                
+                # Configure parameters for CPU
+                params = HPRQP_parameters()
+                params.use_gpu = false
+                params.max_iter = 100000
+                params.stoptol = 1e-6
+                params.time_limit = 1800.0
+                params.warm_up = false
+                params.verbose = false
+                params.print_frequency = -1
+                params.problem_type = "LASSO"
+                
+                result = optimize(model, params)
+                
+                @test result !== nothing
+                @test result.status == "OPTIMAL"
+                @test result.residuals < 1e-6
+                
+                println("CPU - LASSO (E2006.test.mat): Status=$(result.status), Objective=$(result.primal_obj)")
+            else
+                @warn "E2006.test.mat file not found, skipping CPU LASSO test"
+            end
+        end
+        
+        @testset "CPU - QAP (esc64a.mat)" begin
+            qap_file = joinpath(@__DIR__, "..", "data", "esc64a.mat")
+            
+            if isfile(qap_file)
+                # Build QAP model from .mat file
+                model = build_from_mat(qap_file; problem_type="QAP", verbose=false)
+                
+                # Configure parameters for CPU
+                params = HPRQP_parameters()
+                params.use_gpu = false
+                params.max_iter = 80000
+                params.stoptol = 1e-6
+                params.time_limit = 1200.0
+                params.warm_up = false
+                params.verbose = false
+                params.print_frequency = -1
+                params.problem_type = "QAP"
+                
+                result = optimize(model, params)
+                
+                @test result !== nothing
+                @test result.status == "OPTIMAL"
+                @test result.residuals < 1e-6
+                
+                println("CPU - QAP (esc64a.mat): Status=$(result.status), Objective=$(result.primal_obj)")
+            else
+                @warn "esc64a.mat file not found, skipping CPU QAP test"
+            end
+        end
+    end
+    
+    @testset "SpMV Mode Tests (GPU)" begin
+        # Test different combinations of spmv_mode_Q and spmv_mode_A for AUG2D.mps and AUG3DCQP.mps
+        
+        @testset "AUG2D.mps - SpMV mode combinations" begin
+            mps_file = joinpath(@__DIR__, "..", "data", "AUG2D.mps")
+            
+            if isfile(mps_file)
+                # Test all 4 combinations: CUSPARSE/CUSPARSE, CUSPARSE/customized, customized/CUSPARSE, customized/customized
+                test_combinations = [
+                    ("CUSPARSE", "CUSPARSE", "CUSPARSE Q + CUSPARSE A"),
+                    ("CUSPARSE", "customized", "CUSPARSE Q + customized A"),
+                    ("customized", "CUSPARSE", "customized Q + CUSPARSE A"),
+                    ("customized", "customized", "customized Q + customized A")
+                ]
+                
+                for (spmv_Q, spmv_A, desc) in test_combinations
+                    @testset "$desc" begin
+                        model = build_from_mps(mps_file; verbose=false)
+                        
+                        params = HPRQP_parameters()
+                        params.use_gpu = true
+                        params.spmv_mode_Q = spmv_Q
+                        params.spmv_mode_A = spmv_A
+                        params.max_iter = 50000
+                        params.stoptol = 1e-6
+                        params.time_limit = 600.0
+                        params.warm_up = false
+                        params.verbose = false
+                        params.print_frequency = -1
+                        
+                        result = optimize(model, params)
+                        
+                        @test result !== nothing
+                        @test result.status == "OPTIMAL"
+                        @test result.residuals < 1e-6
+                        
+                        println("AUG2D.mps ($desc): Status=$(result.status), Objective=$(result.primal_obj)")
+                    end
+                end
+            else
+                @warn "AUG2D.mps file not found, skipping SpMV mode tests"
+            end
+        end
+        
+        @testset "AUG3DCQP.mps - SpMV mode combinations" begin
+            mps_file = joinpath(@__DIR__, "..", "data", "AUG3DCQP.mps")
+            
+            if isfile(mps_file)
+                # Test all 4 combinations: CUSPARSE/CUSPARSE, CUSPARSE/customized, customized/CUSPARSE, customized/customized
+                test_combinations = [
+                    ("CUSPARSE", "CUSPARSE", "CUSPARSE Q + CUSPARSE A"),
+                    ("CUSPARSE", "customized", "CUSPARSE Q + customized A"),
+                    ("customized", "CUSPARSE", "customized Q + CUSPARSE A"),
+                    ("customized", "customized", "customized Q + customized A")
+                ]
+                
+                for (spmv_Q, spmv_A, desc) in test_combinations
+                    @testset "$desc" begin
+                        model = build_from_mps(mps_file; verbose=false)
+                        
+                        params = HPRQP_parameters()
+                        params.use_gpu = true
+                        params.spmv_mode_Q = spmv_Q
+                        params.spmv_mode_A = spmv_A
+                        params.max_iter = 50000
+                        params.stoptol = 1e-6
+                        params.time_limit = 600.0
+                        params.warm_up = false
+                        params.verbose = false
+                        params.print_frequency = -1
+                        
+                        result = optimize(model, params)
+                        
+                        @test result !== nothing
+                        @test result.status == "OPTIMAL"
+                        @test result.residuals < 1e-6
+                        
+                        println("AUG3DCQP.mps ($desc): Status=$(result.status), Objective=$(result.primal_obj)")
+                    end
+                end
+            else
+                @warn "AUG3DCQP.mps file not found, skipping SpMV mode tests"
+            end
+        end
+    end
+    
     @testset "GPU Validation" begin
         # Test GPU availability checking and automatic fallback to CPU
         

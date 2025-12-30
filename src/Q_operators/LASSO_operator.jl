@@ -120,13 +120,19 @@ end
 supports_cusparse_preprocessing(Q::LASSO_Q_operator_gpu) = true
 
 # Prepare CUSPARSE preprocessing for LASSO operator's internal A and AT matrices
-function prepare_spmv_Q!(Q::LASSO_Q_operator_gpu, x::CuVector{Float64}, Qx::CuVector{Float64})
-    # Create descriptors
+# Note: We only use w and Qw for descriptor creation because the actual vectors passed to Qmap!
+# will be different (w or w_bar). The descriptor just needs the pointer and size info.
+function prepare_spmv_Q!(Q::LASSO_Q_operator_gpu, 
+                        w::CuVector{Float64},
+                        w_bar::CuVector{Float64},
+                        Qw::CuVector{Float64},
+                        Qw_bar::CuVector{Float64})
+    # Create descriptors - we'll use w and Qw as the canonical ones
     desc_A = CUDA.CUSPARSE.CuSparseMatrixDescriptor(Q.A, 'O')
     desc_AT = CUDA.CUSPARSE.CuSparseMatrixDescriptor(Q.AT, 'O')
-    desc_x = CUDA.CUSPARSE.CuDenseVectorDescriptor(x)
+    desc_x = CUDA.CUSPARSE.CuDenseVectorDescriptor(w)
     desc_temp = CUDA.CUSPARSE.CuDenseVectorDescriptor(Q.temp)
-    desc_Qx = CUDA.CUSPARSE.CuDenseVectorDescriptor(Qx)
+    desc_Qx = CUDA.CUSPARSE.CuDenseVectorDescriptor(Qw)
     
     CUSPARSE_handle = CUDA.CUSPARSE.handle()
     ref_one = Ref{Float64}(one(Float64))

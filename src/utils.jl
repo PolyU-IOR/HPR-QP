@@ -901,9 +901,6 @@ function build_from_mps(filename::String; verbose::Bool=true)
     end
     standard_qp = qp_formulation(Q, c, A, lcon, ucon, lvar, uvar, c0)
     if verbose
-        println("QP formulation with C")
-    end
-    if verbose
         println(@sprintf("FORMULATING QP time: %.2f seconds", time() - t_start))
     end
 
@@ -1007,9 +1004,6 @@ function build_from_QAbc(Q::Union{SparseMatrixCSC,Matrix{Float64}},
         println("FORMULATING QP ...")
     end
     standard_qp = qp_formulation(Q, c, A, lcon, ucon, lvar, uvar, obj_constant)
-    if verbose
-        println("QP formulation with C")
-    end
     if verbose
         println(@sprintf("FORMULATING QP time: %.2f seconds", time() - t_start))
     end
@@ -1511,15 +1505,26 @@ function run_dataset(data_path::String, result_path::String, params::HPRQP_param
 
     for i = 1:length(files)
         file = files[i]
-        if occursin(".mps", file) && !(file in namelist)
+        if (occursin(".mps", file) || occursin(".mat", file)) && !(file in namelist)
             FILE_NAME = joinpath(data_path, file)
             println(@sprintf("solving the problem %d", i), @sprintf(": %s", file))
-            
+
             redirect_stdout(io) do
                 println(@sprintf("solving the problem %d", i), @sprintf(": %s", file))
                 println("main run starts: ----------------------------------------------------------------------------------------------------------")
                 t_start_all = time()
-                model = build_from_mps(FILE_NAME, verbose=true)
+                model = nothing
+                if occursin(".mat", file)
+                    if params.problem_type == "QAP"
+                        model = build_from_mat(FILE_NAME, problem_type="QAP", verbose=params.verbose)
+                    elseif params.problem_type == "LASSO"
+                        model = build_from_mat(FILE_NAME, problem_type="LASSO", verbose=params.verbose)
+                    else
+                        error("Unknown problem_type: $(params.problem_type). Supported types are 'QAP' and 'LASSO'.")
+                    end
+                else
+                    model = build_from_mps(FILE_NAME, verbose=params.verbose)
+                end
                 results = optimize(model, params)
                 params.warm_up = false  # disable warm-up for next runs
                 all_time = time() - t_start_all
@@ -1594,7 +1599,7 @@ Allocates buffers and performs preprocessing (for CUDA >= 12.4).
 # Arguments
 - `A::CuSparseMatrixCSR`: The constraint matrix in CSR format
 - `AT::CuSparseMatrixCSR`: The transpose of A in CSR format
-- `x_bar, x_hat, dx::CuVector{Float64}`: Dense vectors for A operations
+- `x_bar, x_hat, dx, tempv::CuVector{Float64}`: Dense vectors for A operations
 - `Ax::CuVector{Float64}`: Output vector for A*x
 - `y_bar, y::CuVector{Float64}`: Dense vectors for AT operations
 - `ATy::CuVector{Float64}`: Output vector for AT*y
@@ -1607,20 +1612,24 @@ function prepare_spmv_A!(A::CuSparseMatrixCSR{Float64,Int32},
     x_bar::CuVector{Float64},
     x_hat::CuVector{Float64},
     dx::CuVector{Float64},
+    tempv::CuVector{Float64},
     Ax::CuVector{Float64},
     y_bar::CuVector{Float64},
     y::CuVector{Float64},
+    ATy_bar::CuVector{Float64},
     ATy::CuVector{Float64})
     # Create matrix and vector descriptors
     desc_A = CUDA.CUSPARSE.CuSparseMatrixDescriptor(A, 'O')
     desc_x_bar = CUDA.CUSPARSE.CuDenseVectorDescriptor(x_bar)
     desc_x_hat = CUDA.CUSPARSE.CuDenseVectorDescriptor(x_hat)
     desc_dx = CUDA.CUSPARSE.CuDenseVectorDescriptor(dx)
+    desc_tempv = CUDA.CUSPARSE.CuDenseVectorDescriptor(tempv)
     desc_Ax = CUDA.CUSPARSE.CuDenseVectorDescriptor(Ax)
 
     desc_AT = CUDA.CUSPARSE.CuSparseMatrixDescriptor(AT, 'O')
     desc_y_bar = CUDA.CUSPARSE.CuDenseVectorDescriptor(y_bar)
     desc_y = CUDA.CUSPARSE.CuDenseVectorDescriptor(y)
+    desc_ATy_bar = CUDA.CUSPARSE.CuDenseVectorDescriptor(ATy_bar)
     desc_ATy = CUDA.CUSPARSE.CuDenseVectorDescriptor(ATy)
 
     CUSPARSE_handle = CUDA.CUSPARSE.handle()
@@ -1640,7 +1649,7 @@ function prepare_spmv_A!(A::CuSparseMatrixCSR{Float64,Int32},
     end
 
     spmv_A = CUSPARSE_spmv_A(CUSPARSE_handle, 'N', ref_one, desc_A, desc_x_bar, desc_x_hat, desc_dx,
-        ref_zero, desc_Ax, Float64, CUDA.CUSPARSE.CUSPARSE_SPMV_CSR_ALG2, buf_A)
+        desc_tempv, ref_zero, desc_Ax, Float64, CUDA.CUSPARSE.CUSPARSE_SPMV_CSR_ALG2, buf_A)
 
     # Prepare AT SpMV
     sz_AT = Ref{Csize_t}(0)
@@ -1655,7 +1664,7 @@ function prepare_spmv_A!(A::CuSparseMatrixCSR{Float64,Int32},
     end
 
     spmv_AT = CUSPARSE_spmv_AT(CUSPARSE_handle, 'N', ref_one, desc_AT, desc_y_bar, desc_y,
-        ref_zero, desc_ATy, Float64, CUDA.CUSPARSE.CUSPARSE_SPMV_CSR_ALG2, buf_AT)
+        ref_zero, desc_ATy_bar, desc_ATy, Float64, CUDA.CUSPARSE.CUSPARSE_SPMV_CSR_ALG2, buf_AT)
 
     return spmv_A, spmv_AT
 end

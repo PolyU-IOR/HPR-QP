@@ -11,6 +11,7 @@ mutable struct CUSPARSE_spmv_A
     desc_x_bar::CUDA.CUSPARSE.CuDenseVectorDescriptor
     desc_x_hat::CUDA.CUSPARSE.CuDenseVectorDescriptor
     desc_dx::CUDA.CUSPARSE.CuDenseVectorDescriptor
+    desc_tempv::CUDA.CUSPARSE.CuDenseVectorDescriptor  # Added for Amap! generic use
     beta::Ref{Float64}
     desc_Ax::CUDA.CUSPARSE.CuDenseVectorDescriptor
     compute_type::DataType
@@ -27,7 +28,8 @@ mutable struct CUSPARSE_spmv_AT
     desc_y_bar::CUDA.CUSPARSE.CuDenseVectorDescriptor
     desc_y::CUDA.CUSPARSE.CuDenseVectorDescriptor
     beta::Ref{Float64}
-    desc_ATy::CUDA.CUSPARSE.CuDenseVectorDescriptor
+    desc_ATy_bar::CUDA.CUSPARSE.CuDenseVectorDescriptor  # Output for AT*y_bar
+    desc_ATy::CUDA.CUSPARSE.CuDenseVectorDescriptor      # Output for AT*y
     compute_type::DataType
     alg::CUDA.CUSPARSE.cusparseSpMVAlg_t
     buf::CuArray{UInt8}
@@ -40,8 +42,10 @@ mutable struct CUSPARSE_spmv_Q
     alpha::Ref{Float64}
     desc_Q::CUDA.CUSPARSE.CuSparseMatrixDescriptor
     desc_w::CUDA.CUSPARSE.CuDenseVectorDescriptor
+    desc_w_bar::CUDA.CUSPARSE.CuDenseVectorDescriptor  # Added for second Qmap! call
     beta::Ref{Float64}
     desc_Qw::CUDA.CUSPARSE.CuDenseVectorDescriptor
+    desc_Qw_bar::CUDA.CUSPARSE.CuDenseVectorDescriptor  # Added for second Qmap! call
     compute_type::DataType
     alg::CUDA.CUSPARSE.cusparseSpMVAlg_t
     buf::CuArray{UInt8}
