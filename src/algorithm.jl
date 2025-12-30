@@ -1409,7 +1409,9 @@ function estimate_eigenvalues(qp::HPRQP_QP_info, params::HPRQP_parameters, ws::H
         println("ESTIMATING MAXIMUM EIGENVALUES ...")
     end
     t_start = time()
-    CUDA.synchronize()
+    if isa(qp, QP_info_gpu)
+        CUDA.synchronize()
+    end
 
     m = size(qp.A, 1)
 
@@ -1423,7 +1425,9 @@ function estimate_eigenvalues(qp::HPRQP_QP_info, params::HPRQP_parameters, ws::H
     # Estimate lambda_max_Q based on Q type using unified dispatch
     lambda_max_Q = compute_lambda_max_Q(qp.Q, ws, params.eig_factor)
 
-    CUDA.synchronize()
+    if isa(qp, QP_info_gpu)
+        CUDA.synchronize()
+    end
     power_time = time() - t_start
 
     if params.verbose

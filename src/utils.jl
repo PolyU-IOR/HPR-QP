@@ -791,7 +791,9 @@ function scaling!(qp::HPRQP_QP_info, params::HPRQP_parameters)
     scaling_info.row_norm = row_norm
     scaling_info.col_norm = col_norm
 
-    CUDA.synchronize()
+    if isa(qp, QP_info_gpu)
+        CUDA.synchronize()
+    end
 
     scaling_time = time() - t_start
     if params.verbose

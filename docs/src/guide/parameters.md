@@ -4,24 +4,32 @@ HPRQP provides extensive customization through the `HPRQP_parameters` type. This
 
 ## Parameter Summary Table
 
-| Parameter | Type | Default | Range/Values | Purpose |
-|-----------|------|---------|--------------|---------|
-| `stoptol` | Float64 | 1e-4 | > 0 | Convergence tolerance |
-| `max_iter` | Int | ~2.1B | > 0 | Maximum iterations |
-| `time_limit` | Float64 | 3600.0 | > 0 | Time limit (seconds) |
-| `check_iter` | Int | 150 | > 0 | Convergence check interval |
-| `use_Ruiz_scaling` | Bool | true | true/false | Ruiz equilibration |
-| `use_Pock_Chambolle_scaling` | Bool | true | true/false | Pock-Chambolle scaling |
-| `use_bc_scaling` | Bool | true | true/false | b/c vector scaling |
-| `use_gpu` | Bool | true | true/false | GPU acceleration |
-| `device_number` | Int | 0 | ≥ 0 | GPU device selection |
-| `warm_up` | Bool | true | true/false | GPU warm-up |
-| `print_frequency` | Int | -1 | -1 or > 0 | Print interval (-1=auto) |
-| `verbose` | Bool | true | true/false | Enable output |
-| `initial_x` | Vector/Nothing | nothing | - | Initial primal solution |
-| `initial_y` | Vector/Nothing | nothing | - | Initial dual solution |
-| `auto_save` | Bool | false | true/false | Auto-save best solution |
-| `save_filename` | String | "hprlp_autosave.h5" | - | HDF5 filename for auto-save |
+| Parameter | Default Value | Description |
+|-----------|---------------|-------------|
+| `stoptol` | `1e-6` | Stopping tolerance for convergence checks. |
+| `sigma` | `-1 (auto)` | Initial value of the σ parameter used in the algorithm. |
+| `max_iter` | `typemax(Int32)` | Maximum number of iterations allowed. |
+| `sigma_fixed` | `false` | Whether σ is fixed throughout the optimization process. |
+| `time_limit` | `3600.0` | Maximum allowed runtime (seconds) for the algorithm. |
+| `eig_factor` | `1.05` | Factor used to scale the maximum eigenvalue estimation. |
+| `check_iter` | `100` | Frequency (in iterations) to check for convergence or perform other checks. |
+| `warm_up` | `false` | Determines if a warm-up phase is performed before main execution. |
+| `spmv_mode_Q` | `"auto"` | Mode for Q matrix-vector multiplication (e.g., "auto", "CUSPARSE", "customized", "operator"). |
+| `spmv_mode_A` | `"auto"` | Mode for A matrix-vector multiplication (e.g., "auto", "CUSPARSE", "customized"). |
+| `print_frequency` | `-1 (auto)` | Frequency (in iterations) for printing progress or logging information. |
+| `device_number` | `0` | GPU device number (e.g., 0, 1, 2, 3). |
+| `use_Ruiz_scaling` | `true` | Whether to apply Ruiz scaling to the problem data. |
+| `use_bc_scaling` | `false` | Whether to apply bc scaling. (For QAP and LASSO, only this scaling is applicable) |
+| `use_l2_scaling` | `false` | Whether to apply L2-norm based scaling. |
+| `use_Pock_Chambolle_scaling` | `true` | Whether to apply Pock-Chambolle scaling to the problem data. |
+| `problem_type` | `"QP"` | Type of problem being solved (e.g., "QP", "LASSO", "QAP"). |
+| `lambda` | `0.0` | Regularization parameter for LASSO problems. |
+| `initial_x` | `nothing` | Initial primal solution for warm-start. |
+| `initial_y` | `nothing` | Initial dual solution for warm-start. |
+| `auto_save` | `false` | Automatically save best x, y, z, w, and sigma during optimization. |
+| `save_filename` | `"hprqp_autosave.h5"` | Filename for auto-save HDF5 file. |
+| `verbose` | `true` | Enable verbose output during optimization. |
+| `use_gpu` | `true` | Whether to use GPU acceleration (requires CUDA). |
 
 
 ## Creating Parameters
@@ -36,185 +44,161 @@ params = HPRQP_parameters()
 params.stoptol = 1e-6
 params.use_gpu = true
 params.verbose = true
+params.time_limit = 1800.0
 ```
 
-## Convergence Parameters
+## Parameter Details
 
-### `stoptol::Float64`
-**Default:** `1e-4`
+### Convergence Control
 
-Stopping tolerance for convergence. The solver terminates when the optimality conditions are satisfied within this tolerance.
+- **`stoptol`**: Stopping tolerance for convergence checks. Lower values require higher accuracy but may take longer.
+  ```julia
+  params.stoptol = 1e-9  # High accuracy
+  params.stoptol = 1e-4  # Faster, less accurate
+  ```
 
-```julia
-params.stoptol = 1e-9  # Higher accuracy (slower)
-params.stoptol = 1e-2  # Lower accuracy (faster)
-```
+- **`max_iter`**: Maximum number of iterations. Set lower to prevent excessive computation time.
+  ```julia
+  params.max_iter = 100000
+  ```
 
-### `max_iter::Int`
-**Default:** `typemax(Int32)` (≈2.1 billion)
+- **`time_limit`**: Maximum runtime in seconds before the solver stops.
+  ```julia
+  params.time_limit = 3600.0  # 1 hour
+  ```
 
-Maximum number of iterations before stopping.
+- **`check_iter`**: How often (in iterations) to check convergence and update statistics.
+  ```julia
+  params.check_iter = 100
+  ```
 
-```julia
-params.max_iter = 100000  # Limit to 100k iterations
-```
+### Algorithm Parameters
 
-### `time_limit::Float64`
-**Default:** `3600.0` (1 hour)
+- **`sigma`**: Initial value of the σ parameter. When set to `-1`, it's automatically computed.
+  ```julia
+  params.sigma = -1  # Auto-compute (recommended)
+  params.sigma = 0.5 # Manual value
+  ```
 
-Maximum solve time in seconds.
+- **`sigma_fixed`**: Whether σ remains constant or adapts during optimization.
+  ```julia
+  params.sigma_fixed = false  # Adaptive (default)
+  params.sigma_fixed = true   # Fixed
+  ```
 
-```julia
-params.time_limit = 600.0   # 10 minutes
-params.time_limit = 7200.0  # 2 hours
-```
+- **`eig_factor`**: Scaling factor for maximum eigenvalue estimation.
+  ```julia
+  params.eig_factor = 1.05
+  ```
 
-### `check_iter::Int`
-**Default:** `150`
+### Matrix-Vector Multiplication Modes
 
-Interval for checking convergence criteria. Lower values check more frequently (higher overhead), higher values check less often (potentially more wasted iterations).
+- **`spmv_mode_Q`**: Controls how Q matrix-vector products are computed.
+  - `"auto"`: Automatically select best method
+  - `"CUSPARSE"`: Use CUDA sparse matrix operations
+  - `"customized"`: Use custom kernels
+  - `"operator"`: Use operator interface (for LASSO/QAP)
 
-```julia
-params.check_iter = 100  # Check more frequently
-params.check_iter = 200  # Check less frequently
-```
+- **`spmv_mode_A`**: Controls how A matrix-vector products are computed.
+  - `"auto"`: Automatically select best method
+  - `"CUSPARSE"`: Use CUDA sparse matrix operations
+  - `"customized"`: Use custom kernels
 
-## Scaling Parameters
+### Scaling Options
 
-Scaling improves numerical stability and convergence. HPRQP supports three types of scaling that can be combined.
+Scaling improves numerical stability and convergence:
 
-### `use_Ruiz_scaling::Bool`
-**Default:** `true`
+- **`use_Ruiz_scaling`**: Apply Ruiz equilibration to balance matrix rows/columns.
+  ```julia
+  params.use_Ruiz_scaling = true
+  ```
 
-Enable Ruiz equilibration scaling, which balances the rows and columns of the constraint matrix.
+- **`use_bc_scaling`**: Scale the objective vector (c) and constraint bounds (b). **Required for QAP and LASSO problems.**
+  ```julia
+  params.use_bc_scaling = false  # Default for standard QP
+  params.use_bc_scaling = true   # Required for QAP/LASSO
+  ```
 
-```julia
-params.use_Ruiz_scaling = true   # Recommended
-params.use_Ruiz_scaling = false  # Disable if problem is already well-scaled
-```
+- **`use_l2_scaling`**: Apply L2-norm based scaling.
+  ```julia
+  params.use_l2_scaling = false
+  ```
 
-### `use_Pock_Chambolle_scaling::Bool`
-**Default:** `true`
+- **`use_Pock_Chambolle_scaling`**: Apply Pock-Chambolle diagonal scaling.
+  ```julia
+  params.use_Pock_Chambolle_scaling = true
+  ```
 
-Enable Pock-Chambolle scaling, a diagonal scaling for primal-dual algorithms.
+### GPU Configuration
 
-```julia
-params.use_Pock_Chambolle_scaling = true  # Recommended
-```
+- **`use_gpu`**: Enable GPU acceleration (requires CUDA).
+  ```julia
+  params.use_gpu = true   # Use GPU (faster for large problems)
+  params.use_gpu = false  # CPU only
+  ```
 
-### `use_bc_scaling::Bool`
-**Default:** `true`
+- **`device_number`**: Select which GPU to use (0-indexed).
+  ```julia
+  params.device_number = 0  # First GPU
+  params.device_number = 1  # Second GPU
+  ```
 
-Enable scaling for the objective vector (c) and constraint bounds (b).
+- **`warm_up`**: Perform warm-up to ensure accurate timing (accounts for JIT compilation).
+  ```julia
+  params.warm_up = false  # Default
+  params.warm_up = true   # For benchmarking
+  ```
 
-```julia
-params.use_bc_scaling = true  # Recommended for most problems
-```
+### Output Control
 
-!!! note "Scaling Recommendations"
-    - Keep all three scaling options enabled (default) for most problems
-    - Disable only if you have a well-conditioned problem or specific numerical concerns
-    - All three can be used simultaneously for best results
+- **`verbose`**: Enable detailed solver output.
+  ```julia
+  params.verbose = true   # Show progress
+  params.verbose = false  # Silent
+  ```
 
-## GPU Parameters
+- **`print_frequency`**: How often to print iteration information. `-1` means automatic.
+  ```julia
+  params.print_frequency = -1   # Auto
+  params.print_frequency = 100  # Every 100 iterations
+  ```
 
-### `use_gpu::Bool`
-**Default:** `true`
+### Warm-Start
 
-Enable GPU acceleration. Requires CUDA-capable GPU.
+- **`initial_x`**: Initial primal solution vector.
+  ```julia
+  params.initial_x = x0  # From previous solve
+  ```
 
-```julia
-params.use_gpu = true   # Use GPU (much faster for large problems)
-params.use_gpu = false  # Use CPU only
-```
+- **`initial_y`**: Initial dual solution vector.
+  ```julia
+  params.initial_y = y0  # From previous solve
+  ```
 
-!!! tip "When to Use GPU"
-    - **Large problems** (>10,000 variables): Significant speedup
-    - **Small problems** (<1,000 variables): CPU may be faster due to overhead
-    - **Multiple GPUs available**: Use `device_number` to select specific GPU
+### Auto-Save Feature
 
-### `device_number::Int`
-**Default:** `0`
+- **`auto_save`**: Automatically save the best solution during optimization.
+  ```julia
+  params.auto_save = true
+  ```
 
-GPU device number to use (0-indexed). Only relevant when `use_gpu = true`.
+- **`save_filename`**: HDF5 filename for auto-saved solutions.
+  ```julia
+  params.save_filename = "my_problem_autosave.h5"
+  ```
 
-```julia
-params.device_number = 0  # First GPU
-params.device_number = 1  # Second GPU
-```
+### Problem Type
 
-### `warm_up::Bool`
-**Default:** `true`
+- **`problem_type`**: Specifies the type of problem being solved.
+  - `"QP"`: Standard quadratic programming
+  - `"LASSO"`: LASSO regression problems
+  - `"QAP"`: Quadratic assignment problems
 
-To ensure accurate timing, due to Julia's JIT compilation, a warm-up phase can be performed before the actual solve. This is recommended for benchmarking.
-
-```julia
-params.warm_up = true   # Accurate timing (recommended)
-params.warm_up = false  # Skip warm-up
-```
-
-## Output Parameters
-
-### `verbose::Bool`
-**Default:** `true`
-
-Enable detailed solver output during optimization.
-
-```julia
-params.verbose = true   # Print iteration log
-params.verbose = false  # Silent mode
-```
-
-### `print_frequency::Int`
-**Default:** `-1` (automatic)
-
-Control how often to print iteration information. When set to `-1`, frequency is automatically determined.
-
-```julia
-params.print_frequency = -1    # Auto (default)
-params.print_frequency = 100   # Print every 100 iterations
-params.print_frequency = 1     # Print every iteration (very verbose)
-```
-
-## Warm-Start Parameters
-
-### `initial_x::Union{Vector{Float64},Nothing}`
-**Default:** `nothing`
-
-Initial primal solution to warm-start the solver.
-
-```julia
-params.initial_x = x0  # From previous solve or heuristic
-```
-
-### `initial_y::Union{Vector{Float64},Nothing}`
-**Default:** `nothing`
-
-Initial dual solution to warm-start the solver.
-
-```julia
-params.initial_y = y0  # Optional, can use with or without initial_x
-```
-
-## Auto-Save Parameters
-
-### `auto_save::Bool`
-**Default:** `false`
-
-Automatically save the best solution found during optimization to HDF5.
-
-```julia
-params.auto_save = true
-```
-
-### `save_filename::String`
-**Default:** `"hprlp_autosave.h5"`
-
-Filename for the HDF5 file used by auto-save.
-
-```julia
-params.save_filename = "my_problem.h5"
-```
+- **`lambda`**: Regularization parameter for LASSO problems.
+  ```julia
+  params.problem_type = "LASSO"
+  params.lambda = 0.1
+  ```
 
 ## Common Configurations
 
@@ -222,7 +206,8 @@ params.save_filename = "my_problem.h5"
 ```julia
 params = HPRQP_parameters()
 params.stoptol = 1e-9
-params.time_limit = 15000.0
+params.time_limit = 7200.0
+params.max_iter = 500000
 ```
 
 ### Fast Approximate Solutions
@@ -230,34 +215,54 @@ params.time_limit = 15000.0
 params = HPRQP_parameters()
 params.stoptol = 1e-4
 params.time_limit = 300.0
+params.check_iter = 200
 ```
 
 ### CPU-Only (No GPU Available)
 ```julia
 params = HPRQP_parameters()
 params.use_gpu = false
+params.verbose = true
 ```
 
-### Production/Batch Processing
+### LASSO Problems
 ```julia
 params = HPRQP_parameters()
-params.verbose = false
-params.warm_up = false
+params.problem_type = "LASSO"
+params.lambda = 0.1
+params.use_bc_scaling = true  # Required for LASSO
+params.spmv_mode_Q = "operator"
+```
+
+### QAP Problems
+```julia
+params = HPRQP_parameters()
+params.problem_type = "QAP"
+params.use_bc_scaling = true  # Required for QAP
+params.spmv_mode_Q = "operator"
 ```
 
 ### With Auto-Save and Warm-Start
 ```julia
 params = HPRQP_parameters()
 params.auto_save = true
-params.save_filename = "backup.h5"
+params.save_filename = "my_solution.h5"
 params.initial_x = x0
+params.initial_y = y0
+```
+
+### Silent/Batch Processing
+```julia
+params = HPRQP_parameters()
+params.verbose = false
+params.warm_up = false
 ```
 
 ### Debugging/Analysis
 ```julia
 params = HPRQP_parameters()
 params.verbose = true
-params.print_frequency = 1
-params.check_iter = 1
-params.max_iter = 100
+params.print_frequency = 10
+params.check_iter = 10
+params.max_iter = 1000
 ```
