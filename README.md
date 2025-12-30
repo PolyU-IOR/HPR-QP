@@ -1,10 +1,15 @@
 # HPR-QP: A GPU Solver for Convex Composite Quadratic Programming in Julia
 
+[![CI](https://github.com/PolyU-IOR/HPR-QP/actions/workflows/CI.yml/badge.svg)](https://github.com/PolyU-IOR/HPR-QP/actions/workflows/CI.yml)
+[![Documentation](https://github.com/PolyU-IOR/HPR-QP/actions/workflows/Documentation.yml/badge.svg)](https://github.com/PolyU-IOR/HPR-QP/actions/workflows/Documentation.yml)
+[![Documentation (stable)](https://img.shields.io/badge/docs-stable-blue.svg)](https://PolyU-IOR.github.io/HPR-QP/stable/)
+[![Documentation (dev)](https://img.shields.io/badge/docs-dev-blue.svg)](https://PolyU-IOR.github.io/HPR-QP/dev/)
+
 > **HPR-QP: A dual Halpern Peaceman–Rachford (HPR) method for solving large-scale convex composite quadratic programming (CCQP).**
 
 ---
 
-## 🎉 What's New in v0.11
+## 🎉 What's New in v0.1.1
 
 This version represents a major architectural overhaul with significant improvements:
 
@@ -27,8 +32,6 @@ This version represents a major architectural overhaul with significant improvem
 ### **5. Auto-Save Feature**
 - Automatically save best solution during optimization (`auto_save=true`)
 - Resume from saved states for long-running problems
-
-> **📖 For detailed documentation**, see the [docs/](docs/) directory or visit our [documentation pages](docs/README.md).
 
 ---
 
