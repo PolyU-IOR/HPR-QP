@@ -332,6 +332,8 @@ function update_sigma!(params::HPRQP_parameters,
         # Compute differences: dx = x_bar - last_x, dw = w_bar - last_w
         ws.dx .= ws.x_bar .- ws.last_x
         ws.dw .= ws.w_bar .- ws.last_w
+        println(@sprintf(" l2 norm of dx: %3.2e", unified_norm(ws.dx)))
+        println(@sprintf(" l_inf norm of dx: %3.2e", unified_norm(ws.dx, Inf)))
 
         # Use unified Qmap! function (dispatch handles operator vs sparse matrix)
         # Pass spmv_Q for GPU sparse matrices to use preprocessed CUSPARSE
@@ -359,6 +361,11 @@ function update_sigma!(params::HPRQP_parameters,
             end
             a = ws.lambda_max_A * unified_dot(ws.dy, ws.dy) - 2 * unified_dot(ws.dQw, ws.ATdy)
         end
+
+        println(@sprintf(" l2 norm of dw: %3.2e", unified_norm(ws.dw)))
+        println(@sprintf(" l_inf norm of dw: %3.2e", unified_norm(ws.dw, Inf)))
+        println(@sprintf(" l2 norm of dy: %3.2e", unified_norm(ws.dy)))
+        println(@sprintf(" l_inf norm of dy: %3.2e", unified_norm(ws.dy, Inf)))
 
         if ws.Q_is_diag
             a += unified_norm(ws.dQw)^2
@@ -1432,8 +1439,8 @@ function estimate_eigenvalues(qp::HPRQP_QP_info, params::HPRQP_parameters, ws::H
 
     if params.verbose
         println(@sprintf("ESTIMATING MAXIMUM EIGENVALUES time = %.2f seconds", power_time))
-        # println(@sprintf("estimated maximum eigenvalue of AAT = %.2e", lambda_max_A))
-        # println(@sprintf("estimated maximum eigenvalue of Q = %.2e", lambda_max_Q))
+        println(@sprintf("estimated maximum eigenvalue of AAT = %.2e", lambda_max_A))
+        println(@sprintf("estimated maximum eigenvalue of Q = %.2e", lambda_max_Q))
     end
 
     return lambda_max_A, lambda_max_Q, power_time
@@ -1915,7 +1922,15 @@ function solve(model::QP_info_cpu, params::HPRQP_parameters)
     diag_Q, Q_is_diag = nothing, false
     qp, transfer_time = prepare_model(model, params)
 
+    if params.problem_type == "QP"
+        print_qp_numerical_info(qp, "before scaling"; verbose=params.verbose)
+    end
+
     scaling_info = scaling!(qp, params)
+
+    if params.problem_type == "QP"
+        print_qp_numerical_info(qp, "after scaling"; verbose=params.verbose)
+    end
 
     diag_Q, Q_is_diag = check_Q_diagonal(qp)
 

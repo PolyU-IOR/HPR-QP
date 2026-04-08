@@ -187,6 +187,80 @@ function qp_formulation(Q::SparseMatrixCSC,
     return standard_qp
 end
 
+# Numerical summary helpers for standard sparse QP data.
+function _abs_range(values::AbstractVector{Float64}; ignore_zero::Bool=false, finite_only::Bool=false)
+    filtered = Float64[]
+    for value in values
+        if finite_only && !isfinite(value)
+            continue
+        end
+        abs_value = abs(value)
+        if ignore_zero && iszero(abs_value)
+            continue
+        end
+        push!(filtered, abs_value)
+    end
+
+    if isempty(filtered)
+        return 0, NaN, NaN, NaN
+    end
+
+    min_abs = minimum(filtered)
+    max_abs = maximum(filtered)
+    ratio = iszero(min_abs) ? Inf : max_abs / min_abs
+    return length(filtered), min_abs, max_abs, ratio
+end
+
+function _print_abs_range_line(label::String, values::AbstractVector{Float64};
+    ignore_zero::Bool=false, finite_only::Bool=false)
+    count, min_abs, max_abs, ratio = _abs_range(values; ignore_zero=ignore_zero, finite_only=finite_only)
+    if count == 0
+        println(rpad(label * ":", 18), "none")
+        return
+    end
+
+    println(
+        rpad(label * ":", 18),
+        @sprintf("count = %-8d min|.| = %9.2e   max|.| = %9.2e   ratio = %9.2e",
+            count, min_abs, max_abs, ratio)
+    )
+end
+
+"""
+    print_qp_numerical_info(qp, stage; verbose=true)
+
+Print a compact numerical summary of sparse-QP problem data.
+
+This helper is intended for standard QP models only. It reports the absolute-value
+ranges of sparse matrix entries and vector/bound data to make scaling effects easy
+to inspect before and after preprocessing.
+"""
+function print_qp_numerical_info(qp::HPRQP_QP_info, stage::String; verbose::Bool=true)
+    if !verbose || is_q_operator(qp.Q)
+        return
+    end
+
+    Q_cpu = to_cpu(qp.Q)
+    A_cpu = to_cpu(qp.A)
+    c_cpu = to_cpu(qp.c)
+    l_cpu = to_cpu(qp.l)
+    u_cpu = to_cpu(qp.u)
+    AL_cpu = to_cpu(qp.AL)
+    AU_cpu = to_cpu(qp.AU)
+
+    println("="^80)
+    println("QP NUMERICAL INFORMATION CHECK ($(stage))")
+    println("="^80)
+    _print_abs_range_line("Q nzval", Q_cpu.nzval; ignore_zero=true)
+    _print_abs_range_line("A nzval", A_cpu.nzval; ignore_zero=true)
+    _print_abs_range_line("c nzval", c_cpu; ignore_zero=true)
+    _print_abs_range_line("l finite nz", l_cpu; finite_only=true, ignore_zero=true)
+    _print_abs_range_line("u finite nz", u_cpu; finite_only=true, ignore_zero=true)
+    _print_abs_range_line("AL finite nz", AL_cpu; finite_only=true, ignore_zero=true)
+    _print_abs_range_line("AU finite nz", AU_cpu; finite_only=true, ignore_zero=true)
+    println()
+end
+
 # CPU-based scaling function for the QP problem (similar to GPU version)
 # ============================================================================
 # Unified Scaling Functions
@@ -700,7 +774,7 @@ function scaling!(qp::HPRQP_QP_info, params::HPRQP_parameters)
     end
 
     # b and c scaling (disabled for now, same as GPU)
-    if params.use_bc_scaling && false
+    if params.use_bc_scaling
         AL_nInf = copy(qp.AL)
         AU_nInf = copy(qp.AU)
         AL_nInf[qp.AL.==-Inf] .= 0.0
