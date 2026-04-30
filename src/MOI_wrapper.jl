@@ -152,6 +152,7 @@ const SUPPORTED_PARAMETERS = (
     "spmv_mode_A",
     "print_frequency",
     "device_number",
+    "use_CR_scaling",
     "use_Ruiz_scaling",
     "use_bc_scaling",
     "use_l2_scaling",
@@ -193,6 +194,8 @@ function MOI.set(model::Optimizer, param::MOI.RawOptimizerAttribute, value)
         model.params.print_frequency = Int(value)
     elseif name == "device_number"
         model.params.device_number = Int32(value)
+    elseif name == "use_CR_scaling"
+        model.params.use_CR_scaling = Bool(value)
     elseif name == "use_Ruiz_scaling"
         model.params.use_Ruiz_scaling = Bool(value)
     elseif name == "use_bc_scaling"
@@ -245,6 +248,8 @@ function MOI.get(model::Optimizer, param::MOI.RawOptimizerAttribute)
         return model.params.print_frequency
     elseif name == "device_number"
         return model.params.device_number
+    elseif name == "use_CR_scaling"
+        return model.params.use_CR_scaling
     elseif name == "use_Ruiz_scaling"
         return model.params.use_Ruiz_scaling
     elseif name == "use_bc_scaling"

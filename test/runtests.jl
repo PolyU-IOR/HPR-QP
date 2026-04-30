@@ -105,6 +105,48 @@ using HDF5
             @test model.Q isa SparseMatrixCSC
             @test nnz(model.Q) == 0  # Should have no nonzeros
         end
+
+        @testset "Curtis Reid scaling preserves QP algebra" begin
+            Q = sparse([4.0 0.0 1e-4; 0.0 2e3 0.0; 1e-4 0.0 3.0])
+            c = [1e-2, -3.0, 8e1]
+            A = sparse([1e4 0.0 -2.0; 0.0 5e-3 7.0])
+            AL = [-10.0, -Inf]
+            AU = [25.0, 12.0]
+            l = [-1.0, 0.0, -Inf]
+            u = [5.0, Inf, 20.0]
+
+            model = build_from_QAbc(Q, c, A, AL, AU, l, u; verbose=false)
+            Q_org = copy(model.Q)
+            c_org = copy(model.c)
+            A_org = copy(model.A)
+            AL_org = copy(model.AL)
+            AU_org = copy(model.AU)
+            l_org = copy(model.l)
+            u_org = copy(model.u)
+
+            params = HPRQP_parameters()
+            params.use_gpu = false
+            params.use_CR_scaling = true
+            params.use_Ruiz_scaling = false
+            params.use_Pock_Chambolle_scaling = false
+            params.use_bc_scaling = false
+            params.verbose = false
+
+            scaling_info = HPRQP.scaling!(model, params)
+            x_org = [0.25, 1.5, -2.0]
+            x_scaled = x_org .* scaling_info.col_norm
+
+            @test model.A * x_scaled ≈ (A_org * x_org) ./ scaling_info.row_norm
+            @test model.Q * x_scaled ≈ (Q_org * x_org) ./ scaling_info.col_norm
+            @test dot(x_scaled, model.Q * x_scaled) ≈ dot(x_org, Q_org * x_org)
+            @test dot(model.c, x_scaled) ≈ dot(c_org, x_org)
+            @test model.AL ≈ AL_org ./ scaling_info.row_norm
+            @test model.AU ≈ AU_org ./ scaling_info.row_norm
+            @test model.l ≈ l_org .* scaling_info.col_norm
+            @test model.u ≈ u_org .* scaling_info.col_norm
+            @test any(abs.(log.(scaling_info.col_norm)) .> 1e-8)
+            @test any(abs.(log.(scaling_info.row_norm)) .> 1e-8)
+        end
         
         @testset "Mixed sparse and dense matrices" begin
             # Test mixing sparse Q with dense A

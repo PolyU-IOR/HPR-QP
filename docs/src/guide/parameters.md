@@ -18,6 +18,7 @@ HPRQP provides extensive customization through the `HPRQP_parameters` type. This
 | `spmv_mode_A` | `"auto"` | Mode for A matrix-vector multiplication (e.g., "auto", "CUSPARSE", "customized"). |
 | `print_frequency` | `-1 (auto)` | Frequency (in iterations) for printing progress or logging information. |
 | `device_number` | `0` | GPU device number (e.g., 0, 1, 2, 3). |
+| `use_CR_scaling` | `true` | Whether to apply Curtis-Reid scaling before Ruiz/Pock-Chambolle scaling. |
 | `use_Ruiz_scaling` | `true` | Whether to apply Ruiz scaling to the problem data. |
 | `use_bc_scaling` | `false` | Whether to apply bc scaling. (For QAP and LASSO, only this scaling is applicable) |
 | `use_l2_scaling` | `false` | Whether to apply L2-norm based scaling. |
@@ -107,6 +108,11 @@ params.time_limit = 1800.0
 ### Scaling Options
 
 Scaling improves numerical stability and convergence:
+
+- **`use_CR_scaling`**: Apply Curtis-Reid geometric-mean scaling on the implicit QP block matrix `[Q A'; A 0]` before other matrix scaling passes.
+  ```julia
+  params.use_CR_scaling = true
+  ```
 
 - **`use_Ruiz_scaling`**: Apply Ruiz equilibration to balance matrix rows/columns.
   ```julia

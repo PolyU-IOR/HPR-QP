@@ -322,12 +322,239 @@ function _scale_A_matrix!(A::CuSparseMatrixCSR, temp_row_norm::CuVector{Float64}
     return A  # Modified in-place
 end
 
+function _compute_curtis_reid_norms(Q::SparseMatrixCSC, A::SparseMatrixCSC, niters::Int)
+    m, n = size(A)
+    total_dim = n + m
+    if total_dim == 0
+        return Float64[], Float64[]
+    end
+
+    q_rows = rowvals(Q)
+    q_vals = nonzeros(Q)
+    a_rows = rowvals(A)
+    a_vals = nonzeros(A)
+    q_logvals = log.(max.(abs.(q_vals), 1e-300))
+    a_logvals = log.(max.(abs.(a_vals), 1e-300))
+    nz = length(q_vals) + 2 * length(a_vals)
+    if nz == 0
+        return ones(Float64, m), ones(Float64, n)
+    end
+
+    row_count = zeros(Int, total_dim)
+    col_count = zeros(Int, total_dim)
+    for j in 1:n
+        for k in Q.colptr[j]:(Q.colptr[j+1]-1)
+            row_count[q_rows[k]] += 1
+            col_count[j] += 1
+        end
+        for k in A.colptr[j]:(A.colptr[j+1]-1)
+            constraint_idx = n + a_rows[k]
+            row_count[constraint_idx] += 1
+            col_count[j] += 1
+            row_count[j] += 1
+            col_count[constraint_idx] += 1
+        end
+    end
+    row_count[row_count.==0] .= 1
+    col_count[col_count.==0] .= 1
+
+    row_log_scale = zeros(Float64, total_dim)
+    col_log_scale = zeros(Float64, total_dim)
+    row_sum = zeros(Float64, total_dim)
+    col_sum = zeros(Float64, total_dim)
+
+    for _ in 1:niters
+        fill!(row_sum, 0.0)
+        for j in 1:n
+            for k in Q.colptr[j]:(Q.colptr[j+1]-1)
+                row_sum[q_rows[k]] += -q_logvals[k] - col_log_scale[j]
+            end
+            for k in A.colptr[j]:(A.colptr[j+1]-1)
+                constraint_idx = n + a_rows[k]
+                row_sum[constraint_idx] += -a_logvals[k] - col_log_scale[j]
+                row_sum[j] += -a_logvals[k] - col_log_scale[constraint_idx]
+            end
+        end
+        row_log_scale .= row_sum ./ row_count
+
+        fill!(col_sum, 0.0)
+        for j in 1:n
+            for k in Q.colptr[j]:(Q.colptr[j+1]-1)
+                col_sum[j] += -q_logvals[k] - row_log_scale[q_rows[k]]
+            end
+            for k in A.colptr[j]:(A.colptr[j+1]-1)
+                constraint_idx = n + a_rows[k]
+                col_sum[j] += -a_logvals[k] - row_log_scale[constraint_idx]
+                col_sum[constraint_idx] += -a_logvals[k] - row_log_scale[j]
+            end
+        end
+        col_log_scale .= col_sum ./ col_count
+    end
+
+    curtis_reid_scale = exp.(0.5 .* (row_log_scale .+ col_log_scale))
+    clamp!(curtis_reid_scale, 1e-30, 1e30)
+
+    col_norm = 1.0 ./ curtis_reid_scale[1:n]
+    row_norm = 1.0 ./ curtis_reid_scale[(n+1):total_dim]
+    return row_norm, col_norm
+end
+
+function _compute_curtis_reid_norms(qp::QP_info_cpu, niters::Int)
+    return _compute_curtis_reid_norms(qp.Q, qp.A, niters)
+end
+
+function _compute_curtis_reid_norms(qp::QP_info_gpu, niters::Int)
+    m, n = size(qp.A)
+    total_dim = n + m
+    if total_dim == 0
+        return CuVector{Float64}(undef, 0), CuVector{Float64}(undef, 0)
+    end
+    if length(qp.Q.nzVal) + 2 * length(qp.A.nzVal) == 0
+        return CUDA.ones(Float64, m), CUDA.ones(Float64, n)
+    end
+
+    row_count = CUDA.zeros(Int32, total_dim)
+    col_count = CUDA.zeros(Int32, total_dim)
+    row_log_scale = CUDA.zeros(Float64, total_dim)
+    col_log_scale = CUDA.zeros(Float64, total_dim)
+    row_sum = CUDA.zeros(Float64, total_dim)
+    col_sum = CUDA.zeros(Float64, total_dim)
+    row_norm = CUDA.ones(Float64, m)
+    col_norm = CUDA.ones(Float64, n)
+
+    threads = 256
+    blocks_total = ceil(Int, total_dim / threads)
+    @cuda threads = threads blocks = blocks_total curtis_reid_count_rows_cols_kernel!(
+        qp.Q.rowPtr, qp.Q.colVal, qp.A.rowPtr, qp.A.colVal, qp.AT.rowPtr, qp.AT.colVal,
+        row_count, col_count, n, m
+    )
+    CUDA.synchronize()
+    @cuda threads = threads blocks = blocks_total curtis_reid_fix_zero_counts_kernel!(col_count, total_dim)
+    CUDA.synchronize()
+
+    for _ in 1:niters
+        fill!(row_sum, 0.0)
+        @cuda threads = threads blocks = blocks_total curtis_reid_row_sum_kernel!(
+            qp.Q.rowPtr, qp.Q.colVal, qp.Q.nzVal,
+            qp.A.rowPtr, qp.A.colVal, qp.A.nzVal,
+            qp.AT.rowPtr, qp.AT.colVal, qp.AT.nzVal,
+            col_log_scale, row_sum, n, m
+        )
+        CUDA.synchronize()
+        @cuda threads = threads blocks = blocks_total curtis_reid_update_log_scale_kernel!(
+            row_log_scale, row_sum, row_count, total_dim
+        )
+        CUDA.synchronize()
+
+        fill!(col_sum, 0.0)
+        @cuda threads = threads blocks = blocks_total curtis_reid_col_sum_kernel!(
+            qp.Q.rowPtr, qp.Q.colVal, qp.Q.nzVal,
+            qp.A.rowPtr, qp.A.colVal, qp.A.nzVal,
+            qp.AT.rowPtr, qp.AT.colVal, qp.AT.nzVal,
+            row_log_scale, col_sum, n, m
+        )
+        CUDA.synchronize()
+        @cuda threads = threads blocks = blocks_total curtis_reid_update_log_scale_kernel!(
+            col_log_scale, col_sum, col_count, total_dim
+        )
+        CUDA.synchronize()
+    end
+
+    @cuda threads = threads blocks = blocks_total curtis_reid_build_norms_kernel!(
+        row_log_scale, col_log_scale, row_norm, col_norm, n, m
+    )
+    CUDA.synchronize()
+
+    return row_norm, col_norm
+end
+
+function _apply_diagonal_qp_scaling!(qp::QP_info_cpu, temp_row_norm::Vector{Float64}, temp_col_norm::Vector{Float64})
+    m, _ = size(qp.A)
+    DC = spdiagm(1.0 ./ temp_col_norm)
+    qp.Q = DC * qp.Q * DC
+    qp.c ./= temp_col_norm
+    qp.l .*= temp_col_norm
+    qp.u .*= temp_col_norm
+
+    if m > 0
+        DR = spdiagm(1.0 ./ temp_row_norm)
+        qp.A = DR * qp.A * DC
+        qp.AL ./= temp_row_norm
+        qp.AU ./= temp_row_norm
+    end
+    return
+end
+
+function _apply_diagonal_qp_scaling!(qp::QP_info_gpu, temp_row_norm::CuVector{Float64}, temp_col_norm::CuVector{Float64})
+    m, n = size(qp.A)
+
+    Q_rowPtr = qp.Q.rowPtr
+    Q_colVal = qp.Q.colVal
+    Q_nzVal = qp.Q.nzVal
+    @cuda threads = 256 blocks = ceil(Int, n / 256) scale_rows_csr_kernel!(
+        Q_rowPtr, Q_nzVal, temp_col_norm, n
+    )
+    CUDA.synchronize()
+    @cuda threads = 256 blocks = ceil(Int, n / 256) scale_csr_cols_kernel!(
+        Q_rowPtr, Q_colVal, Q_nzVal, temp_col_norm, n
+    )
+    CUDA.synchronize()
+
+    if m > 0
+        A_rowPtr = qp.A.rowPtr
+        A_colVal = qp.A.colVal
+        A_nzVal = qp.A.nzVal
+        AT_rowPtr = qp.AT.rowPtr
+        AT_colVal = qp.AT.colVal
+        AT_nzVal = qp.AT.nzVal
+
+        @cuda threads = 256 blocks = ceil(Int, m / 256) scale_rows_csr_kernel!(
+            A_rowPtr, A_nzVal, temp_row_norm, m
+        )
+        CUDA.synchronize()
+        @cuda threads = 256 blocks = ceil(Int, m / 256) scale_csr_cols_kernel!(
+            A_rowPtr, A_colVal, A_nzVal, temp_col_norm, m
+        )
+        CUDA.synchronize()
+
+        @cuda threads = 256 blocks = ceil(Int, n / 256) scale_rows_csr_kernel!(
+            AT_rowPtr, AT_nzVal, temp_col_norm, n
+        )
+        CUDA.synchronize()
+        @cuda threads = 256 blocks = ceil(Int, n / 256) scale_csr_cols_kernel!(
+            AT_rowPtr, AT_colVal, AT_nzVal, temp_row_norm, n
+        )
+        CUDA.synchronize()
+
+        @cuda threads = 256 blocks = ceil(Int, m / 256) scale_vector_div_kernel!(
+            qp.AL, temp_row_norm, m
+        )
+        @cuda threads = 256 blocks = ceil(Int, m / 256) scale_vector_div_kernel!(
+            qp.AU, temp_row_norm, m
+        )
+        CUDA.synchronize()
+    end
+
+    @cuda threads = 256 blocks = ceil(Int, n / 256) scale_vector_div_kernel!(
+        qp.c, temp_col_norm, n
+    )
+    @cuda threads = 256 blocks = ceil(Int, n / 256) scale_vector_mul_kernel!(
+        qp.l, temp_col_norm, n
+    )
+    @cuda threads = 256 blocks = ceil(Int, n / 256) scale_vector_mul_kernel!(
+        qp.u, temp_col_norm, n
+    )
+    CUDA.synchronize()
+    return
+end
+
 """
     scaling!(qp::HPRQP_QP_info, params::HPRQP_parameters)
 
 Unified scaling function that works for both CPU and GPU QP problems.
 
 This function applies various scaling strategies to improve numerical conditioning:
+- Curtis-Reid scaling: Geometric-mean equilibration on the implicit [Q A'; A 0] matrix
 - Ruiz scaling: Row/column equilibration using max norms
 - Pock-Chambolle scaling: Row/column equilibration using sum norms
 - b/c scaling: Objective/constraint balancing (currently disabled)
@@ -447,6 +674,13 @@ function scaling!(qp::HPRQP_QP_info, params::HPRQP_parameters)
     else
         temp_row_norm = ones(Float64, m)
         temp_col_norm = ones(Float64, n)
+    end
+
+    if params.use_CR_scaling
+        temp_row_norm, temp_col_norm = _compute_curtis_reid_norms(qp, 10)
+        row_norm .*= temp_row_norm
+        col_norm .*= temp_col_norm
+        _apply_diagonal_qp_scaling!(qp, temp_row_norm, temp_col_norm)
     end
 
     # Ruiz scaling
@@ -1440,7 +1674,7 @@ function power_iteration_Q(ws::HPRQP_workspace,
         q .= z
         q ./= unified_norm(q)
         # For sparse matrices, pass spmv_Q if available
-        if Q isa Union{SparseMatrixCSC,CuSparseMatrixCSR}
+        if Q isa CuSparseMatrixCSR
             Qmap!(q, z, Q, spmv_Q)
         else
             # For operators, they handle preprocessing internally

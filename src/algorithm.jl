@@ -278,6 +278,7 @@ function save_state_to_hdf5!(
         file["parameters/spmv_mode_A"] = params.spmv_mode_A
         file["parameters/print_frequency"] = params.print_frequency
         file["parameters/device_number"] = params.device_number
+        file["parameters/use_CR_scaling"] = params.use_CR_scaling
         file["parameters/use_Ruiz_scaling"] = params.use_Ruiz_scaling
         file["parameters/use_bc_scaling"] = params.use_bc_scaling
         file["parameters/use_l2_scaling"] = params.use_l2_scaling
@@ -420,21 +421,6 @@ function update_sigma!(params::HPRQP_parameters,
             end
         end
     end
-end
-
-# ============================================================================
-# Legacy GPU Wrapper (calls unified version)
-# ============================================================================
-
-# This function updates the penalty parameter (sigma) based on the current state of the algorithm.
-function update_sigma_gpu!(params::HPRQP_parameters,
-    restart_info::HPRQP_restart,
-    ws::HPRQP_workspace_gpu,
-    qp::QP_info_gpu,
-    residuals::HPRQP_residuals,
-)
-    # Call unified implementation
-    update_sigma!(params, restart_info, ws, qp, residuals)
 end
 
 # This function checks whether a restart is needed based on the current state of the algorithm.
@@ -972,20 +958,6 @@ function main_update_cpu!(ws::HPRQP_workspace_cpu, qp::QP_info_cpu, restart_info
 end
 
 # ============================================================================
-# CPU Sigma Update
-# ============================================================================
-
-function update_sigma_cpu!(params::HPRQP_parameters,
-    restart_info::HPRQP_restart,
-    ws::HPRQP_workspace_cpu,
-    qp::QP_info_cpu,
-    residuals::HPRQP_residuals,
-)
-    # Call unified implementation
-    update_sigma!(params, restart_info, ws, qp, residuals)
-end
-
-# ============================================================================
 # CPU Collect Results  
 # ============================================================================
 
@@ -1358,6 +1330,7 @@ function print_solver_params(params::HPRQP_parameters, qp::Union{QP_info_gpu,QP_
         println("  SpMV mode A: ", spmv_mode_A, params.spmv_mode_A == "auto" ? " (auto-detected)" : "")
     end
     println("  Scaling options:")
+    println("    Curtis-Reid scaling: ", params.use_CR_scaling ? "Enabled" : "Disabled")
     println("    Ruiz scaling: ", params.use_Ruiz_scaling ? "Enabled" : "Disabled")
     println("    Pock-Chambolle scaling: ", params.use_Pock_Chambolle_scaling ? "Enabled" : "Disabled")
     println("    b/c scaling: ", params.use_bc_scaling ? "Enabled" : "Disabled")

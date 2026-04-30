@@ -218,6 +218,8 @@ mutable struct HPRQP_parameters
             Frequency (in iterations) for printing progress or logging information.
         device_number::Int32
             Identifier for the computational device (e.g., GPU device number 0 1 2 3).
+        use_CR_scaling::Bool
+            If true, applies Curtis-Reid scaling before other matrix scaling passes.
         use_Ruiz_scaling::Bool
             If true, applies Ruiz scaling to the problem data.
         use_bc_scaling::Bool
@@ -254,6 +256,7 @@ mutable struct HPRQP_parameters
     print_frequency::Int
     device_number::Int32
     # scaling
+    use_CR_scaling::Bool
     use_Ruiz_scaling::Bool
     use_bc_scaling::Bool
     use_l2_scaling::Bool
@@ -271,7 +274,7 @@ mutable struct HPRQP_parameters
     verbose::Bool
     # use GPU or CPU
     use_gpu::Bool
-    HPRQP_parameters() = new(1e-6, -1, typemax(Int32), false, 3600.0, 1.05, 100, false, "auto", "auto", -1, 0, true, false, false, true, "QP", 0.0, nothing, nothing, false, "hprqp_autosave.h5", true, true)
+    HPRQP_parameters() = new(1e-6, -1, typemax(Int32), false, 3600.0, 1.05, 100, false, "auto", "auto", -1, 0, true, true, false, false, true, "QP", 0.0, nothing, nothing, false, "hprqp_autosave.h5", true, true)
 end
 
 # This struct stores the residuals and other metrics during the HPR-QP algorithm.
