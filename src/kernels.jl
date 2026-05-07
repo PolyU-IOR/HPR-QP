@@ -1910,39 +1910,14 @@ function compute_col_sum_abs_with_Q_kernel!(A_rowPtr::CuDeviceVector{Int32},
     return
 end
 
-function curtis_reid_count_rows_cols_kernel!(Q_rowPtr::CuDeviceVector{Int32},
-    Q_colVal::CuDeviceVector{Int32},
-    A_rowPtr::CuDeviceVector{Int32},
-    A_colVal::CuDeviceVector{Int32},
-    AT_rowPtr::CuDeviceVector{Int32},
-    AT_colVal::CuDeviceVector{Int32},
-    row_count::CuDeviceVector{Int32},
+function curtis_reid_count_col_norm_kernel!(AT_rowPtr::CuDeviceVector{Int32},
     col_count::CuDeviceVector{Int32},
-    n::Int,
-    m::Int)
+    n::Int)
     i = threadIdx().x + (blockDim().x * (blockIdx().x - 1))
-    total_dim = n + m
-    if i <= total_dim
+    if i <= n
         @inbounds begin
-            local_count = Int32(0)
-            if i <= n
-                for k in Q_rowPtr[i]:(Q_rowPtr[i+1]-1)
-                    local_count += Int32(1)
-                    CUDA.@atomic col_count[Q_colVal[k]] += Int32(1)
-                end
-                for k in AT_rowPtr[i]:(AT_rowPtr[i+1]-1)
-                    local_count += Int32(1)
-                    constraint_idx = n + AT_colVal[k]
-                    CUDA.@atomic col_count[constraint_idx] += Int32(1)
-                end
-            else
-                row_idx = i - n
-                for k in A_rowPtr[row_idx]:(A_rowPtr[row_idx+1]-1)
-                    local_count += Int32(1)
-                    CUDA.@atomic col_count[A_colVal[k]] += Int32(1)
-                end
-            end
-            row_count[i] = max(local_count, Int32(1))
+            count = AT_rowPtr[i+1] - AT_rowPtr[i]
+            col_count[i] = max(count, Int32(1))
         end
     end
     return
@@ -1960,37 +1935,31 @@ function curtis_reid_fix_zero_counts_kernel!(count::CuDeviceVector{Int32}, n::In
     return
 end
 
-function curtis_reid_row_sum_kernel!(Q_rowPtr::CuDeviceVector{Int32},
-    Q_colVal::CuDeviceVector{Int32},
-    Q_nzVal::CuDeviceVector{Float64},
-    A_rowPtr::CuDeviceVector{Int32},
-    A_colVal::CuDeviceVector{Int32},
-    A_nzVal::CuDeviceVector{Float64},
-    AT_rowPtr::CuDeviceVector{Int32},
-    AT_colVal::CuDeviceVector{Int32},
-    AT_nzVal::CuDeviceVector{Float64},
-    col_log_scale::CuDeviceVector{Float64},
-    row_sum::CuDeviceVector{Float64},
-    n::Int,
+function curtis_reid_count_row_norm_kernel!(A_rowPtr::CuDeviceVector{Int32},
+    row_count::CuDeviceVector{Int32},
     m::Int)
     i = threadIdx().x + (blockDim().x * (blockIdx().x - 1))
-    total_dim = n + m
-    if i <= total_dim
+    if i <= m
+        @inbounds begin
+            count = A_rowPtr[i+1] - A_rowPtr[i]
+            row_count[i] = max(count, Int32(1))
+        end
+    end
+    return
+end
+
+function curtis_reid_row_norm_sum_kernel!(A_rowPtr::CuDeviceVector{Int32},
+    A_colVal::CuDeviceVector{Int32},
+    A_nzVal::CuDeviceVector{Float64},
+    col_log_scale::CuDeviceVector{Float64},
+    row_sum::CuDeviceVector{Float64},
+    m::Int)
+    i = threadIdx().x + (blockDim().x * (blockIdx().x - 1))
+    if i <= m
         @inbounds begin
             sum_val = 0.0
-            if i <= n
-                for k in Q_rowPtr[i]:(Q_rowPtr[i+1]-1)
-                    sum_val += -log(max(abs(Q_nzVal[k]), 1e-300)) - col_log_scale[Q_colVal[k]]
-                end
-                for k in AT_rowPtr[i]:(AT_rowPtr[i+1]-1)
-                    constraint_idx = n + AT_colVal[k]
-                    sum_val += -log(max(abs(AT_nzVal[k]), 1e-300)) - col_log_scale[constraint_idx]
-                end
-            else
-                row_idx = i - n
-                for k in A_rowPtr[row_idx]:(A_rowPtr[row_idx+1]-1)
-                    sum_val += -log(max(abs(A_nzVal[k]), 1e-300)) - col_log_scale[A_colVal[k]]
-                end
+            for k in A_rowPtr[i]:(A_rowPtr[i+1]-1)
+                sum_val += -log(max(abs(A_nzVal[k]), 1e-300)) - col_log_scale[A_colVal[k]]
             end
             row_sum[i] = sum_val
         end
@@ -1998,37 +1967,20 @@ function curtis_reid_row_sum_kernel!(Q_rowPtr::CuDeviceVector{Int32},
     return
 end
 
-function curtis_reid_col_sum_kernel!(Q_rowPtr::CuDeviceVector{Int32},
-    Q_colVal::CuDeviceVector{Int32},
-    Q_nzVal::CuDeviceVector{Float64},
-    A_rowPtr::CuDeviceVector{Int32},
-    A_colVal::CuDeviceVector{Int32},
-    A_nzVal::CuDeviceVector{Float64},
-    AT_rowPtr::CuDeviceVector{Int32},
+function curtis_reid_col_norm_sum_kernel!(AT_rowPtr::CuDeviceVector{Int32},
     AT_colVal::CuDeviceVector{Int32},
     AT_nzVal::CuDeviceVector{Float64},
     row_log_scale::CuDeviceVector{Float64},
     col_sum::CuDeviceVector{Float64},
-    n::Int,
-    m::Int)
+    n::Int)
     i = threadIdx().x + (blockDim().x * (blockIdx().x - 1))
-    total_dim = n + m
-    if i <= total_dim
+    if i <= n
         @inbounds begin
-            if i <= n
-                for k in Q_rowPtr[i]:(Q_rowPtr[i+1]-1)
-                    CUDA.@atomic col_sum[Q_colVal[k]] += -log(max(abs(Q_nzVal[k]), 1e-300)) - row_log_scale[i]
-                end
-                for k in AT_rowPtr[i]:(AT_rowPtr[i+1]-1)
-                    constraint_idx = n + AT_colVal[k]
-                    CUDA.@atomic col_sum[constraint_idx] += -log(max(abs(AT_nzVal[k]), 1e-300)) - row_log_scale[i]
-                end
-            else
-                row_idx = i - n
-                for k in A_rowPtr[row_idx]:(A_rowPtr[row_idx+1]-1)
-                    CUDA.@atomic col_sum[A_colVal[k]] += -log(max(abs(A_nzVal[k]), 1e-300)) - row_log_scale[i]
-                end
+            sum_val = 0.0
+            for k in AT_rowPtr[i]:(AT_rowPtr[i+1]-1)
+                sum_val += -log(max(abs(AT_nzVal[k]), 1e-300)) - row_log_scale[AT_colVal[k]]
             end
+            col_sum[i] = sum_val
         end
     end
     return
@@ -2045,23 +1997,15 @@ function curtis_reid_update_log_scale_kernel!(log_scale::CuDeviceVector{Float64}
     return
 end
 
-function curtis_reid_build_norms_kernel!(row_log_scale::CuDeviceVector{Float64},
-    col_log_scale::CuDeviceVector{Float64},
-    row_norm::CuDeviceVector{Float64},
-    col_norm::CuDeviceVector{Float64},
-    n::Int,
-    m::Int)
+function curtis_reid_build_inverse_norm_kernel!(log_scale::CuDeviceVector{Float64},
+    norm::CuDeviceVector{Float64},
+    n::Int)
     i = threadIdx().x + (blockDim().x * (blockIdx().x - 1))
-    total_dim = n + m
-    if i <= total_dim
+    if i <= n
         @inbounds begin
-            scale = exp(0.5 * (row_log_scale[i] + col_log_scale[i]))
+            scale = exp(log_scale[i])
             scale = min(max(scale, 1e-30), 1e30)
-            if i <= n
-                col_norm[i] = 1.0 / scale
-            else
-                row_norm[i-n] = 1.0 / scale
-            end
+            norm[i] = 1.0 / scale
         end
     end
     return

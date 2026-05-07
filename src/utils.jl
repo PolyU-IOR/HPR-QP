@@ -324,78 +324,59 @@ end
 
 function _compute_curtis_reid_norms(Q::SparseMatrixCSC, A::SparseMatrixCSC, niters::Int)
     m, n = size(A)
-    total_dim = n + m
-    if total_dim == 0
+    if n + m == 0
         return Float64[], Float64[]
     end
 
-    q_rows = rowvals(Q)
-    q_vals = nonzeros(Q)
     a_rows = rowvals(A)
     a_vals = nonzeros(A)
-    q_logvals = log.(max.(abs.(q_vals), 1e-300))
     a_logvals = log.(max.(abs.(a_vals), 1e-300))
-    nz = length(q_vals) + 2 * length(a_vals)
-    if nz == 0
+    if length(a_vals) == 0
         return ones(Float64, m), ones(Float64, n)
     end
 
-    row_count = zeros(Int, total_dim)
-    col_count = zeros(Int, total_dim)
+    row_count = zeros(Float64, m)
+    col_count = zeros(Float64, n)
     for j in 1:n
-        for k in Q.colptr[j]:(Q.colptr[j+1]-1)
-            row_count[q_rows[k]] += 1
-            col_count[j] += 1
-        end
         for k in A.colptr[j]:(A.colptr[j+1]-1)
-            constraint_idx = n + a_rows[k]
-            row_count[constraint_idx] += 1
-            col_count[j] += 1
-            row_count[j] += 1
-            col_count[constraint_idx] += 1
+            row = a_rows[k]
+            row_count[row] += 1.0
+            col_count[j] += 1.0
         end
     end
     row_count[row_count.==0] .= 1
     col_count[col_count.==0] .= 1
 
-    row_log_scale = zeros(Float64, total_dim)
-    col_log_scale = zeros(Float64, total_dim)
-    row_sum = zeros(Float64, total_dim)
-    col_sum = zeros(Float64, total_dim)
+    row_log_scale = zeros(Float64, m)
+    col_log_scale = zeros(Float64, n)
+    row_sum = zeros(Float64, m)
+    col_sum = zeros(Float64, n)
 
     for _ in 1:niters
         fill!(row_sum, 0.0)
         for j in 1:n
-            for k in Q.colptr[j]:(Q.colptr[j+1]-1)
-                row_sum[q_rows[k]] += -q_logvals[k] - col_log_scale[j]
-            end
             for k in A.colptr[j]:(A.colptr[j+1]-1)
-                constraint_idx = n + a_rows[k]
-                row_sum[constraint_idx] += -a_logvals[k] - col_log_scale[j]
-                row_sum[j] += -a_logvals[k] - col_log_scale[constraint_idx]
+                row = a_rows[k]
+                row_sum[row] += -a_logvals[k] - col_log_scale[j]
             end
         end
         row_log_scale .= row_sum ./ row_count
 
         fill!(col_sum, 0.0)
         for j in 1:n
-            for k in Q.colptr[j]:(Q.colptr[j+1]-1)
-                col_sum[j] += -q_logvals[k] - row_log_scale[q_rows[k]]
-            end
             for k in A.colptr[j]:(A.colptr[j+1]-1)
-                constraint_idx = n + a_rows[k]
-                col_sum[j] += -a_logvals[k] - row_log_scale[constraint_idx]
-                col_sum[constraint_idx] += -a_logvals[k] - row_log_scale[j]
+                row = a_rows[k]
+                col_sum[j] += -a_logvals[k] - row_log_scale[row]
             end
         end
         col_log_scale .= col_sum ./ col_count
     end
 
-    curtis_reid_scale = exp.(0.5 .* (row_log_scale .+ col_log_scale))
-    clamp!(curtis_reid_scale, 1e-30, 1e30)
+    row_scale = clamp.(exp.(row_log_scale), 1e-30, 1e30)
+    col_scale = clamp.(exp.(col_log_scale), 1e-30, 1e30)
 
-    col_norm = 1.0 ./ curtis_reid_scale[1:n]
-    row_norm = 1.0 ./ curtis_reid_scale[(n+1):total_dim]
+    row_norm = 1.0 ./ row_scale
+    col_norm = 1.0 ./ col_scale
     return row_norm, col_norm
 end
 
@@ -405,65 +386,82 @@ end
 
 function _compute_curtis_reid_norms(qp::QP_info_gpu, niters::Int)
     m, n = size(qp.A)
-    total_dim = n + m
-    if total_dim == 0
+    if n + m == 0
         return CuVector{Float64}(undef, 0), CuVector{Float64}(undef, 0)
     end
-    if length(qp.Q.nzVal) + 2 * length(qp.A.nzVal) == 0
+    if length(qp.A.nzVal) == 0
         return CUDA.ones(Float64, m), CUDA.ones(Float64, n)
     end
 
-    row_count = CUDA.zeros(Int32, total_dim)
-    col_count = CUDA.zeros(Int32, total_dim)
-    row_log_scale = CUDA.zeros(Float64, total_dim)
-    col_log_scale = CUDA.zeros(Float64, total_dim)
-    row_sum = CUDA.zeros(Float64, total_dim)
-    col_sum = CUDA.zeros(Float64, total_dim)
+    row_count = CUDA.zeros(Int32, m)
+    col_count = CUDA.zeros(Int32, n)
+    row_log_scale = CUDA.zeros(Float64, m)
+    col_log_scale = CUDA.zeros(Float64, n)
+    row_sum = CUDA.zeros(Float64, m)
+    col_sum = CUDA.zeros(Float64, n)
     row_norm = CUDA.ones(Float64, m)
     col_norm = CUDA.ones(Float64, n)
 
     threads = 256
-    blocks_total = ceil(Int, total_dim / threads)
-    @cuda threads = threads blocks = blocks_total curtis_reid_count_rows_cols_kernel!(
-        qp.Q.rowPtr, qp.Q.colVal, qp.A.rowPtr, qp.A.colVal, qp.AT.rowPtr, qp.AT.colVal,
-        row_count, col_count, n, m
-    )
-    CUDA.synchronize()
-    @cuda threads = threads blocks = blocks_total curtis_reid_fix_zero_counts_kernel!(col_count, total_dim)
-    CUDA.synchronize()
-
-    for _ in 1:niters
-        fill!(row_sum, 0.0)
-        @cuda threads = threads blocks = blocks_total curtis_reid_row_sum_kernel!(
-            qp.Q.rowPtr, qp.Q.colVal, qp.Q.nzVal,
-            qp.A.rowPtr, qp.A.colVal, qp.A.nzVal,
-            qp.AT.rowPtr, qp.AT.colVal, qp.AT.nzVal,
-            col_log_scale, row_sum, n, m
+    if m > 0
+        blocks_m = ceil(Int, m / threads)
+        @cuda threads = threads blocks = blocks_m curtis_reid_count_row_norm_kernel!(
+            qp.A.rowPtr, row_count, m
         )
         CUDA.synchronize()
-        @cuda threads = threads blocks = blocks_total curtis_reid_update_log_scale_kernel!(
-            row_log_scale, row_sum, row_count, total_dim
-        )
-        CUDA.synchronize()
-
-        fill!(col_sum, 0.0)
-        @cuda threads = threads blocks = blocks_total curtis_reid_col_sum_kernel!(
-            qp.Q.rowPtr, qp.Q.colVal, qp.Q.nzVal,
-            qp.A.rowPtr, qp.A.colVal, qp.A.nzVal,
-            qp.AT.rowPtr, qp.AT.colVal, qp.AT.nzVal,
-            row_log_scale, col_sum, n, m
-        )
-        CUDA.synchronize()
-        @cuda threads = threads blocks = blocks_total curtis_reid_update_log_scale_kernel!(
-            col_log_scale, col_sum, col_count, total_dim
+    end
+    if n > 0
+        blocks_n = ceil(Int, n / threads)
+        @cuda threads = threads blocks = blocks_n curtis_reid_count_col_norm_kernel!(
+            qp.AT.rowPtr, col_count, n
         )
         CUDA.synchronize()
     end
 
-    @cuda threads = threads blocks = blocks_total curtis_reid_build_norms_kernel!(
-        row_log_scale, col_log_scale, row_norm, col_norm, n, m
-    )
-    CUDA.synchronize()
+    for _ in 1:niters
+        fill!(row_sum, 0.0)
+        if m > 0
+            blocks_m = ceil(Int, m / threads)
+            @cuda threads = threads blocks = blocks_m curtis_reid_row_norm_sum_kernel!(
+                qp.A.rowPtr, qp.A.colVal, qp.A.nzVal,
+                col_log_scale, row_sum, m
+            )
+            CUDA.synchronize()
+            @cuda threads = threads blocks = blocks_m curtis_reid_update_log_scale_kernel!(
+                row_log_scale, row_sum, row_count, m
+            )
+            CUDA.synchronize()
+        end
+
+        fill!(col_sum, 0.0)
+        if n > 0
+            blocks_n = ceil(Int, n / threads)
+            @cuda threads = threads blocks = blocks_n curtis_reid_col_norm_sum_kernel!(
+                qp.AT.rowPtr, qp.AT.colVal, qp.AT.nzVal,
+                row_log_scale, col_sum, n
+            )
+            CUDA.synchronize()
+            @cuda threads = threads blocks = blocks_n curtis_reid_update_log_scale_kernel!(
+                col_log_scale, col_sum, col_count, n
+            )
+            CUDA.synchronize()
+        end
+    end
+
+    if m > 0
+        blocks_m = ceil(Int, m / threads)
+        @cuda threads = threads blocks = blocks_m curtis_reid_build_inverse_norm_kernel!(
+            row_log_scale, row_norm, m
+        )
+        CUDA.synchronize()
+    end
+    if n > 0
+        blocks_n = ceil(Int, n / threads)
+        @cuda threads = threads blocks = blocks_n curtis_reid_build_inverse_norm_kernel!(
+            col_log_scale, col_norm, n
+        )
+        CUDA.synchronize()
+    end
 
     return row_norm, col_norm
 end
