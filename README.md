@@ -15,6 +15,9 @@ For the C implementation on GPUs (recommended for benchmarking), please visit th
 
 [https://github.com/PolyU-IOR/HPR-QP-C](https://github.com/PolyU-IOR/HPR-QP-C)
 
+For the Julia implementation on CPUs and GPUs (recommended for development/research), please visit the following repository:
+
+[https://github.com/PolyU-IOR/HPR-QP](https://github.com/PolyU-IOR/HPR-QP)
 
 
 ## 🎉 What's New in v0.1.1
