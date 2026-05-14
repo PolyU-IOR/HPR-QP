@@ -9,6 +9,14 @@
 
 ---
 
+## Available HPR-QP Implementations
+
+For the C implementation on GPUs (recommended for benchmarking), please visit the following repository:
+
+[https://github.com/PolyU-IOR/HPR-QP-C](https://github.com/PolyU-IOR/HPR-QP-C)
+
+
+
 ## 🎉 What's New in v0.1.1
 
 This version represents a major architectural overhaul with significant improvements:
