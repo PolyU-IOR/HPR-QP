@@ -1,0 +1,166 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8"/><meta name="viewport" content="width=device-width, initial-scale=1.0"/><title>Sparse Matrix QP · HPRQP.jl</title><meta name="title" content="Sparse Matrix QP · HPRQP.jl"/><meta property="og:title" content="Sparse Matrix QP · HPRQP.jl"/><meta property="twitter:title" content="Sparse Matrix QP · HPRQP.jl"/><meta name="description" content="Documentation for HPRQP.jl."/><meta property="og:description" content="Documentation for HPRQP.jl."/><meta property="twitter:description" content="Documentation for HPRQP.jl."/><meta property="og:url" content="https://PolyU-IOR.github.io/HPR-QP/guide/sparse_matrix_qp/"/><meta property="twitter:url" content="https://PolyU-IOR.github.io/HPR-QP/guide/sparse_matrix_qp/"/><link rel="canonical" href="https://PolyU-IOR.github.io/HPR-QP/guide/sparse_matrix_qp/"/><script data-outdated-warner src="../../assets/warner.js"></script><link href="https://cdnjs.cloudflare.com/ajax/libs/lato-font/3.0.0/css/lato-font.min.css" rel="stylesheet" type="text/css"/><link href="https://cdnjs.cloudflare.com/ajax/libs/juliamono/0.050/juliamono.min.css" rel="stylesheet" type="text/css"/><link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.2/css/fontawesome.min.css" rel="stylesheet" type="text/css"/><link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.2/css/solid.min.css" rel="stylesheet" type="text/css"/><link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.2/css/brands.min.css" rel="stylesheet" type="text/css"/><link href="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.8/katex.min.css" rel="stylesheet" type="text/css"/><script>documenterBaseURL="../.."</script><script src="https://cdnjs.cloudflare.com/ajax/libs/require.js/2.3.6/require.min.js" data-main="../../assets/documenter.js"></script><script src="../../search_index.js"></script><script src="../../siteinfo.js"></script><script src="../../../versions.js"></script><link class="docs-theme-link" rel="stylesheet" type="text/css" href="../../assets/themes/catppuccin-mocha.css" data-theme-name="catppuccin-mocha"/><link class="docs-theme-link" rel="stylesheet" type="text/css" href="../../assets/themes/catppuccin-macchiato.css" data-theme-name="catppuccin-macchiato"/><link class="docs-theme-link" rel="stylesheet" type="text/css" href="../../assets/themes/catppuccin-frappe.css" data-theme-name="catppuccin-frappe"/><link class="docs-theme-link" rel="stylesheet" type="text/css" href="../../assets/themes/catppuccin-latte.css" data-theme-name="catppuccin-latte"/><link class="docs-theme-link" rel="stylesheet" type="text/css" href="../../assets/themes/documenter-dark.css" data-theme-name="documenter-dark" data-theme-primary-dark/><link class="docs-theme-link" rel="stylesheet" type="text/css" href="../../assets/themes/documenter-light.css" data-theme-name="documenter-light" data-theme-primary/><script src="../../assets/themeswap.js"></script></head><body><div id="documenter"><nav class="docs-sidebar"><div class="docs-package-name"><span class="docs-autofit"><a href="../../">HPRQP.jl</a></span></div><button class="docs-search-query input is-rounded is-small is-clickable my-2 mx-auto py-1 px-2" id="documenter-search-query">Search docs (Ctrl + /)</button><ul class="docs-menu"><li><a class="tocitem" href="../../">Home</a></li><li><a class="tocitem" href="../../getting_started/">Getting Started</a></li><li><span class="tocitem">User Guide</span><ul><li><input class="collapse-toggle" id="menuitem-3-1" type="checkbox"/><label class="tocitem" for="menuitem-3-1"><span class="docs-label">Input Methods</span><i class="docs-chevron"></i></label><ul class="collapsed"><li><a class="tocitem" href="../input_overview/">Overview</a></li><li><a class="tocitem" href="../direct_api/">Direct API</a></li><li><a class="tocitem" href="../jump_integration/">JuMP Integration</a></li><li><a class="tocitem" href="../mps_files/">MPS Files</a></li></ul></li><li><input class="collapse-toggle" id="menuitem-3-2" type="checkbox" checked/><label class="tocitem" for="menuitem-3-2"><span class="docs-label">Q Operators</span><i class="docs-chevron"></i></label><ul class="collapsed"><li><a class="tocitem" href="../q_operators_overview/">Overview</a></li><li class="is-active"><a class="tocitem" href>Sparse Matrix QP</a><ul class="internal"><li><a class="tocitem" href="#When-to-Use"><span>When to Use</span></a></li><li><a class="tocitem" href="#Basic-Usage"><span>Basic Usage</span></a></li><li><a class="tocitem" href="#Creating-Sparse-Q-Matrices"><span>Creating Sparse Q Matrices</span></a></li><li><a class="tocitem" href="#Ensuring-Positive-Semidefiniteness"><span>Ensuring Positive Semidefiniteness</span></a></li><li><a class="tocitem" href="#Performance-Considerations"><span>Performance Considerations</span></a></li><li><a class="tocitem" href="#Common-Patterns"><span>Common Patterns</span></a></li><li><a class="tocitem" href="#Troubleshooting"><span>Troubleshooting</span></a></li><li><a class="tocitem" href="#See-Also"><span>See Also</span></a></li></ul></li><li><a class="tocitem" href="../lasso_problems/">LASSO Problems</a></li><li><a class="tocitem" href="../qap_problems/">QAP Problems</a></li></ul></li><li><a class="tocitem" href="../parameters/">Parameters</a></li><li><a class="tocitem" href="../output_results/">Output &amp; Results</a></li></ul></li><li><a class="tocitem" href="../../api/">API Reference</a></li><li><a class="tocitem" href="../../examples/">Examples</a></li></ul><div class="docs-version-selector field has-addons"><div class="control"><span class="docs-label button is-static is-size-7">Version</span></div><div class="docs-selector control is-expanded"><div class="select is-fullwidth is-size-7"><select id="documenter-version-selector"></select></div></div></div></nav><div class="docs-main"><header class="docs-navbar"><a class="docs-sidebar-button docs-navbar-link fa-solid fa-bars is-hidden-desktop" id="documenter-sidebar-button" href="#"></a><nav class="breadcrumb"><ul class="is-hidden-mobile"><li><a class="is-disabled">User Guide</a></li><li><a class="is-disabled">Q Operators</a></li><li class="is-active"><a href>Sparse Matrix QP</a></li></ul><ul class="is-hidden-tablet"><li class="is-active"><a href>Sparse Matrix QP</a></li></ul></nav><div class="docs-right"><a class="docs-navbar-link" href="https://github.com/PolyU-IOR/HPR-QP" title="View the repository on GitHub"><span class="docs-icon fa-brands"></span><span class="docs-label is-hidden-touch">GitHub</span></a><a class="docs-navbar-link" href="https://github.com/PolyU-IOR/HPR-QP/blob/main/docs/src/guide/sparse_matrix_qp.md" title="Edit source on GitHub"><span class="docs-icon fa-solid"></span></a><a class="docs-settings-button docs-navbar-link fa-solid fa-gear" id="documenter-settings-button" href="#" title="Settings"></a><a class="docs-article-toggle-button fa-solid fa-chevron-up" id="documenter-article-toggle-button" href="javascript:;" title="Collapse all docstrings"></a></div></header><article class="content" id="documenter-page"><h1 id="Sparse-Matrix-QP"><a class="docs-heading-anchor" href="#Sparse-Matrix-QP">Sparse Matrix QP</a><a id="Sparse-Matrix-QP-1"></a><a class="docs-heading-anchor-permalink" href="#Sparse-Matrix-QP" title="Permalink"></a></h1><p>The sparse matrix Q operator is the default and most general way to represent quadratic objectives in HPRQP. It&#39;s suitable for any sparse positive semidefinite matrix.</p><h2 id="When-to-Use"><a class="docs-heading-anchor" href="#When-to-Use">When to Use</a><a id="When-to-Use-1"></a><a class="docs-heading-anchor-permalink" href="#When-to-Use" title="Permalink"></a></h2><p>Use the sparse matrix operator when:</p><ul><li>You have a general quadratic programming problem</li><li>Your Q matrix is sparse (not dense)</li><li>You don&#39;t have special structure (LASSO, QAP, etc.)</li><li>You want the simplest, most straightforward approach</li></ul><h2 id="Basic-Usage"><a class="docs-heading-anchor" href="#Basic-Usage">Basic Usage</a><a id="Basic-Usage-1"></a><a class="docs-heading-anchor-permalink" href="#Basic-Usage" title="Permalink"></a></h2><pre><code class="language-julia hljs">using HPRQP
+using SparseArrays
+
+# Define a sparse positive semidefinite matrix
+Q = sparse([
+    2.0  0.5  0.0  0.0;
+    0.5  2.0  0.5  0.0;
+    0.0  0.5  2.0  0.5;
+    0.0  0.0  0.5  2.0
+])
+
+# Linear term
+c = [1.0, 2.0, 3.0, 4.0]
+
+# Constraints (simple box constraints for this example)
+A = sparse(zeros(0, 4))
+AL = Float64[]
+AU = Float64[]
+l = zeros(4)
+u = fill(10.0, 4)
+
+# Build and solve
+model = build_from_QAbc(Q, A, c, AL, AU, l, u)
+
+params = HPRQP_parameters()
+result = optimize(model, params)</code></pre><h2 id="Creating-Sparse-Q-Matrices"><a class="docs-heading-anchor" href="#Creating-Sparse-Q-Matrices">Creating Sparse Q Matrices</a><a id="Creating-Sparse-Q-Matrices-1"></a><a class="docs-heading-anchor-permalink" href="#Creating-Sparse-Q-Matrices" title="Permalink"></a></h2><h3 id="From-Dense-Matrices"><a class="docs-heading-anchor" href="#From-Dense-Matrices">From Dense Matrices</a><a id="From-Dense-Matrices-1"></a><a class="docs-heading-anchor-permalink" href="#From-Dense-Matrices" title="Permalink"></a></h3><pre><code class="language-julia hljs">using SparseArrays
+
+# Convert dense to sparse
+Q_dense = [2.0 0.5; 0.5 2.0]
+Q_sparse = sparse(Q_dense)
+
+# HPRQP will also convert automatically
+model = build_from_QAbc(Q_dense, A, c, AL, AU, l, u)  # Works but issues warning</code></pre><h3 id="Building-Sparse-Matrices-Directly"><a class="docs-heading-anchor" href="#Building-Sparse-Matrices-Directly">Building Sparse Matrices Directly</a><a id="Building-Sparse-Matrices-Directly-1"></a><a class="docs-heading-anchor-permalink" href="#Building-Sparse-Matrices-Directly" title="Permalink"></a></h3><pre><code class="language-julia hljs">using SparseArrays
+
+n = 100
+
+# Tridiagonal matrix
+main_diag = fill(2.0, n)
+off_diag = fill(0.5, n-1)
+Q = spdiagm(0 =&gt; main_diag, 1 =&gt; off_diag, -1 =&gt; off_diag)
+
+# Random sparse matrix (make it positive semidefinite)
+H = sprandn(n, n, 0.1)  # 10% density
+Q = H&#39; * H  # Q = H&#39;H is positive semidefinite</code></pre><h3 id="Block-Diagonal-Structure"><a class="docs-heading-anchor" href="#Block-Diagonal-Structure">Block Diagonal Structure</a><a id="Block-Diagonal-Structure-1"></a><a class="docs-heading-anchor-permalink" href="#Block-Diagonal-Structure" title="Permalink"></a></h3><pre><code class="language-julia hljs">using SparseArrays
+using LinearAlgebra
+
+# Create block diagonal Q
+n_blocks = 10
+block_size = 5
+
+blocks = [spdiagm(0 =&gt; rand(block_size)) for _ in 1:n_blocks]
+Q = blockdiag(blocks...)</code></pre><h2 id="Ensuring-Positive-Semidefiniteness"><a class="docs-heading-anchor" href="#Ensuring-Positive-Semidefiniteness">Ensuring Positive Semidefiniteness</a><a id="Ensuring-Positive-Semidefiniteness-1"></a><a class="docs-heading-anchor-permalink" href="#Ensuring-Positive-Semidefiniteness" title="Permalink"></a></h2><p>Q must be positive semidefinite for convex QP. Here are ways to ensure this:</p><h3 id="Method-1:-Form-Q-H&#39;H"><a class="docs-heading-anchor" href="#Method-1:-Form-Q-H&#39;H">Method 1: Form Q = H&#39;H</a><a id="Method-1:-Form-Q-H&#39;H-1"></a><a class="docs-heading-anchor-permalink" href="#Method-1:-Form-Q-H&#39;H" title="Permalink"></a></h3><pre><code class="language-julia hljs">H = sprandn(n, n, 0.1)
+Q = H&#39; * H  # Always positive semidefinite</code></pre><h3 id="Method-2:-Add-Regularization"><a class="docs-heading-anchor" href="#Method-2:-Add-Regularization">Method 2: Add Regularization</a><a id="Method-2:-Add-Regularization-1"></a><a class="docs-heading-anchor-permalink" href="#Method-2:-Add-Regularization" title="Permalink"></a></h3><pre><code class="language-julia hljs">Q_indefinite = ... # Some matrix
+λ = 1e-6
+Q = Q_indefinite + λ * I  # Make positive definite</code></pre><h3 id="Method-3:-Symmetric-Part-of-A&#39;A"><a class="docs-heading-anchor" href="#Method-3:-Symmetric-Part-of-A&#39;A">Method 3: Symmetric Part of A&#39;A</a><a id="Method-3:-Symmetric-Part-of-A&#39;A-1"></a><a class="docs-heading-anchor-permalink" href="#Method-3:-Symmetric-Part-of-A&#39;A" title="Permalink"></a></h3><pre><code class="language-julia hljs">A = randn(m, n)
+Q = sparse((A&#39; * A + (A&#39; * A)&#39;) / 2)  # Ensure symmetry</code></pre><h2 id="Performance-Considerations"><a class="docs-heading-anchor" href="#Performance-Considerations">Performance Considerations</a><a id="Performance-Considerations-1"></a><a class="docs-heading-anchor-permalink" href="#Performance-Considerations" title="Permalink"></a></h2><h3 id="Sparsity-Pattern"><a class="docs-heading-anchor" href="#Sparsity-Pattern">Sparsity Pattern</a><a id="Sparsity-Pattern-1"></a><a class="docs-heading-anchor-permalink" href="#Sparsity-Pattern" title="Permalink"></a></h3><p>The performance depends heavily on sparsity:</p><pre><code class="language-julia hljs">using SparseArrays
+
+n = 1000
+
+# Diagonal (very sparse)
+Q_diag = spdiagm(0 =&gt; rand(n))
+println(&quot;Diagonal nnz: &quot;, nnz(Q_diag))  # 1000
+
+# Tridiagonal  
+Q_tri = spdiagm(0 =&gt; rand(n), 1 =&gt; rand(n-1), -1 =&gt; rand(n-1))
+println(&quot;Tridiagonal nnz: &quot;, nnz(Q_tri))  # ~3000
+
+# Banded
+bandwidth = 10
+Q_band = spdiagm([k =&gt; rand(n - abs(k)) for k in -bandwidth:bandwidth]...)
+println(&quot;Banded nnz: &quot;, nnz(Q_band))  # ~20,000
+
+# Random sparse
+density = 0.01
+H = sprandn(n, n, density)
+Q_random = H&#39; * H
+println(&quot;Random nnz: &quot;, nnz(Q_random))  # ~100,000</code></pre><h3 id="Dense-vs-Sparse-Threshold"><a class="docs-heading-anchor" href="#Dense-vs-Sparse-Threshold">Dense vs Sparse Threshold</a><a id="Dense-vs-Sparse-Threshold-1"></a><a class="docs-heading-anchor-permalink" href="#Dense-vs-Sparse-Threshold" title="Permalink"></a></h3><p>As a rule of thumb:</p><ul><li><strong>Sparse</strong> (&lt; 10% density): Use sparse matrix operator</li><li><strong>Dense</strong> (&gt; 50% density): Consider if problem can be reformulated</li><li><strong>Medium</strong> (10-50% density): Test both, sparse usually better</li></ul><pre><code class="language-julia hljs">using SparseArrays
+
+n = 1000
+density = 0.05  # 5% density
+
+H = sprandn(n, n, density)
+Q = H&#39; * H
+
+println(&quot;Matrix size: &quot;, n, &quot;×&quot;, n)
+println(&quot;Density: &quot;, nnz(Q) / (n^2) * 100, &quot;%&quot;)
+println(&quot;Memory (sparse): &quot;, Base.summarysize(Q) / 1e6, &quot; MB&quot;)
+println(&quot;Memory (dense): &quot;, 8 * n^2 / 1e6, &quot; MB&quot;)</code></pre><h2 id="Common-Patterns"><a class="docs-heading-anchor" href="#Common-Patterns">Common Patterns</a><a id="Common-Patterns-1"></a><a class="docs-heading-anchor-permalink" href="#Common-Patterns" title="Permalink"></a></h2><h3 id="Portfolio-Optimization"><a class="docs-heading-anchor" href="#Portfolio-Optimization">Portfolio Optimization</a><a id="Portfolio-Optimization-1"></a><a class="docs-heading-anchor-permalink" href="#Portfolio-Optimization" title="Permalink"></a></h3><pre><code class="language-julia hljs">using SparseArrays
+using LinearAlgebra
+
+# Covariance matrix (often sparse for large portfolios)
+n_assets = 100
+
+# Block diagonal covariance (assets grouped by sector)
+sector_sizes = [20, 30, 25, 25]
+sectors = []
+for s in sector_sizes
+    Σ_sector = rand(s, s)
+    Σ_sector = (Σ_sector + Σ_sector&#39;) / 2  # Symmetric
+    Σ_sector += 2I  # Positive definite
+    push!(sectors, Σ_sector)
+end
+
+Q = 2 * blockdiag([sparse(s) for s in sectors]...)  # Factor of 2 for QP form
+
+# Expected returns
+μ = rand(n_assets)
+
+# Build QP: min 0.5*x&#39;Qx - μ&#39;x subject to sum(x) = 1, x &gt;= 0
+A = sparse(ones(1, n_assets))
+AL = [1.0]
+AU = [1.0]
+c = -μ
+l = zeros(n_assets)
+u = ones(n_assets)
+
+model = build_from_QAbc(Q, A, c, AL, AU, l, u)</code></pre><h3 id="Support-Vector-Machine-(Dual)"><a class="docs-heading-anchor" href="#Support-Vector-Machine-(Dual)">Support Vector Machine (Dual)</a><a id="Support-Vector-Machine-(Dual)-1"></a><a class="docs-heading-anchor-permalink" href="#Support-Vector-Machine-(Dual)" title="Permalink"></a></h3><pre><code class="language-julia hljs">using SparseArrays
+
+# SVM dual: min 0.5*α&#39;Qα - 1&#39;α where Q[i,j] = y[i]*y[j]*K[i,j]
+m = 1000  # Training samples
+
+y = rand([-1, 1], m)  # Labels
+K = exp.(-0.1 * (rand(m) .- rand(m)&#39;).^2)  # RBF kernel (dense)
+
+# Q is often dense for kernel methods, but can sparsify
+Q_full = sparse([(y[i] * y[j] * K[i,j]) for i in 1:m, j in 1:m])
+
+# Sparsify by thresholding small entries
+threshold = 1e-3
+Q = sparse(Q_full .* (abs.(Q_full) .&gt; threshold))
+
+println(&quot;Sparsified to &quot;, nnz(Q) / length(Q) * 100, &quot;% density&quot;)</code></pre><h3 id="Regularized-Least-Squares-(Non-LASSO)"><a class="docs-heading-anchor" href="#Regularized-Least-Squares-(Non-LASSO)">Regularized Least Squares (Non-LASSO)</a><a id="Regularized-Least-Squares-(Non-LASSO)-1"></a><a class="docs-heading-anchor-permalink" href="#Regularized-Least-Squares-(Non-LASSO)" title="Permalink"></a></h3><pre><code class="language-julia hljs">using SparseArrays
+
+# Ridge regression: min ||Ax - b||² + λ||Dx||²
+# where D is a regularization matrix (e.g., finite differences)
+
+m, n = 100, 50
+A = randn(m, n)
+b = randn(m)
+λ = 0.1
+
+# First-order finite difference operator
+D = spdiagm(0 =&gt; ones(n-1), 1 =&gt; -ones(n-1))
+
+# Q = A&#39;A + λD&#39;D
+Q = sparse(A&#39; * A + λ * (D&#39; * D))
+
+c = -A&#39; * b</code></pre><h2 id="Troubleshooting"><a class="docs-heading-anchor" href="#Troubleshooting">Troubleshooting</a><a id="Troubleshooting-1"></a><a class="docs-heading-anchor-permalink" href="#Troubleshooting" title="Permalink"></a></h2><h3 id="Matrix-Not-Positive-Semidefinite"><a class="docs-heading-anchor" href="#Matrix-Not-Positive-Semidefinite">Matrix Not Positive Semidefinite</a><a id="Matrix-Not-Positive-Semidefinite-1"></a><a class="docs-heading-anchor-permalink" href="#Matrix-Not-Positive-Semidefinite" title="Permalink"></a></h3><p>If you get convergence issues or unbounded solutions:</p><pre><code class="language-julia hljs">using LinearAlgebra
+
+# Check if Q is positive semidefinite
+eigvals_Q = eigvals(Matrix(Q))
+if minimum(eigvals_Q) &lt; -1e-10
+    @warn &quot;Q has negative eigenvalues, not positive semidefinite&quot;
+    
+    # Fix by adding regularization
+    λ = abs(minimum(eigvals_Q)) + 1e-6
+    Q = Q + λ * I
+end</code></pre><h3 id="Out-of-Memory"><a class="docs-heading-anchor" href="#Out-of-Memory">Out of Memory</a><a id="Out-of-Memory-1"></a><a class="docs-heading-anchor-permalink" href="#Out-of-Memory" title="Permalink"></a></h3><p>For very large sparse matrices:</p><pre><code class="language-julia hljs"># Use GPU to offload memory
+params = HPRQP_parameters()
+params.use_gpu = true
+
+# Or reduce problem size through preprocessing</code></pre><h3 id="Slow-Performance"><a class="docs-heading-anchor" href="#Slow-Performance">Slow Performance</a><a id="Slow-Performance-1"></a><a class="docs-heading-anchor-permalink" href="#Slow-Performance" title="Permalink"></a></h3><pre><code class="language-julia hljs"># Check sparsity
+println(&quot;Sparsity: &quot;, nnz(Q) / length(Q) * 100, &quot;%&quot;)
+
+# If too dense, consider reformulation or different Q operator</code></pre><h2 id="See-Also"><a class="docs-heading-anchor" href="#See-Also">See Also</a><a id="See-Also-1"></a><a class="docs-heading-anchor-permalink" href="#See-Also" title="Permalink"></a></h2><ul><li><a href="../q_operators_overview/">Q Operators Overview</a> - Choosing the right operator</li><li><a href="../lasso_problems/">LASSO Problems</a> - Alternative for least squares</li><li><a href="../direct_api/">Direct API</a> - Building models with matrices</li></ul></article><nav class="docs-footer"><a class="docs-footer-prevpage" href="../q_operators_overview/">« Overview</a><a class="docs-footer-nextpage" href="../lasso_problems/">LASSO Problems »</a><div class="flexbox-break"></div><p class="footer-message">Powered by <a href="https://github.com/JuliaDocs/Documenter.jl">Documenter.jl</a> and the <a href="https://julialang.org/">Julia Programming Language</a>.</p></nav></div><div class="modal" id="documenter-settings"><div class="modal-background"></div><div class="modal-card"><header class="modal-card-head"><p class="modal-card-title">Settings</p><button class="delete"></button></header><section class="modal-card-body"><p><label class="label">Theme</label><div class="select"><select id="documenter-themepicker"><option value="auto">Automatic (OS)</option><option value="documenter-light">documenter-light</option><option value="documenter-dark">documenter-dark</option><option value="catppuccin-latte">catppuccin-latte</option><option value="catppuccin-frappe">catppuccin-frappe</option><option value="catppuccin-macchiato">catppuccin-macchiato</option><option value="catppuccin-mocha">catppuccin-mocha</option></select></div></p><hr/><p>This document was generated with <a href="https://github.com/JuliaDocs/Documenter.jl">Documenter.jl</a> version 1.16.1 on <span class="colophon-date" title="Tuesday 30 December 2025 15:47">Tuesday 30 December 2025</span>. Using Julia version 1.10.10.</p></section><footer class="modal-card-foot"></footer></div></div></div></body></html>

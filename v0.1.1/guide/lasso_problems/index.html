@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8"/><meta name="viewport" content="width=device-width, initial-scale=1.0"/><title>LASSO Problems · HPRQP.jl</title><meta name="title" content="LASSO Problems · HPRQP.jl"/><meta property="og:title" content="LASSO Problems · HPRQP.jl"/><meta property="twitter:title" content="LASSO Problems · HPRQP.jl"/><meta name="description" content="Documentation for HPRQP.jl."/><meta property="og:description" content="Documentation for HPRQP.jl."/><meta property="twitter:description" content="Documentation for HPRQP.jl."/><meta property="og:url" content="https://PolyU-IOR.github.io/HPR-QP/guide/lasso_problems/"/><meta property="twitter:url" content="https://PolyU-IOR.github.io/HPR-QP/guide/lasso_problems/"/><link rel="canonical" href="https://PolyU-IOR.github.io/HPR-QP/guide/lasso_problems/"/><script data-outdated-warner src="../../assets/warner.js"></script><link href="https://cdnjs.cloudflare.com/ajax/libs/lato-font/3.0.0/css/lato-font.min.css" rel="stylesheet" type="text/css"/><link href="https://cdnjs.cloudflare.com/ajax/libs/juliamono/0.050/juliamono.min.css" rel="stylesheet" type="text/css"/><link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.2/css/fontawesome.min.css" rel="stylesheet" type="text/css"/><link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.2/css/solid.min.css" rel="stylesheet" type="text/css"/><link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.2/css/brands.min.css" rel="stylesheet" type="text/css"/><link href="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.8/katex.min.css" rel="stylesheet" type="text/css"/><script>documenterBaseURL="../.."</script><script src="https://cdnjs.cloudflare.com/ajax/libs/require.js/2.3.6/require.min.js" data-main="../../assets/documenter.js"></script><script src="../../search_index.js"></script><script src="../../siteinfo.js"></script><script src="../../../versions.js"></script><link class="docs-theme-link" rel="stylesheet" type="text/css" href="../../assets/themes/catppuccin-mocha.css" data-theme-name="catppuccin-mocha"/><link class="docs-theme-link" rel="stylesheet" type="text/css" href="../../assets/themes/catppuccin-macchiato.css" data-theme-name="catppuccin-macchiato"/><link class="docs-theme-link" rel="stylesheet" type="text/css" href="../../assets/themes/catppuccin-frappe.css" data-theme-name="catppuccin-frappe"/><link class="docs-theme-link" rel="stylesheet" type="text/css" href="../../assets/themes/catppuccin-latte.css" data-theme-name="catppuccin-latte"/><link class="docs-theme-link" rel="stylesheet" type="text/css" href="../../assets/themes/documenter-dark.css" data-theme-name="documenter-dark" data-theme-primary-dark/><link class="docs-theme-link" rel="stylesheet" type="text/css" href="../../assets/themes/documenter-light.css" data-theme-name="documenter-light" data-theme-primary/><script src="../../assets/themeswap.js"></script></head><body><div id="documenter"><nav class="docs-sidebar"><div class="docs-package-name"><span class="docs-autofit"><a href="../../">HPRQP.jl</a></span></div><button class="docs-search-query input is-rounded is-small is-clickable my-2 mx-auto py-1 px-2" id="documenter-search-query">Search docs (Ctrl + /)</button><ul class="docs-menu"><li><a class="tocitem" href="../../">Home</a></li><li><a class="tocitem" href="../../getting_started/">Getting Started</a></li><li><span class="tocitem">User Guide</span><ul><li><input class="collapse-toggle" id="menuitem-3-1" type="checkbox"/><label class="tocitem" for="menuitem-3-1"><span class="docs-label">Input Methods</span><i class="docs-chevron"></i></label><ul class="collapsed"><li><a class="tocitem" href="../input_overview/">Overview</a></li><li><a class="tocitem" href="../direct_api/">Direct API</a></li><li><a class="tocitem" href="../jump_integration/">JuMP Integration</a></li><li><a class="tocitem" href="../mps_files/">MPS Files</a></li></ul></li><li><input class="collapse-toggle" id="menuitem-3-2" type="checkbox" checked/><label class="tocitem" for="menuitem-3-2"><span class="docs-label">Q Operators</span><i class="docs-chevron"></i></label><ul class="collapsed"><li><a class="tocitem" href="../q_operators_overview/">Overview</a></li><li><a class="tocitem" href="../sparse_matrix_qp/">Sparse Matrix QP</a></li><li class="is-active"><a class="tocitem" href>LASSO Problems</a><ul class="internal"><li><a class="tocitem" href="#Problem-Formulation"><span>Problem Formulation</span></a></li><li><a class="tocitem" href="#Why-Use-the-LASSO-Operator?"><span>Why Use the LASSO Operator?</span></a></li><li><a class="tocitem" href="#Basic-Usage"><span>Basic Usage</span></a></li><li><a class="tocitem" href="#Complete-Example-with-Constraints"><span>Complete Example with Constraints</span></a></li><li><a class="tocitem" href="#Choosing-the-Regularization-Parameter-λ"><span>Choosing the Regularization Parameter λ</span></a></li><li><a class="tocitem" href="#Elastic-Net-Variation"><span>Elastic Net Variation</span></a></li><li><a class="tocitem" href="#Applications"><span>Applications</span></a></li><li><a class="tocitem" href="#Performance-Tips"><span>Performance Tips</span></a></li><li><a class="tocitem" href="#See-Also"><span>See Also</span></a></li></ul></li><li><a class="tocitem" href="../qap_problems/">QAP Problems</a></li></ul></li><li><a class="tocitem" href="../parameters/">Parameters</a></li><li><a class="tocitem" href="../output_results/">Output &amp; Results</a></li></ul></li><li><a class="tocitem" href="../../api/">API Reference</a></li><li><a class="tocitem" href="../../examples/">Examples</a></li></ul><div class="docs-version-selector field has-addons"><div class="control"><span class="docs-label button is-static is-size-7">Version</span></div><div class="docs-selector control is-expanded"><div class="select is-fullwidth is-size-7"><select id="documenter-version-selector"></select></div></div></div></nav><div class="docs-main"><header class="docs-navbar"><a class="docs-sidebar-button docs-navbar-link fa-solid fa-bars is-hidden-desktop" id="documenter-sidebar-button" href="#"></a><nav class="breadcrumb"><ul class="is-hidden-mobile"><li><a class="is-disabled">User Guide</a></li><li><a class="is-disabled">Q Operators</a></li><li class="is-active"><a href>LASSO Problems</a></li></ul><ul class="is-hidden-tablet"><li class="is-active"><a href>LASSO Problems</a></li></ul></nav><div class="docs-right"><a class="docs-navbar-link" href="https://github.com/PolyU-IOR/HPR-QP" title="View the repository on GitHub"><span class="docs-icon fa-brands"></span><span class="docs-label is-hidden-touch">GitHub</span></a><a class="docs-navbar-link" href="https://github.com/PolyU-IOR/HPR-QP/blob/main/docs/src/guide/lasso_problems.md" title="Edit source on GitHub"><span class="docs-icon fa-solid"></span></a><a class="docs-settings-button docs-navbar-link fa-solid fa-gear" id="documenter-settings-button" href="#" title="Settings"></a><a class="docs-article-toggle-button fa-solid fa-chevron-up" id="documenter-article-toggle-button" href="javascript:;" title="Collapse all docstrings"></a></div></header><article class="content" id="documenter-page"><h1 id="LASSO-Problems"><a class="docs-heading-anchor" href="#LASSO-Problems">LASSO Problems</a><a id="LASSO-Problems-1"></a><a class="docs-heading-anchor-permalink" href="#LASSO-Problems" title="Permalink"></a></h1><p>The LASSO (Least Absolute Shrinkage and Selection Operator) is a regression method that performs both variable selection and regularization. HPRQP provides a specialized operator for efficiently solving LASSO problems.</p><h2 id="Problem-Formulation"><a class="docs-heading-anchor" href="#Problem-Formulation">Problem Formulation</a><a id="Problem-Formulation-1"></a><a class="docs-heading-anchor-permalink" href="#Problem-Formulation" title="Permalink"></a></h2><p>The LASSO problem is:</p><p class="math-container">\[\min_{x} \quad \frac{1}{2} \|Ax - b\|^2 + \lambda \|x\|_1\]</p><p>where:</p><ul><li><span>$A \in \mathbb{R}^{m \times n}$</span> is the design matrix (features)</li><li><span>$b \in \mathbb{R}^m$</span> is the response vector</li><li><span>$x \in \mathbb{R}^n$</span> is the coefficient vector to solve for</li><li><span>$\lambda &gt; 0$</span> is the regularization parameter</li></ul><p>This is equivalent to the QP:</p><p class="math-container">\[\min_{x} \quad \frac{1}{2} x^T (A^T A) x - (A^T b)^T x + \lambda \|x\|_1\]</p><h2 id="Why-Use-the-LASSO-Operator?"><a class="docs-heading-anchor" href="#Why-Use-the-LASSO-Operator?">Why Use the LASSO Operator?</a><a id="Why-Use-the-LASSO-Operator?-1"></a><a class="docs-heading-anchor-permalink" href="#Why-Use-the-LASSO-Operator?" title="Permalink"></a></h2><p>Instead of explicitly forming <span>$Q = A^T A$</span>:</p><p><strong>Benefits:</strong></p><ul><li>✅ <strong>Memory efficient</strong>: Stores <span>$A$</span> instead of <span>$A^T A$</span></li><li>✅ <strong>Numerically stable</strong>: Avoids conditioning issues from forming <span>$A^T A$</span></li><li>✅ <strong>Faster</strong>: Two matrix-vector products <span>$A^T(Ax)$</span> instead of one with <span>$A^T A$</span></li></ul><p><strong>When <span>$m = 1000, n = 500$</span>:</strong></p><ul><li>Sparse matrix operator: stores <span>$A^T A$</span> (potentially <span>$n^2 = 250000$</span> entries)</li><li>LASSO operator: stores <span>$A$</span> (only <span>$mn = 500000$</span> entries, but structured)</li></ul><h2 id="Basic-Usage"><a class="docs-heading-anchor" href="#Basic-Usage">Basic Usage</a><a id="Basic-Usage-1"></a><a class="docs-heading-anchor-permalink" href="#Basic-Usage" title="Permalink"></a></h2><pre><code class="language-julia hljs">using HPRQP
+
+# Problem data
+m, n = 100, 50
+A = randn(m, n)  # Design matrix
+b = randn(m)     # Observations
+λ = 0.1          # Regularization parameter
+
+# Create LASSO operator
+Q_lasso = LASSOOperatorCPU(A, b, λ)
+
+# No additional constraints (or add your own)
+A_constr = sparse(zeros(0, n))
+AL = Float64[]
+AU = Float64[]
+c = zeros(n)  # Linear term is handled by LASSO operator
+l = fill(-Inf, n)
+u = fill(Inf, n)
+
+# Build and solve
+model = build_from_QAbc(Q_lasso, A_constr, c, AL, AU, l, u)
+
+params = HPRQP_parameters()
+params.use_gpu = true
+result = optimize(model, params)
+
+# Analyze sparsity
+sparsity = sum(abs.(result.x) .&gt; 1e-6)
+println(&quot;Non-zero coefficients: &quot;, sparsity, &quot; / &quot;, n)
+println(&quot;Sparsity: &quot;, (1 - sparsity/n) * 100, &quot;%&quot;)</code></pre><h2 id="Complete-Example-with-Constraints"><a class="docs-heading-anchor" href="#Complete-Example-with-Constraints">Complete Example with Constraints</a><a id="Complete-Example-with-Constraints-1"></a><a class="docs-heading-anchor-permalink" href="#Complete-Example-with-Constraints" title="Permalink"></a></h2><pre><code class="language-julia hljs">using HPRQP
+using SparseArrays
+
+# Generate synthetic data
+m, n = 200, 100
+A = randn(m, n)
+x_true = sparsevec([1, 5, 10, 25, 50], randn(5), n)  # Sparse truth
+noise = 0.1 * randn(m)
+b = A * x_true + noise
+
+λ = 0.5  # Regularization
+
+# Create LASSO operator
+Q_lasso = LASSOOperatorCPU(A, b, λ)
+
+# Add non-negativity constraint
+A_constr = sparse(zeros(0, n))
+AL = Float64[]
+AU = Float64[]
+c = zeros(n)
+l = zeros(n)  # x &gt;= 0 (non-negative LASSO)
+u = fill(Inf, n)
+
+# Solve
+model = build_from_QAbc(Q_lasso, A_constr, c, AL, AU, l, u)
+
+params = HPRQP_parameters()
+result = optimize(model, params)
+
+# Compare to true solution
+x_recovered = result.x
+println(&quot;Recovery error: &quot;, norm(x_recovered - x_true))
+println(&quot;Support recovery: &quot;, sum((abs.(x_recovered) .&gt; 1e-3) .&amp; (abs.(x_true) .&gt; 0)))</code></pre><h2 id="Choosing-the-Regularization-Parameter-λ"><a class="docs-heading-anchor" href="#Choosing-the-Regularization-Parameter-λ">Choosing the Regularization Parameter λ</a><a id="Choosing-the-Regularization-Parameter-λ-1"></a><a class="docs-heading-anchor-permalink" href="#Choosing-the-Regularization-Parameter-λ" title="Permalink"></a></h2><p>The regularization parameter λ controls the sparsity-accuracy trade-off:</p><ul><li><strong>Small λ</strong>: Less regularization, more non-zero coefficients, better fit</li><li><strong>Large λ</strong>: More regularization, sparser solution, worse fit</li></ul><h3 id="Cross-Validation"><a class="docs-heading-anchor" href="#Cross-Validation">Cross-Validation</a><a id="Cross-Validation-1"></a><a class="docs-heading-anchor-permalink" href="#Cross-Validation" title="Permalink"></a></h3><pre><code class="language-julia hljs">using HPRQP
+
+function lasso_cv(A, b, λ_values; n_folds=5)
+    m, n = size(A)
+    fold_size = div(m, n_folds)
+    cv_errors = zeros(length(λ_values))
+    
+    for (i, λ) in enumerate(λ_values)
+        fold_errors = zeros(n_folds)
+        
+        for fold in 1:n_folds
+            # Split data
+            test_idx = (fold-1)*fold_size+1 : fold*fold_size
+            train_idx = setdiff(1:m, test_idx)
+            
+            A_train = A[train_idx, :]
+            b_train = b[train_idx]
+            A_test = A[test_idx, :]
+            b_test = b[test_idx]
+            
+            # Solve LASSO on training set
+            Q_lasso = LASSOOperatorCPU(A_train, b_train, λ)
+            model = build_from_QAbc(Q_lasso, sparse(zeros(0,n)), 
+                                    zeros(n), Float64[], Float64[], 
+                                    fill(-Inf,n), fill(Inf,n))
+            
+            params = HPRQP_parameters()
+            params.verbose = false
+            result = optimize(model, params)
+            
+            # Test error
+            fold_errors[fold] = norm(A_test * result.x - b_test)^2 / length(test_idx)
+        end
+        
+        cv_errors[i] = mean(fold_errors)
+    end
+    
+    best_idx = argmin(cv_errors)
+    return λ_values[best_idx], cv_errors
+end
+
+# Use it
+λ_values = [0.001, 0.01, 0.1, 0.5, 1.0, 5.0]
+λ_best, errors = lasso_cv(A, b, λ_values)
+println(&quot;Best λ: &quot;, λ_best)</code></pre><h2 id="Elastic-Net-Variation"><a class="docs-heading-anchor" href="#Elastic-Net-Variation">Elastic Net Variation</a><a id="Elastic-Net-Variation-1"></a><a class="docs-heading-anchor-permalink" href="#Elastic-Net-Variation" title="Permalink"></a></h2><p>Elastic net combines L1 and L2 regularization:</p><p class="math-container">\[\min_{x} \quad \frac{1}{2} \|Ax - b\|^2 + \lambda_1 \|x\|_1 + \frac{\lambda_2}{2} \|x\|^2\]</p><pre><code class="language-julia hljs"># Elastic net as modified LASSO
+λ1 = 0.1  # L1 penalty
+λ2 = 0.05  # L2 penalty
+
+# Augment A and b for L2 penalty
+A_aug = vcat(A, sqrt(λ2) * I(n))
+b_aug = vcat(b, zeros(n))
+
+Q_elastic = LASSOOperatorCPU(A_aug, b_aug, λ1)
+
+model = build_from_QAbc(Q_elastic, A_constr, c, AL, AU, l, u)</code></pre><h2 id="Applications"><a class="docs-heading-anchor" href="#Applications">Applications</a><a id="Applications-1"></a><a class="docs-heading-anchor-permalink" href="#Applications" title="Permalink"></a></h2><h3 id="Feature-Selection"><a class="docs-heading-anchor" href="#Feature-Selection">Feature Selection</a><a id="Feature-Selection-1"></a><a class="docs-heading-anchor-permalink" href="#Feature-Selection" title="Permalink"></a></h3><pre><code class="language-julia hljs"># Select important features from high-dimensional data
+m, n = 100, 1000  # More features than samples!
+
+A = randn(m, n)
+x_sparse = sparsevec(rand(1:n, 10), randn(10), n)  # Only 10 important features
+b = A * x_sparse + 0.1 * randn(m)
+
+# Use LASSO to identify important features
+λ = 0.5
+Q_lasso = LASSOOperatorCPU(A, b, λ)
+model = build_from_QAbc(Q_lasso, sparse(zeros(0,n)), zeros(n), 
+                        Float64[], Float64[], fill(-Inf,n), fill(Inf,n))
+
+params = HPRQP_parameters()
+result = optimize(model, params)
+
+# Identify selected features
+threshold = 1e-4
+selected_features = findall(abs.(result.x) .&gt; threshold)
+println(&quot;Selected &quot;, length(selected_features), &quot; out of &quot;, n, &quot; features&quot;)</code></pre><h3 id="Compressed-Sensing"><a class="docs-heading-anchor" href="#Compressed-Sensing">Compressed Sensing</a><a id="Compressed-Sensing-1"></a><a class="docs-heading-anchor-permalink" href="#Compressed-Sensing" title="Permalink"></a></h3><pre><code class="language-julia hljs"># Recover sparse signal from compressed measurements
+n = 1000  # Signal dimension
+m = 200   # Number of measurements (m &lt;&lt; n)
+k = 20    # Sparsity level
+
+# Measurement matrix (random Gaussian)
+A = randn(m, n) / sqrt(m)
+
+# Sparse signal
+x_true = sparsevec(rand(1:n, k), randn(k), n)
+
+# Compressed measurements
+b = A * x_true
+
+# Recover using LASSO
+λ = 0.01
+Q_lasso = LASSOOperatorCPU(A, b, λ)
+model = build_from_QAbc(Q_lasso, sparse(zeros(0,n)), zeros(n),
+                        Float64[], Float64[], fill(-Inf,n), fill(Inf,n))
+
+params = HPRQP_parameters()
+result = optimize(model, params)
+
+println(&quot;Recovery error: &quot;, norm(result.x - x_true) / norm(x_true))</code></pre><h3 id="Time-Series-(Trend-Filtering)"><a class="docs-heading-anchor" href="#Time-Series-(Trend-Filtering)">Time Series (Trend Filtering)</a><a id="Time-Series-(Trend-Filtering)-1"></a><a class="docs-heading-anchor-permalink" href="#Time-Series-(Trend-Filtering)" title="Permalink"></a></h3><pre><code class="language-julia hljs"># LASSO with finite difference regularization
+T = 200  # Time points
+y = sin.(range(0, 2π, length=T)) + 0.2 * randn(T)
+
+# Identity observation
+A = Matrix(1.0I, T, T)
+b = y
+
+# But add constraint on differences (trend filtering)
+# This is approximated using LASSO on transformed space
+
+λ = 0.1
+Q_lasso = LASSOOperatorCPU(A, b, λ)
+model = build_from_QAbc(Q_lasso, sparse(zeros(0,T)), zeros(T),
+                        Float64[], Float64[], fill(-Inf,T), fill(Inf,T))
+
+result = optimize(model, HPRQP_parameters())
+x_smooth = result.x
+
+using Plots
+plot(y, label=&quot;Noisy&quot;, alpha=0.5)
+plot!(x_smooth, label=&quot;LASSO smoothed&quot;, linewidth=2)</code></pre><h2 id="Performance-Tips"><a class="docs-heading-anchor" href="#Performance-Tips">Performance Tips</a><a id="Performance-Tips-1"></a><a class="docs-heading-anchor-permalink" href="#Performance-Tips" title="Permalink"></a></h2><ol><li><p><strong>GPU Acceleration</strong>: LASSO operator benefits significantly from GPU for large problems</p><pre><code class="language-julia hljs">params = HPRQP_parameters()
+params.use_gpu = true</code></pre></li><li><p><strong>Scaling</strong>: Standardize features for better numerical behavior</p><pre><code class="language-julia hljs"># Standardize columns of A
+A_mean = mean(A, dims=1)
+A_std = std(A, dims=1)
+A_scaled = (A .- A_mean) ./ A_std</code></pre></li><li><p><strong>Warm-start</strong>: Solve for sequence of λ values using warm-start</p><pre><code class="language-julia hljs">λ_path = [1.0, 0.5, 0.1, 0.05, 0.01]
+solutions = []
+
+for λ in λ_path
+    Q_lasso = LASSOOperatorCPU(A, b, λ)
+    model = build_from_QAbc(Q_lasso, ...)
+    
+    params = HPRQP_parameters()
+    if !isempty(solutions)
+        params.initial_x = solutions[end]  # Warm-start
+    end
+    
+    result = optimize(model, params)
+    push!(solutions, result.x)
+end</code></pre></li></ol><h2 id="See-Also"><a class="docs-heading-anchor" href="#See-Also">See Also</a><a id="See-Also-1"></a><a class="docs-heading-anchor-permalink" href="#See-Also" title="Permalink"></a></h2><ul><li><a href="../q_operators_overview/">Q Operators Overview</a> - Understanding Q operators</li><li><a href="../sparse_matrix_qp/">Sparse Matrix QP</a> - Alternative general approach</li><li><a href="../direct_api/">Direct API</a> - Building models</li></ul></article><nav class="docs-footer"><a class="docs-footer-prevpage" href="../sparse_matrix_qp/">« Sparse Matrix QP</a><a class="docs-footer-nextpage" href="../qap_problems/">QAP Problems »</a><div class="flexbox-break"></div><p class="footer-message">Powered by <a href="https://github.com/JuliaDocs/Documenter.jl">Documenter.jl</a> and the <a href="https://julialang.org/">Julia Programming Language</a>.</p></nav></div><div class="modal" id="documenter-settings"><div class="modal-background"></div><div class="modal-card"><header class="modal-card-head"><p class="modal-card-title">Settings</p><button class="delete"></button></header><section class="modal-card-body"><p><label class="label">Theme</label><div class="select"><select id="documenter-themepicker"><option value="auto">Automatic (OS)</option><option value="documenter-light">documenter-light</option><option value="documenter-dark">documenter-dark</option><option value="catppuccin-latte">catppuccin-latte</option><option value="catppuccin-frappe">catppuccin-frappe</option><option value="catppuccin-macchiato">catppuccin-macchiato</option><option value="catppuccin-mocha">catppuccin-mocha</option></select></div></p><hr/><p>This document was generated with <a href="https://github.com/JuliaDocs/Documenter.jl">Documenter.jl</a> version 1.16.1 on <span class="colophon-date" title="Tuesday 30 December 2025 15:47">Tuesday 30 December 2025</span>. Using Julia version 1.10.10.</p></section><footer class="modal-card-foot"></footer></div></div></div></body></html>
