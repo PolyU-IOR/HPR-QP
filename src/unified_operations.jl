@@ -71,7 +71,7 @@ result = unified_norm(x_gpu)  # Uses CUDA.norm
 ```
 """
 @inline unified_norm(x::Vector{T}, p::Real=2) where {T} = norm(x, p)
-@inline unified_norm(x::CuVector{T}, p::Real=2) where {T} = CUDA.norm(x, p)
+@inline unified_norm(x::CuVector{T}, p::Real=2) where {T} = norm(x, p)
 
 # ============================================================================
 # Matrix-Vector Multiplication

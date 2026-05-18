@@ -1501,7 +1501,7 @@ function golden_Q_diag(a::Float64, b::Float64, Q::CuArray{Float64}, c::CuArray{F
     # Objective using GPU operations, reusing tempv
     function f_gpu(x)
         @. tempv = d / (1.0 + x * Q)
-        return a * x + b / x + x^2 * CUDA.dot(c, tempv)
+        return a * x + b / x + x^2 * dot(c, tempv)
     end
 
     # Initialize bracket
