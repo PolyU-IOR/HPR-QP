@@ -39,11 +39,11 @@ result = unified_dot(x_cpu, y_cpu)  # Uses LinearAlgebra.dot
 # GPU version  
 x_gpu = CuVector([1.0, 2.0, 3.0])
 y_gpu = CuVector([4.0, 5.0, 6.0])
-result = unified_dot(x_gpu, y_gpu)  # Uses CUDA.dot
+result = unified_dot(x_gpu, y_gpu)  # Uses dot
 ```
 """
 @inline unified_dot(x::Vector{T}, y::Vector{T}) where {T} = dot(x, y)
-@inline unified_dot(x::CuVector{T}, y::CuVector{T}) where {T} = CUDA.dot(x, y)
+@inline unified_dot(x::CuVector{T}, y::CuVector{T}) where {T} = dot(x, y)
 
 # ============================================================================
 # Norm Operations
@@ -67,11 +67,11 @@ result = unified_norm(x_cpu)  # Uses LinearAlgebra.norm
 
 # GPU version
 x_gpu = CuVector([3.0, 4.0])
-result = unified_norm(x_gpu)  # Uses CUDA.norm
+result = unified_norm(x_gpu)  # Uses norm
 ```
 """
 @inline unified_norm(x::Vector{T}, p::Real=2) where {T} = norm(x, p)
-@inline unified_norm(x::CuVector{T}, p::Real=2) where {T} = CUDA.norm(x, p)
+@inline unified_norm(x::CuVector{T}, p::Real=2) where {T} = norm(x, p)
 
 # ============================================================================
 # Matrix-Vector Multiplication
@@ -397,7 +397,7 @@ function unified_golden_Q_diag(a::Float64, b::Float64,
     # Objective using GPU operations
     function f_gpu(x)
         @. tempv = d / (1.0 + x * Q)
-        return a * x + b / x + x^2 * CUDA.dot(c, tempv)
+        return a * x + b / x + x^2 * dot(c, tempv)
     end
 
     # Golden section search
