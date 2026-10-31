@@ -2,6 +2,7 @@
 
 #include "shared/sparse.h"
 #include "shared/parallel.h"
+#include "shared/eigen_probe.h"
 #include "shared/vector.h"
 
 #include <math.h>
@@ -158,6 +159,7 @@ static HPRQPStatus power_iteration_aqka(const HPRQPWorkspace *workspace,
                                         size_t max_iterations,
                                         double tolerance,
                                         int q_power,
+                                        int *retry_moments,
                                         double *lambda_max)
 {
     double *z;
@@ -165,6 +167,7 @@ static HPRQPStatus power_iteration_aqka(const HPRQPWorkspace *workspace,
     double *at_q;
     double *q_at_q;
     size_t iteration;
+    int retry_probe = *retry_moments;
 
     if (q_power < 1 || q_power > 2) {
         return HPRQP_STATUS_INVALID_ARGUMENT;
@@ -186,7 +189,14 @@ static HPRQPStatus power_iteration_aqka(const HPRQPWorkspace *workspace,
         return HPRQP_STATUS_ALLOCATION_FAILED;
     }
 
-    init_probe(z, workspace->m);
+    if (retry_probe) {
+        size_t i;
+        for (i = 0; i < workspace->m; ++i) {
+            z[i] = hprqp_eigen_retry_probe_value(i);
+        }
+    } else {
+        init_probe(z, workspace->m);
+    }
     *lambda_max = 1.0;
     for (iteration = 0; iteration < max_iterations; ++iteration) {
         size_t i;
@@ -194,7 +204,16 @@ static HPRQPStatus power_iteration_aqka(const HPRQPWorkspace *workspace,
         double z_norm;
         double error;
 
-        if (q_norm <= 1e-16) {
+        if (q_norm == 0.0 || (!retry_probe && q_norm <= 1e-16)) {
+            if (!retry_probe && q_power == 1) {
+                for (i = 0; i < workspace->m; ++i) {
+                    z[i] = hprqp_eigen_retry_probe_value(i);
+                }
+                retry_probe = 1;
+                *retry_moments = 1;
+                iteration = (size_t)-1;
+                continue;
+            }
             *lambda_max = 0.0;
             break;
         }
@@ -220,8 +239,23 @@ static HPRQPStatus power_iteration_aqka(const HPRQPWorkspace *workspace,
         for (i = 0; i < workspace->m; ++i) {
             q[i] = z[i] - (*lambda_max) * q[i];
         }
-        error = vec_norm2(q, workspace->m) /
-                (z_norm + fabs(*lambda_max) + 1e-16);
+        {
+            double error_norm = vec_norm2(q, workspace->m);
+            double relative_scale = z_norm + fabs(*lambda_max);
+            error = retry_probe
+                        ? (z_norm > 0.0 ? error_norm / relative_scale : 0.0)
+                        : error_norm / (relative_scale + 1e-16);
+            if (!retry_probe && q_power == 1 && error < tolerance &&
+                (z_norm == 0.0 || error_norm / relative_scale >= tolerance)) {
+                for (i = 0; i < workspace->m; ++i) {
+                    z[i] = hprqp_eigen_retry_probe_value(i);
+                }
+                retry_probe = 1;
+                *retry_moments = 1;
+                iteration = (size_t)-1;
+                continue;
+            }
+        }
         if (error < tolerance) {
             break;
         }
@@ -243,6 +277,7 @@ HPRQPStatus estimate_eigenvalues(HPRQPWorkspace *workspace,
     HPRQPStatus status;
     double eig_factor = params != NULL ? params->eig_factor : HPRQP_EIGENVALUE_SCALE;
     int moment_selector_requested;
+    int retry_moments = 0;
 
     if (workspace == NULL || workspace->Q == NULL || workspace->A == NULL || workspace->AT == NULL) {
         return HPRQP_STATUS_INVALID_ARGUMENT;
@@ -285,6 +320,7 @@ HPRQPStatus estimate_eigenvalues(HPRQPWorkspace *workspace,
                                               5000,
                                               1e-4,
                                               1,
+                                              &retry_moments,
                                               &workspace->lambda_max_AQA);
                 if (status != HPRQP_STATUS_OK) {
                     return status;
@@ -310,6 +346,7 @@ HPRQPStatus estimate_eigenvalues(HPRQPWorkspace *workspace,
                                                   5000,
                                                   1e-4,
                                                   2,
+                                                  &retry_moments,
                                                   &workspace->lambda_max_AQ2A);
                     if (status != HPRQP_STATUS_OK) return status;
                     workspace->lambda_max_AQ2A *= eig_factor;

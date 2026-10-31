@@ -1,4 +1,38 @@
 #include "test_support.h"
+#include "test_eigen_retry.h"
+
+static int run_retry_case(double q, int zero_coupling)
+{
+    int exit_code=0;
+    HPRQPModel model;
+    HPRQPParams params;
+    HPRQPGPUContext context;
+    HPRQPGPUProblem problem;
+    HPRQPGPUWorkspace workspace;
+    double expected;
+    model_init(&model); gpu_context_init(&context);
+    gpu_problem_init(&problem); gpu_workspace_init(&workspace);
+    test_params_set_no_scaling(&params);
+    params.method=HPRQP_METHOD_PARALLEL;
+    params.parallel_majorizer_mode=HPRQP_PARALLEL_MAJORIZER_MOMENT_SELECTOR;
+    TEST_ASSERT_OK(test_build_eigen_retry_case(q,zero_coupling,&model));
+    TEST_ASSERT_OK(gpu_context_open(&context,0));
+    TEST_ASSERT_OK(gpu_problem_upload(&problem,&model));
+    TEST_ASSERT_OK(gpu_workspace_allocate(&workspace,&problem,&params));
+    TEST_ASSERT_OK(gpu_workspace_prepare_spmv(&workspace,&problem,0));
+    TEST_ASSERT_OK(gpu_estimate_eigenvalues(&workspace,&problem,&params));
+    expected=6*q*params.eig_factor;
+    TEST_ASSERT(zero_coupling
+                ? workspace.lambda_max_AQA==0 && workspace.lambda_max_AQ2A==0
+                : fabs(workspace.lambda_max_AQA/expected-1)<1e-8 &&
+                  fabs(workspace.lambda_max_AQ2A/(expected*q)-1)<1e-8,
+                "gpu moment retry spectrum q=%.17g zero=%d: AQA=%.17g AQ2A=%.17g",
+                q,zero_coupling,workspace.lambda_max_AQA,workspace.lambda_max_AQ2A);
+cleanup:
+    gpu_workspace_free(&workspace); gpu_problem_free(&problem);
+    gpu_context_free(&context); model_free(&model);
+    return exit_code;
+}
 
 static int run_case(HPRQPTestModelCase case_id,
                     HPRQPMethod method,
@@ -82,6 +116,9 @@ int main(void)
         printf("test_gpu_eigs skipped\n");
         return 0;
     }
+
+    if (run_retry_case(1,0) || run_retry_case(1e-8,0) ||
+        run_retry_case(1e-12,0) || run_retry_case(1,1)) return 1;
 
     if (run_case(HPRQP_TEST_CASE_STANDARD, HPRQP_METHOD_SGS, "diag") != 0) {
         return 1;

@@ -4,8 +4,9 @@ A CUDA/C implementation of the Halpern Peaceman--Rachford (HPR) method for
 quadratic programming and the supported diagonal convex QCQP input format.
 This HPR-QP branch imports the September handoff's C/CUDA source snapshot,
 identified there as `31afb2ac5c6315fa5348363cd5570e1b4e77c4e4`, and makes its
-documented parallel profile the defaults. The original spectral estimators,
-iteration kernels, scaling routines, controllers and stopping checks are retained.
+documented parallel profile the defaults. The original iteration kernels,
+scaling routines, controllers and stopping checks are retained. Coupling-moment
+spectral estimation includes the conditional numerical repair described below.
 
 ## Install
 
@@ -114,6 +115,17 @@ implementation. `moment_selector` uses the second-moment test on eligible QP
 paths; QC majorizer `auto` retains the original QCQP selection rule. The other
 majorizers and legacy sGS method remain explicitly selectable. No CUDA
 fast-math option is used.
+
+The moment estimator normally retains the original power-iteration probe. If
+the first coupling moment is annihilated by that probe, or its absolute stopping
+floor masks a failed relative convergence test, it restarts once with a fixed
+nonsmooth probe and recomputes the moment pair with relative stopping checks.
+This prevents a spurious near-zero coupling estimate from invalidating the
+parallel metric on structured problems such as QPLIB_8500. It is automatic on
+CPU and GPU and needs no additional option. The normal probe, the `AA^T` and
+`Q` estimators, the safety factor, and all solver thresholds remain unchanged.
+Power-iteration estimates are still numerical estimates, not certified spectral
+upper bounds; this repair does not guarantee convergence within the time limit.
 
 The selectable Curtis--Reid path follows PolyU-IOR/HPR-QP commit
 `8023de0426e096d0f540b8126460f2b9d7c1a355`: it performs A-only

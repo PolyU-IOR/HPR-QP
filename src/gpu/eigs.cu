@@ -1,6 +1,7 @@
 #include "cuda_common.h"
 
 #include "shared/parallel.h"
+#include "shared/eigen_probe.h"
 
 #include <chrono>
 #include <cstdio>
@@ -51,6 +52,14 @@ __global__ static void gpu_init_probe_kernel(double *values, size_t length)
         return;
     }
     values[i] = 1.0 + ((double)i + 1.0) / ((double)length + 1.0);
+}
+
+__global__ static void gpu_init_retry_probe_kernel(double *values, size_t length)
+{
+    size_t i = (size_t)blockIdx.x * (size_t)blockDim.x + (size_t)threadIdx.x;
+    if (i < length) {
+        values[i] = hprqp_eigen_retry_probe_value(i);
+    }
 }
 
 __global__ static void gpu_extract_diag_kernel(double *diag_q,
@@ -389,11 +398,13 @@ static HPRQPStatus gpu_power_iteration_a_local(HPRQPGPUWorkspace *workspace,
 static HPRQPStatus gpu_power_iteration_aqka_local(HPRQPGPUWorkspace *workspace,
                                                   const HPRQPGPUProblem *model,
                                                   int q_power,
+                                                  int *retry_moments,
                                                   double *lambda_max)
 {
     cublasHandle_t handle = gpu_blas_handle(workspace);
     HPRQPStatus status;
     size_t iteration;
+    bool retry_probe = *retry_moments != 0;
     double *q = workspace->y_bar.values;
     double *z = workspace->Ax.values;
 
@@ -409,7 +420,13 @@ static HPRQPStatus gpu_power_iteration_aqka_local(HPRQPGPUWorkspace *workspace,
         return HPRQP_STATUS_INVALID_ARGUMENT;
     }
 
-    status = gpu_launch_probe(z, workspace->m, workspace->threads_m);
+    if (retry_probe) {
+        gpu_init_retry_probe_kernel<<<workspace->blocks_m,
+                                       workspace->threads_m>>>(z, workspace->m);
+        status = map_cuda_status(cudaGetLastError());
+    } else {
+        status = gpu_launch_probe(z, workspace->m, workspace->threads_m);
+    }
     if (status != HPRQP_STATUS_OK) {
         return status;
     }
@@ -423,7 +440,17 @@ static HPRQPStatus gpu_power_iteration_aqka_local(HPRQPGPUWorkspace *workspace,
         if (status != HPRQP_STATUS_OK) {
             return status;
         }
-        if (q_norm <= 1e-16) {
+        if (q_norm == 0.0 || (!retry_probe && q_norm <= 1e-16)) {
+            if (!retry_probe && q_power == 1) {
+                gpu_init_retry_probe_kernel<<<workspace->blocks_m,
+                                               workspace->threads_m>>>(z, workspace->m);
+                status = map_cuda_status(cudaGetLastError());
+                if (status != HPRQP_STATUS_OK) return status;
+                retry_probe = true;
+                *retry_moments = 1;
+                iteration = (size_t)-1;
+                continue;
+            }
             *lambda_max = 0.0;
             break;
         }
@@ -492,8 +519,23 @@ static HPRQPStatus gpu_power_iteration_aqka_local(HPRQPGPUWorkspace *workspace,
         if (status != HPRQP_STATUS_OK) {
             return status;
         }
-        if (error_norm / (z_norm + fabs(*lambda_max) + 1e-16) < 1e-4) {
-            break;
+        {
+            const double relative_scale = z_norm + fabs(*lambda_max);
+            const double error = retry_probe
+                ? (z_norm > 0.0 ? error_norm / relative_scale : 0.0)
+                : error_norm / (relative_scale + 1e-16);
+            if (!retry_probe && q_power == 1 && error < 1e-4 &&
+                (z_norm == 0.0 || error_norm / relative_scale >= 1e-4)) {
+                gpu_init_retry_probe_kernel<<<workspace->blocks_m,
+                                               workspace->threads_m>>>(z, workspace->m);
+                status = map_cuda_status(cudaGetLastError());
+                if (status != HPRQP_STATUS_OK) return status;
+                retry_probe = true;
+                *retry_moments = 1;
+                iteration = (size_t)-1;
+                continue;
+            }
+            if (error < 1e-4) break;
         }
     }
 
@@ -530,6 +572,7 @@ HPRQPStatus gpu_estimate_eigenvalues(HPRQPGPUWorkspace *workspace,
     double power_aqa_seconds = 0.0;
     double power_aq2a_seconds = 0.0;
     bool moment_selector_requested;
+    int retry_moments = 0;
 
     if (workspace == NULL || model == NULL || params == NULL) {
         return HPRQP_STATUS_INVALID_ARGUMENT;
@@ -593,7 +636,7 @@ HPRQPStatus gpu_estimate_eigenvalues(HPRQPGPUWorkspace *workspace,
             if (!workspace->empty_A && workspace->lambda_max_A > 0.0 &&
                 workspace->lambda_max_Q > 0.0) {
                 status = gpu_power_iteration_aqka_local(
-                    workspace, model, 1, &workspace->lambda_max_AQA);
+                    workspace, model, 1, &retry_moments, &workspace->lambda_max_AQA);
                 if (profile_setup) {
                     const auto now = std::chrono::steady_clock::now();
                     power_aqa_seconds =
@@ -621,7 +664,7 @@ HPRQPStatus gpu_estimate_eigenvalues(HPRQPGPUWorkspace *workspace,
                 moment_selector_requested) {
                 if (workspace->lambda_max_AQA > 0.0) {
                     status = gpu_power_iteration_aqka_local(
-                        workspace, model, 2, &workspace->lambda_max_AQ2A);
+                        workspace, model, 2, &retry_moments, &workspace->lambda_max_AQ2A);
                     if (profile_setup) {
                         const auto now = std::chrono::steady_clock::now();
                         power_aq2a_seconds =
