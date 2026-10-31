@@ -1,13 +1,19 @@
-# HPR-QP-C
+# Parallel HPR-QP / HPR-QCQP (C/CUDA)
 
-A CUDA/C implementation of the Halpern Peaceman--Rachford (HPR) method for solving quadratic programming (QP) problems on GPUs.
+A CUDA/C implementation of the Halpern Peaceman--Rachford (HPR) method for
+quadratic programming and the supported diagonal convex QCQP input format.
+This HPR-QP branch imports the September handoff's C/CUDA source snapshot,
+identified there as `31afb2ac5c6315fa5348363cd5570e1b4e77c4e4`, and makes its
+documented parallel profile the defaults. The original spectral estimators,
+iteration kernels, scaling routines, controllers and stopping checks are retained.
 
 ## Install
 
 For a fresh setup:
 
 ```sh
-make clean && make
+make
+./build-cuda/solve_qp model.mps
 ```
 
 Install the shared library:
@@ -16,10 +22,11 @@ Install the shared library:
 make install
 ```
 
-Wrapper documentation:
-
-- [Julia wrapper API](julia/README.md)
-- [Python wrapper API](python/README.md)
+CUDA must be installed for GPU builds. For the reference CUDA 12.8 installation,
+use `make CUDA_ROOT=/usr/local/cuda-12.8 GPU_SM=90` and make its runtime libraries
+discoverable, for example with `LD_LIBRARY_PATH=/usr/local/cuda-12.8/lib64`.
+The original Makefile detects CUDA and builds GPU targets when available.
+This source export does not include the separate Julia/Python wrapper packages.
 
 ## solve_qp
 
@@ -29,17 +36,26 @@ GPU example:
 
 ```sh
 ./build-cuda/solve_qp model.mps \
-  --method parallel \
-  --parallel-majorizer coupling_power \
-  --tau-mode adaptive_restart \
-  --use-cr-scaling 1 \
-  --cr-iterations 10 \
-  --use-gpu 1 \
-  --device-number 0 \
-  --stoptol 1e-8 \
-  --check-iter 100 \
-  --time-limit 1000
+  --device-number 0
 ```
+
+No profile flags are needed. The native API, executable and dataset launcher
+use parallel updates, `moment_selector`, QC majorizer `auto`, adaptive-restart
+tau in `[0.025, 40]`, adaptive sigma, both SOCP policies enabled, CR10 followed
+by the existing scaling passes, and global b/c normalization off. GPU use is
+enabled, tolerance is `1e-8`, checks occur every 100 updates, and the native
+time limit is 1000 seconds. Explicit CLI options override these defaults.
+
+Dataset example (the GPU executable is selected by default):
+
+```sh
+python3 scripts/run_dataset.py /path/to/mps results/run --device-number 0
+```
+
+The dataset summary counts only finite native `OPTIMAL` results satisfying the
+requested tolerance. Its native-time SGM10 charges nonoptimal cases the requested
+time limit; this is not a complete-process wall-clock metric. Completed native
+timeouts remain recorded and are not automatically rerun when resuming a folder.
 
 Usage:
 
@@ -50,8 +66,10 @@ Usage:
 CPU example:
 
 ```sh
-./build/solve_qp model.mps --stoptol 1e-6 --time-limit 3600
+./build/solve_qp model.mps --use-gpu 0
 ```
+
+CPU solving supports QP; the QCQP solve path requires the GPU executable.
 
 Parameters:
 
@@ -75,37 +93,40 @@ Parameters:
 - `--use-scaling 0|1`: enable or disable problem scaling
 - `--use-cr-scaling 0|1`: apply A-only Curtis--Reid scaling before the existing scaling passes
 - `--cr-iterations N`: number of Curtis--Reid alternating row/column passes; the validated setting is `10`
-- `--use-bc-scaling 0|1`: enable the final Pock--Chambolle pass
+- `--use-bc-scaling 0|1`: enable global b/c normalization after the existing scaling passes
 
-The note-aligned QCQP profile is selected explicitly so legacy defaults remain
-unchanged:
+The default profile can also be written explicitly:
 
 ```sh
 ./build-cuda/solve_qp INSTANCE.mps \
-  --use-gpu 1 --method parallel \
-  --parallel-majorizer coupling_power --qc-majorizer pairwise \
+  --use-gpu 1 --device-number 0 --method parallel \
+  --parallel-majorizer moment_selector --qc-majorizer auto \
   --tau-mode adaptive_restart --tau-min 0.025 --tau-max 40 \
   --sigma-fixed 0 --use-socp-restart-policy 1 \
-  --use-socp-sigma-policy 0 --check-iter 150 \
+  --use-socp-sigma-policy 1 --check-iter 100 \
   --use-scaling 1 --use-cr-scaling 1 --cr-iterations 10 \
-  --use-bc-scaling 1 --stoptol 1e-8
+  --use-bc-scaling 0 --stoptol 1e-8 --time-limit 1000
 ```
 
-This profile applies `CR -> Ruiz -> PC`. It estimates
-`lambda_max(A Q A^T)` by the existing double-precision power method, updates
-the three pairwise QCQP shapes only at accepted restarts, refreshes sigma in
-the new metric with the one-decade safeguard, and reseeds restart history after
-every metric change. The optional `two_moment` and `moment_selector` modes also
-estimate `lambda_max(A Q^2 A^T)`. No CUDA fast-math option is used.
+This profile applies `CR -> Ruiz -> PC` with global b/c normalization off.
+It retains the existing double-precision spectral estimation and metric/control
+implementation. `moment_selector` uses the second-moment test on eligible QP
+paths; QC majorizer `auto` retains the original QCQP selection rule. The other
+majorizers and legacy sGS method remain explicitly selectable. No CUDA
+fast-math option is used.
 
 The selectable Curtis--Reid path follows PolyU-IOR/HPR-QP commit
 `8023de0426e096d0f540b8126460f2b9d7c1a355`: it performs A-only
 log-geometric equilibration, then the existing 10 Ruiz passes and one
 Pock--Chambolle pass. CPU and CUDA implementations use `double`, the largest
 eigenvalues are still computed by the existing power method, and the build
-does not enable fast-math. Curtis--Reid scaling is off by default so the
-pre-existing path remains selectable; pass the two flags above to enable the
-validated CR10 configuration.
+does not enable fast-math. Curtis--Reid scaling is enabled with ten passes by
+default; `--use-cr-scaling 0` selects the path without that preprocessing.
+
+The handoff's historical table used an earlier August source snapshot and a
+3600-second cap. This branch's default 1000-second cap does not claim to
+reproduce that table. Original Git history was not included in the handoff;
+the import and defaults commits use their actual current dates.
 
 Set `HPRQP_PROFILE_SETUP=1` to print opt-in phase timings for MPS parsing and
 model construction, CUDA context/upload/allocation, scaling, spectral and

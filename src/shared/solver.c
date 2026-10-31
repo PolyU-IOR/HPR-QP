@@ -155,20 +155,20 @@ void params_set_defaults(HPRQPParams *params)
     params->max_iter = (size_t)INT_MAX;
     params->use_gpu = 1;
     params->device_number = 0;
-    params->time_limit = 3600.0;
+    params->time_limit = 1000.0;
     params->check_iter = 100;
     params->print_frequency = -1;
     params->use_scaling = 1;
-    params->use_cr_scaling = 0;
+    params->use_cr_scaling = 1;
     params->cr_iterations = 10;
     params->use_bc_scaling = 0;
     params->verbose = 1;
     params->spmv_mode_q = HPRQP_SPMV_MODE_AUTO;
     params->spmv_mode_a = HPRQP_SPMV_MODE_AUTO;
-    params->method = HPRQP_METHOD_SGS;
-    params->parallel_majorizer_mode = HPRQP_PARALLEL_MAJORIZER_COUPLING_POWER;
+    params->method = HPRQP_METHOD_PARALLEL;
+    params->parallel_majorizer_mode = HPRQP_PARALLEL_MAJORIZER_MOMENT_SELECTOR;
     params->qc_majorizer_mode = HPRQP_QC_MAJORIZER_AUTO;
-    params->tau_mode = HPRQP_TAU_MODE_UNIT;
+    params->tau_mode = HPRQP_TAU_MODE_ADAPTIVE_RESTART;
     params->tau = 1.0;
     params->tau_min = 1.0 / 40.0;
     params->tau_max = 40.0;
@@ -177,8 +177,8 @@ void params_set_defaults(HPRQPParams *params)
     params->parallel_adaptation_energy_floor = 1e-12;
     params->sigma_fixed = 0;
     params->initial_sigma = -1.0;
-    params->use_socp_restart_policy = 0;
-    params->use_socp_sigma_policy = 0;
+    params->use_socp_restart_policy = 1;
+    params->use_socp_sigma_policy = 1;
 }
 
 void results_init(HPRQPResults *results)

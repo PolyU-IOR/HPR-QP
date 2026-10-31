@@ -13,7 +13,7 @@ from pathlib import Path
 CSV_NAME = "HPRQP_result.csv"
 LOG_NAME = "HPRQP_log.txt"
 SUMMARY_NAMES = {"SGM10", "solved"}
-SUCCESS_STATUSES = {"OK", "MAX_ITER", "TIME_LIMIT"}
+COMPLETED_STATUSES = {"OPTIMAL", "MAX_ITER", "TIME_LIMIT"}
 FIELDNAMES = [
     "name",
     "iter",
@@ -33,20 +33,23 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run solve_qp on all .mps files in a folder.")
     parser.add_argument("data_path", help="Folder containing .mps files")
     parser.add_argument("result_path", help="Folder for CSV and log outputs")
-    parser.add_argument("--build-dir", default="build", help="Build directory containing solve_qp")
+    parser.add_argument("--build-dir", help="Build directory; defaults to build-cuda for GPU or build for CPU")
     parser.add_argument("--solver", default="solve_qp", help="Solver executable name")
     parser.add_argument("--max-iter", type=int)
-    parser.add_argument("--stoptol", type=float)
+    parser.add_argument("--stoptol", type=float, default=1e-8)
     parser.add_argument("--check-iter", type=int)
     parser.add_argument("--print-frequency", type=int)
-    parser.add_argument("--time-limit", type=float, default=3600.0)
+    parser.add_argument("--time-limit", type=float, default=1000.0)
     parser.add_argument("--verbose", type=int)
-    parser.add_argument("--use-gpu", type=int)
+    parser.add_argument("--use-gpu", type=int, choices=[0, 1], default=1)
     parser.add_argument("--device-number", type=int)
     parser.add_argument("--spmv-mode-q", choices=["auto", "cusparse", "customized"])
     parser.add_argument("--spmv-mode-a", choices=["auto", "cusparse", "customized"])
     parser.add_argument("--use-scaling", type=int)
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.build_dir is None:
+        args.build_dir = "build-cuda" if args.use_gpu else "build"
+    return args
 
 
 def solver_command(args: argparse.Namespace, mps_path: Path) -> list[str]:
@@ -120,9 +123,22 @@ def shifted_geomean(values: list[float], shift: float = 10.0) -> str:
     return f"{math.exp(sum(math.log(v + shift) for v in values) / len(values)) - shift:.12g}"
 
 
-def write_csv(csv_path: Path, rows: list[dict[str, str]], time_limit: float) -> None:
+def is_solved(row: dict[str, str], stoptol: float) -> bool:
+    values = [parse_float(row, key) for key in ("alg_time", "res", "gap", "primal_obj")]
+    return (
+        row.get("status") == "OPTIMAL"
+        and all(value is not None and math.isfinite(value) for value in values)
+        and values[0] >= 0
+        and 0 <= values[1] <= stoptol
+        and 0 <= values[2] <= stoptol
+    )
+
+
+def write_csv(csv_path: Path, rows: list[dict[str, str]], time_limit: float,
+              stoptol: float = 1e-8) -> None:
     data_rows = list(rows)
-    alg_times = [value for row in data_rows if (value := parse_float(row, "alg_time")) is not None]
+    alg_times = [parse_float(row, "alg_time") if is_solved(row, stoptol) else time_limit
+                 for row in data_rows]
     iter_values = [float(value) for row in data_rows if (value := parse_int(row, "iter")) is not None]
     time4_values = [value for row in data_rows if (value := parse_float(row, "time_4")) is not None]
     iter4_values = [float(value) for row in data_rows if (value := parse_int(row, "iter_4")) is not None]
@@ -145,7 +161,7 @@ def write_csv(csv_path: Path, rows: list[dict[str, str]], time_limit: float) -> 
     solved_row = {
         "name": "solved",
         "iter": "",
-        "alg_time": str(sum(1 for value in alg_times if value < time_limit)),
+        "alg_time": str(sum(is_solved(row, stoptol) for row in data_rows)),
         "res": "",
         "primal_obj": "",
         "gap": "",
@@ -186,7 +202,7 @@ def main() -> int:
     completed = {
         row["name"]
         for row in rows
-        if row.get("name") and row.get("status", "") in SUCCESS_STATUSES
+        if row.get("name") and row.get("status", "") in COMPLETED_STATUSES
     }
     files = sorted(path for path in data_path.iterdir() if path.is_file() and path.suffix.lower() == ".mps")
 
@@ -225,6 +241,8 @@ def main() -> int:
             "iter_6": parsed.get("iter_6", ""),
             "time_6": parsed.get("time_6", ""),
         }
+        if completed_process.returncode != 0:
+            row["status"] = f"EXIT_{completed_process.returncode}"
         existing_index = row_index_by_name.get(mps_path.name)
         if existing_index is None:
             row_index_by_name[mps_path.name] = len(rows)
@@ -232,11 +250,11 @@ def main() -> int:
         else:
             rows[existing_index] = row
 
-        if row["status"] in SUCCESS_STATUSES:
+        if row["status"] in COMPLETED_STATUSES:
             completed.add(mps_path.name)
         else:
             completed.discard(mps_path.name)
-        write_csv(csv_path, rows, args.time_limit)
+        write_csv(csv_path, rows, args.time_limit, args.stoptol)
 
     return 0
 

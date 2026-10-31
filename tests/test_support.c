@@ -68,6 +68,11 @@ void test_params_set_no_scaling(HPRQPParams *params)
 {
     params_set_defaults(params);
     params->use_scaling = 0;
+    /* These factor/update fixtures use the explicitly selected legacy sGS
+     * path, independent of the public parallel profile defaults. */
+    params->method = HPRQP_METHOD_SGS;
+    params->parallel_majorizer_mode = HPRQP_PARALLEL_MAJORIZER_COUPLING_POWER;
+    params->tau_mode = HPRQP_TAU_MODE_UNIT;
 }
 
 HPRQPStatus test_build_model_case(HPRQPTestModelCase case_id,

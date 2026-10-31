@@ -247,6 +247,10 @@ int main(void)
     params.method = HPRQP_METHOD_PARALLEL;
     params.parallel_majorizer_mode = HPRQP_PARALLEL_MAJORIZER_COUPLING_POWER;
     params.verbose = 0;
+    /* This fixture checks the legacy policy before explicitly enabling the
+     * SOCP policy below; do not inherit the public policy default. */
+    params.use_socp_sigma_policy = 0;
+    params.tau_mode = HPRQP_TAU_MODE_UNIT;
 
     status = build_from_mps(path, &model);
     if (status != HPRQP_STATUS_OK || model.qc.count != 2) {
