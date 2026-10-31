@@ -1,113 +1,130 @@
-# Contributing to HPR-QP
+# Contributing to HPR-QP-C
 
-Thank you for your interest in contributing to HPR-QP!
+This document describes the expected workflow for contributions to HPR-QP-C. The project includes a core C/CUDA solver, a C binding API, and Julia and Python wrappers, so changes should keep the relevant build, test, and documentation paths in sync.
 
-## Commit Message Guidelines
+## Getting Started
 
-We follow the [Conventional Commits](https://www.conventionalcommits.org/) specification for commit messages. This leads to more readable messages that are easy to follow when looking through the project history.
+1. Fork the repository if you are contributing through GitHub.
+2. Clone your fork or local checkout:
 
-### Commit Message Format
+   ```sh
+   git clone https://github.com/YOUR_USERNAME/HPR-QP-C.git
+   cd HPR-QP-C
+   ```
 
-Each commit message consists of a **header**, a **body**, and a **footer**.
+3. Create a focused branch for the change:
 
-```
-<type>(<scope>): <subject>
+   ```sh
+   git checkout -b feature/short-description
+   ```
 
-<body>
+## Development Setup
 
-<footer>
-```
+### Prerequisites
 
-The **header** is mandatory and the **scope** of the header is optional.
+- CMake 3.16+
+- A C11 compiler and a C++17 compiler
+- Optional: a CUDA toolkit with `nvcc` in `PATH` or exposed through `CUDA_ROOT` for GPU builds
+- Optional: Julia for the Julia wrapper and tests
+- Optional: Python 3 for the Python wrapper and tests
 
-### Type
+### Core Build
 
-Must be one of the following:
+For a normal local build, use the top-level Makefile:
 
-- **feat**: A new feature
-- **fix**: A bug fix
-- **docs**: Documentation only changes
-- **style**: Changes that do not affect the meaning of the code (white-space, formatting, missing semi-colons, etc)
-- **refactor**: A code change that neither fixes a bug nor adds a feature
-- **perf**: A code change that improves performance
-- **test**: Adding missing tests or correcting existing tests
-- **build**: Changes that affect the build system or external dependencies
-- **ci**: Changes to our CI configuration files and scripts
-- **chore**: Other changes that don't modify src or test files
-- **revert**: Reverts a previous commit
-
-### Scope
-
-The scope should be the name of the module/component affected (as perceived by the person reading the changelog).
-
-Examples:
-- `algorithm`
-- `kernels`
-- `utils`
-- `docs`
-
-### Subject
-
-The subject contains a succinct description of the change:
-
-- Use the imperative, present tense: "change" not "changed" nor "changes"
-- Don't capitalize the first letter
-- No dot (.) at the end
-
-### Body
-
-The body should include the motivation for the change and contrast this with previous behavior.
-
-### Footer
-
-The footer should contain any information about **Breaking Changes** and is also the place to reference GitHub issues that this commit closes.
-
-### Examples
-
-```
-feat(algorithm): add new HPR solver method
-
-Implement a new high-performance solver for large-scale QP problems
-that reduces memory footprint by 30%.
-
-Closes #42
+```sh
+make clean && make
 ```
 
-```
-fix(kernels): correct matrix indexing bug
+This auto-detects whether CUDA is available and builds the matching CPU-only or CPU+GPU targets.
 
-Fix off-by-one error in kernel computation that caused incorrect
-results for edge cases.
+Useful explicit targets:
 
-Fixes #156
-```
-
-```
-docs: update installation instructions
-
-Add Julia 1.9+ requirement and clarify dependency installation steps.
+```sh
+make build
+make test
+make shared
+make install
+make gpu-build
+make gpu-test
 ```
 
-### Using the Commit Template
+### Wrapper Setup
 
-To configure git to use the provided commit message template:
+Julia wrapper:
 
-```bash
-git config commit.template .gitmessage
+```sh
+cd julia
+make setup
+make test
 ```
 
-This will automatically populate your commit message with the template when you run `git commit`.
+Python wrapper:
 
-## Pull Request Process
+```sh
+cd python
+make setup
+make test
+```
 
-1. Fork the repository and create your branch from `main`
-2. Make your changes following the coding standards
-3. Add tests if applicable
-4. Update documentation as needed
-5. Ensure all tests pass
-6. Write clear, conventional commit messages
-7. Submit a pull request
+## Testing Expectations
 
-## Questions?
+Run the tests that cover the area you changed before opening a pull request.
 
-Feel free to open an issue if you have any questions about contributing!
+- Core solver or shared library changes: `make test`
+- CUDA-specific changes: `make gpu-test`
+- Julia wrapper changes: `cd julia && make test`
+- Python wrapper changes: `cd python && make test`
+- CLI or example changes: run the relevant demo or `solve_qp` command directly
+
+If your change affects both the core solver and a wrapper, test both layers.
+
+## Reporting Bugs
+
+When filing a bug report, include:
+
+- A clear summary of the problem
+- Steps to reproduce it
+- The expected behavior and the actual behavior
+- Your platform details, including compiler and CUDA information when relevant
+- The exact command you ran and any error output
+- A small `.mps` or array-based reproducer when possible
+
+## Pull Requests
+
+Before opening a pull request:
+
+1. Keep the change focused and avoid unrelated refactors.
+2. Add or update tests when behavior changes.
+3. Update user-facing documentation when APIs, build steps, or examples change.
+4. Keep C, Julia, and Python surfaces aligned when the shared binding or solver behavior changes.
+5. Use clear commit messages.
+
+Example commit prefixes:
+
+```text
+feat: add GPU control regression for diagonal Q
+fix: correct binding result ownership on error
+docs: update python wrapper setup instructions
+test: add solver regression for unchecked iterations
+refactor: split gpu eigs setup from control path
+```
+
+## Code Style
+
+- Follow the existing style in the surrounding code instead of introducing a new one.
+- Prefer small, single-purpose functions and keep public API changes deliberate.
+- Add comments only where the control flow or math would otherwise be hard to follow.
+- Keep naming consistent across the solver, binding API, and wrapper layers.
+- Avoid changing generated build artifacts or unrelated formatting in the same pull request.
+
+## Documentation
+
+- Update [README.md](README.md) when top-level build, install, or CLI usage changes.
+- Update [julia/README.md](julia/README.md) when the Julia wrapper surface changes.
+- Update [python/README.md](python/README.md) when the Python wrapper surface changes.
+- Update [IMPLEMENTATION_STATUS.md](IMPLEMENTATION_STATUS.md) when the port status or major milestones change.
+
+## License
+
+By contributing to HPR-QP-C, you agree that your contributions will be licensed under the MIT License used by this repository.

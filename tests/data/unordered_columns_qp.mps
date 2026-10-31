@@ -1,0 +1,17 @@
+NAME          UNORDERED
+OBJSENSE
+ MIN
+ROWS
+ N  OBJ
+ G  C1
+ L  C2
+COLUMNS
+ X1  C1  1.0
+ X2  C2  2.0
+ X1  C2  3.0  C1  4.0
+RHS
+ RHS1  C1  0.0  C2  0.0
+QUADOBJ
+ X1  X1  1.0
+ X2  X2  1.0
+ENDATA
